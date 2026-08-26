@@ -145,6 +145,25 @@ if(MCKE_ENABLE_CUDA)
 endif()
 
 # -----------------------------------------------------------------------------
+# Benchmarks
+#
+# stream_triad and fma_peak are Phase 1 deliverables: they establish the
+# MEASURED bandwidth and MEASURED FMA-peak denominators that every later
+# "% of peak" figure in RESULTS.md is computed against (see docs/PROFILING.md
+# section 2 for why a spec-sheet number is the wrong denominator). They are
+# standalone diagnostic .cu files, not part of the mcke_kernels library, so
+# they are built directly here rather than through the kernels/ launcher
+# pattern used by the runtime's actual ops.
+# -----------------------------------------------------------------------------
+if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
+  add_executable(mcke_stream_triad bench/stream_triad.cu)
+  target_link_libraries(mcke_stream_triad PRIVATE mcke)
+
+  add_executable(mcke_fma_peak bench/fma_peak.cu)
+  target_link_libraries(mcke_fma_peak PRIVATE mcke)
+endif()
+
+# -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
 if(MCKE_BUILD_TESTS)
