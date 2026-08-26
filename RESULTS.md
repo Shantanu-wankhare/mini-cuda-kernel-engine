@@ -26,7 +26,7 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 | Machine | GPU | CC | SMs | smem/SM | Peak BW (spec formula) | Measured BW | Measured FMA f32 peak | Driver / CUDA |
 |---|---|---|---|---|---|---|---|---|
 | MacBook Air (M-series) | — | — | — | — | — | — | — | host-only build |
-| Colab | Tesla T4 | 7.5 | 40 | 64 KiB | 320.1 GB/s | 235.5 GB/s | 8.059 TFLOP/s | driver 580.82.07 / nvcc 12.8.93 |
+| Colab | Tesla T4 | 7.5 | 40 | 64 KiB | 320.1 GB/s | 235.4 GB/s | 8.130 TFLOP/s | driver 580.82.07 / nvcc 12.8.93 |
 | RTX 5060 laptop | _TBD_ | 12.0 | | | | | | needs CUDA ≥ 12.8 |
 | Explorer | _TBD_ | | | | | | | |
 
@@ -52,15 +52,14 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 
 | Kernel | Variant | n | Ideal bytes | median ms | min ms | GB/s | % measured BW | Machine |
 |---|---|---|---|---|---|---|---|---|
-| stream_triad | grid_stride_256t | 64Mi | 768 MiB | 3.420 | pending rerun* | 235.5 | 100.0% (this IS the baseline) | Colab T4 |
-| vector_add | grid_stride_256t | 64Mi | 768 MiB | 3.346 | pending rerun* | 240.6 | 102.2% | Colab T4 |
+| stream_triad | grid_stride_256t | 64Mi | 768 MiB | 3.421 | 3.417 | 235.4 | 100.0% (this IS the baseline) | Colab T4 |
+| vector_add | grid_stride_256t | 64Mi | 768 MiB | 3.348 | 3.344 | 240.5 | 102.2% | Colab T4 |
 
-\* These rows predate the `Profiler::time_op` fix that added min-ms tracking
-(`include/mcke/profiling/profiler.hpp` / `src/core/profiler.cpp`,
-2026-08-26 — `KernelRecord::ms` split into `median_ms` + `min_ms`). The GB/s and
-median-ms figures above are still correct and unaffected by that change; only
-the min-ms column was genuinely missing data, not wrong data. Replace this
-row's "pending rerun" with the real min ms once the next Colab run reports it.
+Median and min sit within 0.1-0.2% of each other for both kernels — a clean,
+idle, unthrottled T4 (41 degC at session start, no other tenants), not a wide
+median-min gap that would have signalled clock ramp or a noisy shared GPU. This
+is the first row filled in after the `Profiler::time_op` min-tracking fix
+(`include/mcke/profiling/profiler.hpp` / `src/core/profiler.cpp`, 2026-08-26).
 
 **Prediction (recorded 2026-08-24, before any run):** 70-85% of measured
 bandwidth. Below 50% indicates a problem — pageable-memory staging on the copies,

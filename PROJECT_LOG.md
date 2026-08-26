@@ -246,9 +246,18 @@ number for this specific chip.
 
 ### What's next
 
-Rerun the four Phase 1 programs on Colab once more to get real min-ms numbers
-for the `RESULTS.md` §1 rows currently marked "pending rerun", then move to
-Phase 2: `BuddyAllocator` — design and unit-test the split/merge and
+**Phase 1 closed out**, same session: reran all four programs on Colab T4 after
+the min-tracking fix. Final numbers: `vector_add` 240.5 GB/s (median 3.348 ms /
+min 3.344 ms, 75.1% of corrected peak), `stream_triad` 235.4 GB/s (median
+3.421 ms / min 3.417 ms, 73.6%), `fma_peak` 8.130 TFLOP/s (vs. 8.050 and 8.059
+TFLOP/s on the two earlier runs — about 1% run-to-run spread, unremarkable).
+Median and min agree to within 0.1-0.2% on both bandwidth kernels, which is
+itself informative: it says this T4 session was clean (idle, 41 degC, no other
+tenants) rather than something we'd need to caveat. `RESULTS.md` sec 0 and
+sec 1 now hold these as the final Phase 1 figures; `docs/ROADMAP.md`'s Phase 1
+exit criteria are met.
+
+Next: Phase 2 — `BuddyAllocator`. Design and unit-test the split/merge and
 stream-ordered pending-free logic on the Mac (the logic needs no GPU at all),
 then bring real `raw_malloc_calls`-vs-`alloc_calls` and fragmentation numbers
 back from a GPU session.
