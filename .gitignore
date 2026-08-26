@@ -1,0 +1,29 @@
+# Build trees. Two, because we routinely have a host-only and a CUDA build side
+# by side (macOS + a remote GPU checkout).
+build/
+build-host/
+build-*/
+compile_commands.json
+
+# Profiler output. These are large binaries (an ncu report is easily 100+ MB) and
+# are regenerable. The *derived numbers* belong in RESULTS.md, which IS committed
+# — commit the conclusion, not the raw capture.
+reports/
+logs/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+*.qdrep
+
+# Editor / OS
+.vscode/
+.idea/
+.cache/
+.DS_Store
+*.swp
+
+# Python (tools/ plotting + reference generation only, never the runtime)
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/shantanuwankhare/.claude/projects/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime--/memory/**)"
+    ]
+  }
+}
