@@ -142,3 +142,113 @@ staging, too-small grid, or clocks).
 
 Then Phase 2a: implement `BuddyAllocator` (host logic → testable on the Mac
 first, GPU only for the final numbers).
+
+---
+
+## 2026-08-26 — Session 2: First light on Colab T4 (Phase 1)
+
+**Environment:** Google Colab Pro, T4 GPU runtime, Standard RAM. Driver
+580.82.07 (reports CUDA 13.0 capability), CUDA toolkit/nvcc 12.8.93. Repo
+cloned over HTTPS with a short-lived, repo-scoped fine-grained PAT.
+
+### What was built
+
+- `bench/stream_triad.cu` — classic STREAM triad
+  (`a[i] = b[i] + scalar*c[i]`), measures *achieved* DRAM bandwidth.
+- `bench/fma_peak.cu` — register-only f32 FMA microbenchmark: 8 independent
+  accumulator chains per thread (the ILP width), each running the contraction
+  recurrence `acc = acc*0.999 + 1` for 100,000 iterations — `|m|<1` keeps the
+  value bounded near its fixed point (1000) for the whole run, so there is no
+  overflow/denormal risk that could silently corrupt the timing. Measures
+  *achieved* f32 FMA throughput.
+- Both wired into `CMakeLists.txt` under the existing `MCKE_BUILD_BENCH`
+  option. Landed via PR #1 (`phase1/measured-peak-benchmarks` -> `main`),
+  merged only after the Colab run confirmed everything built and ran.
+- **Bug fix, committed directly to `main` (`8a4117d`), no branch/PR:**
+  `DeviceInfo::peak_dram_gb_s()` was missing a factor of 2.
+
+### What was learned — including something that turned out wrong
+
+The first Colab run reported `mcke_smoke` and `mcke_stream_triad` achieving
+**~150% of "peak" DRAM bandwidth** — a physical impossibility. That is exactly
+the useful kind of signal: it means the "peak" being compared against was
+wrong, not that the kernel exceeded physics.
+
+Root cause: `peak_dram_gb_s()`'s original comment asserted
+`cudaDeviceProp::memoryClockRate` "is already the effective data rate, so no
+extra x2 for DDR." That was wrong. The field reports **one edge** of a
+double-data-rate clock — the same convention NVIDIA's own `deviceQuery` sample
+uses (`2.0 * memoryClockRate * busWidth/8`). Confirmed against T4's published
+spec (320 GB/s): our un-doubled formula gave 160.032 GB/s, exactly half.
+Doubled, it gives 320.064 GB/s, matching spec, and both `vector_add` (75.2%)
+and `stream_triad` (73.6%) now land at a believable fraction of it — the two
+kernels agree with each other to within ~2%, which is what gives confidence
+the *measurement* methodology was sound the whole time, even while the
+*formula* was broken.
+
+This is the concrete case the project's own docs warned about only in the
+abstract ("never trust a spec-sheet number, measure it") — it turns out the
+theoretical *formula* itself needed the same skepticism, not just the
+achieved-vs-formula comparison built on top of it.
+
+Secondary finding, acted on later the same session: `RESULTS.md`'s row format
+calls for both **median and min** per its own rule 3, but `Profiler::time_op`
+(`include/mcke/profiling/profiler.hpp`) computed and stored only the
+**median** — there was no min in `KernelRecord` at all. Fixed before the
+Colab rerun rather than deferred to Phase 5: `KernelRecord::ms` was split into
+`median_ms` (unchanged semantics — every derived metric, `tflops()`/
+`gb_per_s()`, is still computed from it) and a new `min_ms`, computed in
+`time_op` via `std::min_element` on the *same* set of timed iterations, before
+`std::nth_element` partitions the vector for the median (order doesn't
+actually matter here — `nth_element` only reorders, never removes, elements —
+but computing min first keeps the two computations obviously independent on
+inspection rather than relying on that fact). `summary_table()` and
+`write_csv()` in `src/core/profiler.cpp` were updated to print/export both
+columns. Verified by recompiling `device_query` + `test_host_core` on the Mac
+in host-only mode after the change: still 4410 checks, 0 failures, and the
+new binaries link and run correctly — this header is included by every
+benchmark from here on, so it was worth confirming before handing it back for
+the Colab rerun rather than finding a break there.
+
+Also learned in passing: authenticating to a private GitHub repo from Colab
+via `Authorization: Bearer <PAT>` in a `git -c http.extraHeader` does **not**
+work against GitHub's git-over-HTTPS endpoint (fails with "could not read
+Username", i.e. the header was silently ignored and git fell back to an
+interactive prompt). `Authorization: Basic <base64(x-access-token:PAT)>` does
+work — the same convention GitHub Actions uses internally. Also: `base64`
+wraps long output at 76 columns by default, which would have corrupted the
+header if not passed `-w0`.
+
+### Benchmarks run (Colab, Tesla T4, driver 580.82.07, CUDA toolkit 12.8.93)
+
+| Program | Result |
+|---|---|
+| `mcke_device_query` | sm_75, 40 SMs, 64 KiB smem/SM, peak DRAM BW (corrected formula) = 320.064 GB/s |
+| `mcke_smoke` (vector_add) | 240.6 GB/s achieved (75.2% of corrected peak); verification OK, 0/67,108,864 mismatches |
+| `mcke_stream_triad` | **235.5 GB/s achieved** (73.6% of corrected peak) — canonical *measured bandwidth* denominator for T4 from here on |
+| `mcke_fma_peak` | **8.059 TFLOP/s** measured sustained f32 FMA — canonical *measured compute peak* denominator for T4 from here on |
+| `ctest` / `mcke_test_host_core` | 4410 checks, 0 failures — first time this host logic has compiled and run under gcc + nvcc's host compiler rather than Apple clang; confirms nothing clang-specific crept in |
+
+Derived: T4 roofline ridge point (measured/measured) =
+8.059e12 / 235.5e9 approx **34.2 FLOP/byte**. Kernels below that AI are
+memory-bound on this GPU; our planned GEMM (AI approx 682) sits deep in the
+compute-bound region, row-reduce (AI approx 0.25) deep in memory-bound —
+structurally as `docs/PROFILING.md` sec 2 predicted, now anchored to a real
+number for this specific chip.
+
+### Design decisions taken (and alternatives rejected)
+
+| Decision | Chosen | Rejected | Why |
+|---|---|---|---|
+| Colab auth for a private repo | HTTPS + fine-grained PAT, `http.extraHeader="Authorization: Basic ..."`, `x-access-token` convention | `Authorization: Bearer` header (tried first) | Bearer isn't honored by GitHub's git-smart-HTTP endpoint; Basic with `x-access-token` is what GitHub Actions itself uses |
+| GPU/RAM tier for Phase 1 | T4, Standard RAM | L4 / A100 | Phase 1 needs no compute headroom (scoped in `docs/ROADMAP.md` as ~2 credits); save bigger GPUs for Phase 3 GEMM sweeps |
+| Bandwidth-formula bug fix | Committed directly to `main`, no branch/PR | Branch + PR (as done for the new benchmark files) | Small, single-reasoning-chain correction to existing code, not new functionality |
+
+### What's next
+
+Rerun the four Phase 1 programs on Colab once more to get real min-ms numbers
+for the `RESULTS.md` §1 rows currently marked "pending rerun", then move to
+Phase 2: `BuddyAllocator` — design and unit-test the split/merge and
+stream-ordered pending-free logic on the Mac (the logic needs no GPU at all),
+then bring real `raw_malloc_calls`-vs-`alloc_calls` and fragmentation numbers
+back from a GPU session.

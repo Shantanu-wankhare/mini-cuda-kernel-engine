@@ -92,13 +92,21 @@ class NvtxRange {
 struct KernelRecord {
   std::string   name;
   std::string   variant;          // e.g. "tiled_128x128x8_regblock_4x4"
-  double        ms = 0.0;         // GPU time for one iteration
+  // Both are populated by Profiler::time_op from the SAME set of timed
+  // iterations. `median_ms` is what every derived metric below (tflops(),
+  // gb_per_s()) is computed from -- see the "MEASUREMENT DISCIPLINE" note
+  // above for why median, not mean. `min_ms` is kept alongside it, unreduced,
+  // because RESULTS.md's own rule 3 asks for both: a wide median-min gap is
+  // itself a signal (clock still ramping, thermal throttling, a noisy shared
+  // GPU) that a single median would quietly hide.
+  double        median_ms = 0.0;
+  double        min_ms    = 0.0;
   std::uint64_t flops = 0;        // ideal, from OpCost
   std::uint64_t bytes = 0;        // ideal, from OpCost
   int           iterations = 1;
   int           stream_idx = 0;
 
-  [[nodiscard]] double seconds() const { return ms * 1e-3; }
+  [[nodiscard]] double seconds() const { return median_ms * 1e-3; }
   [[nodiscard]] double tflops() const {
     return seconds() > 0 ? static_cast<double>(flops) / seconds() / 1e12 : 0.0;
   }
@@ -233,12 +241,18 @@ StatusOr<KernelRecord> Profiler::time_op(const std::string& name, const std::str
     if (!t.ok()) return t.status();
     ms.push_back(static_cast<double>(*t));
   }
+  // Min first: nth_element below reorders `ms` in place (a partition, not a
+  // sort, so no element is lost -- min_element would still be correct even
+  // after it), but computing min on the untouched vector keeps the two
+  // computations obviously independent on inspection.
+  const double min_ms = *std::min_element(ms.begin(), ms.end());
   std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
 
   KernelRecord r;
   r.name = name;
   r.variant = variant;
-  r.ms = ms[ms.size() / 2];
+  r.median_ms = ms[ms.size() / 2];
+  r.min_ms = min_ms;
   r.flops = flops;
   r.bytes = bytes;
   r.iterations = iters;

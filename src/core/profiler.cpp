@@ -58,15 +58,16 @@ double theoretical_peak_f32_tflops(const DeviceInfo& d) {
 std::string Profiler::summary_table(const Roofline& rl) const {
   std::ostringstream os;
   os << std::left << std::setw(22) << "kernel" << std::setw(26) << "variant"
-     << std::right << std::setw(10) << "ms" << std::setw(10) << "GB/s"
-     << std::setw(10) << "TFLOP/s" << std::setw(8) << "AI" << std::setw(10) << "%peak"
-     << "  bound\n";
-  os << std::string(100, '-') << '\n';
+     << std::right << std::setw(10) << "med_ms" << std::setw(10) << "min_ms"
+     << std::setw(10) << "GB/s" << std::setw(10) << "TFLOP/s" << std::setw(8) << "AI"
+     << std::setw(10) << "%peak" << "  bound\n";
+  os << std::string(110, '-') << '\n';
   os << std::fixed << std::setprecision(3);
   for (const auto& r : records_) {
     const double ai = r.arithmetic_intensity();
     os << std::left << std::setw(22) << r.name << std::setw(26) << r.variant
-       << std::right << std::setw(10) << r.ms
+       << std::right << std::setw(10) << r.median_ms
+       << std::setw(10) << r.min_ms
        << std::setw(10) << std::setprecision(1) << r.gb_per_s()
        << std::setw(10) << std::setprecision(3) << r.tflops()
        << std::setw(8) << std::setprecision(2) << ai
@@ -82,11 +83,12 @@ Status Profiler::write_csv(const std::string& path, const Roofline& rl) const {
   // Header names chosen to be plot-script friendly and self-documenting; the
   // ideal-vs-achieved distinction is explicit so a reader six months later
   // cannot misread which is which.
-  f << "kernel,variant,ms,iterations,ideal_flops,ideal_bytes,achieved_gb_s,"
+  f << "kernel,variant,median_ms,min_ms,iterations,ideal_flops,ideal_bytes,achieved_gb_s,"
        "achieved_tflops,arithmetic_intensity,attainable_tflops,efficiency_pct,bound\n";
   for (const auto& r : records_) {
     const double ai = r.arithmetic_intensity();
-    f << r.name << ',' << r.variant << ',' << r.ms << ',' << r.iterations << ','
+    f << r.name << ',' << r.variant << ',' << r.median_ms << ',' << r.min_ms << ','
+      << r.iterations << ','
       << r.flops << ',' << r.bytes << ',' << r.gb_per_s() << ',' << r.tflops() << ','
       << ai << ',' << rl.attainable_tflops(ai) << ',' << rl.efficiency(r) * 100.0 << ','
       << (rl.memory_bound(ai) ? "memory" : "compute") << '\n';

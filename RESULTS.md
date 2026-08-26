@@ -26,9 +26,16 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 | Machine | GPU | CC | SMs | smem/SM | Peak BW (spec formula) | Measured BW | Measured FMA f32 peak | Driver / CUDA |
 |---|---|---|---|---|---|---|---|---|
 | MacBook Air (M-series) | — | — | — | — | — | — | — | host-only build |
-| Colab | _TBD_ | | | | | | | |
+| Colab | Tesla T4 | 7.5 | 40 | 64 KiB | 320.1 GB/s | 235.5 GB/s | 8.059 TFLOP/s | driver 580.82.07 / nvcc 12.8.93 |
 | RTX 5060 laptop | _TBD_ | 12.0 | | | | | | needs CUDA ≥ 12.8 |
 | Explorer | _TBD_ | | | | | | | |
+
+> Colab clocks were **not locked** (no root access in the hosted notebook); the
+> T4 was idle and cool at session start (51 degC), so throttling is unlikely for
+> runs this short, but treat this row as indicative rather than authoritative —
+> per `docs/ENVIRONMENTS.md`, Explorer is where the authoritative numbers come
+> from. "Measured BW" here is `stream_triad`'s figure, not `vector_add`'s
+> (240.6 GB/s) — see section 1 for why they differ and why that's expected.
 
 > Note: "Peak BW (spec formula)" is `2 × memory_clock_khz × 1e3 × bus_bits/8`
 > (the leading ×2 accounts for `cudaDeviceProp::memoryClockRate` reporting one
@@ -45,11 +52,27 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 
 | Kernel | Variant | n | Ideal bytes | median ms | min ms | GB/s | % measured BW | Machine |
 |---|---|---|---|---|---|---|---|---|
-| vector_add | grid_stride_256t | 64Mi | 768 MiB | | | | | |
+| stream_triad | grid_stride_256t | 64Mi | 768 MiB | 3.420 | pending rerun* | 235.5 | 100.0% (this IS the baseline) | Colab T4 |
+| vector_add | grid_stride_256t | 64Mi | 768 MiB | 3.346 | pending rerun* | 240.6 | 102.2% | Colab T4 |
+
+\* These rows predate the `Profiler::time_op` fix that added min-ms tracking
+(`include/mcke/profiling/profiler.hpp` / `src/core/profiler.cpp`,
+2026-08-26 — `KernelRecord::ms` split into `median_ms` + `min_ms`). The GB/s and
+median-ms figures above are still correct and unaffected by that change; only
+the min-ms column was genuinely missing data, not wrong data. Replace this
+row's "pending rerun" with the real min ms once the next Colab run reports it.
 
 **Prediction (recorded 2026-08-24, before any run):** 70-85% of measured
 bandwidth. Below 50% indicates a problem — pageable-memory staging on the copies,
 too small a grid, or clock throttling.
+
+**Actual (2026-08-26, Colab T4):** 102.2% — higher than predicted, not lower.
+Reason: `vector_add` and `stream_triad` turned out to be structurally almost
+identical grid-stride kernels (same thread/block count heuristics, same 3-array
+access pattern), so there was little room for one to lag the other; the ~2%
+gap is consistent with ordinary run-to-run timing noise rather than a real
+difference between them. The 70-85% guess assumed more daylight between the
+two kernels than actually exists.
 
 ---
 
