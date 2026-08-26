@@ -30,7 +30,10 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 | RTX 5060 laptop | _TBD_ | 12.0 | | | | | | needs CUDA ≥ 12.8 |
 | Explorer | _TBD_ | | | | | | | |
 
-> Note: "Peak BW (spec formula)" is `memory_clock_khz × 1e3 × bus_bits/8`.
+> Note: "Peak BW (spec formula)" is `2 × memory_clock_khz × 1e3 × bus_bits/8`
+> (the leading ×2 accounts for `cudaDeviceProp::memoryClockRate` reporting one
+> edge of a double-data-rate clock — see `DeviceInfo::peak_dram_gb_s()` in
+> `include/mcke/core/device.hpp` for how we found this was missing).
 > "Measured BW" comes from `bench/stream_triad` (Phase 1). Use the **measured**
 > figure as the denominator for bandwidth efficiency — it already accounts for
 > ECC overhead and real sustained clocks, and is typically 80-90% of the spec

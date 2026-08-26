@@ -68,12 +68,26 @@ struct DeviceInfo {
   // -------------------------------------------------------------------------
 
   // Theoretical peak DRAM bandwidth, GB/s (decimal GB, matching NVIDIA specs).
-  //   bytes/s = clock_Hz * bus_width_bytes
-  // memory_clock_khz is already the effective data rate, so no extra x2 for DDR
-  // — double-counting that factor is the classic way to report a "50% of peak"
-  // kernel as "25% of peak".
+  //   bytes/s = 2 * clock_Hz * bus_width_bytes
+  //
+  // CORRECTED 2026-08-26, after Colab/T4 measurement: an earlier version of
+  // this function omitted the factor of 2 on the theory that
+  // `cudaDeviceProp::memoryClockRate` already reports the DDR-effective rate.
+  // That was wrong. `memoryClockRate` reports ONE EDGE of a double-data-rate
+  // clock — this is the same convention NVIDIA's own `deviceQuery` CUDA sample
+  // uses (`2.0 * memoryClockRate * (busWidth/8) / 1e6`), so the x2 is not a
+  // per-GPU quirk, it's the field's documented definition. We caught the bug
+  // because a T4's measured stream_triad bandwidth (239.7 GB/s) came out
+  // HIGHER than this function's un-doubled "peak" (160.0 GB/s) — a physical
+  // impossibility that only makes sense once you realize the "peak" was itself
+  // wrong. Doubled, it lines up with T4's published spec (320 GB/s), putting
+  // the measured 239.7 GB/s at a believable ~75% of true peak. See
+  // PROJECT_LOG.md (Session 2) and docs/PROFILING.md sec 2 for the full story
+  // — this is a good example of why sec 2 insists on a MEASURED denominator
+  // rather than trusting a formula: here, even the formula itself was broken,
+  // not just optimistic.
   [[nodiscard]] double peak_dram_gb_s() const {
-    return static_cast<double>(memory_clock_khz) * 1e3 *
+    return 2.0 * static_cast<double>(memory_clock_khz) * 1e3 *
            (static_cast<double>(memory_bus_width_bits) / 8.0) / 1e9;
   }
 
