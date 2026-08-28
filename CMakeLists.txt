@@ -91,8 +91,10 @@ endif()
 add_library(mcke_core STATIC
   src/core/device.cpp
   src/core/profiler.cpp
+  src/core/host_timer.cpp
   src/memory/allocator.cpp
-  # Phase 2+ adds: src/memory/buddy_allocator.cpp, src/memory/freelist_allocator.cpp
+  src/memory/buddy_allocator.cpp
+  src/memory/freelist_allocator.cpp
   # Phase 3+ adds: src/graph/graph.cpp, src/graph/executor.cpp, src/graph/ops_*.cpp
 )
 target_include_directories(mcke_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -163,6 +165,25 @@ if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
   target_link_libraries(mcke_fma_peak PRIVATE mcke)
 endif()
 
+# alloc_bench is deliberately NOT gated on MCKE_ENABLE_CUDA: it is a plain .cpp
+# with no device code, and its entire point (Phase 2c) is that allocator LOGIC,
+# host-side allocate/deallocate latency, and fragmentation bookkeeping are all
+# measurable on the MacBook with no GPU at all. It links mcke_core rather than
+# the `mcke` umbrella for the same reason the tests do -- the umbrella pulls in
+# mcke_kernels, which only exists in a CUDA build.
+if(MCKE_BUILD_BENCH)
+  add_executable(mcke_alloc_bench bench/alloc_bench.cpp)
+  target_link_libraries(mcke_alloc_bench PRIVATE mcke_core)
+  # mcke_core's -Wall -Wextra -Wpedantic are PRIVATE to that target and are NOT
+  # inherited by anything linking it (unlike a normal header-only interface).
+  # This file does substantial pointer and size arithmetic, where -Wextra earns
+  # its keep, so opt in explicitly rather than silently building unwarned.
+  target_compile_options(mcke_alloc_bench PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  )
+endif()
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
@@ -174,5 +195,35 @@ if(MCKE_BUILD_TESTS)
   # its statistics, not before.
   add_executable(mcke_test_host_core tests/test_host_core.cpp)
   target_link_libraries(mcke_test_host_core PRIVATE mcke_core)
+  target_include_directories(mcke_test_host_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   add_test(NAME host_core COMMAND mcke_test_host_core)
+
+  # Phase 2d: the stream-safety race. The repo's FIRST .cu test target.
+  #
+  # Needs CUDA for a reason that is not incidental: in a host-only build every
+  # rt::StreamHandle is nullptr, so "two streams" are the same stream, rule 1 in
+  # pending_reusable() legitimately fires, stream_query is unconditionally true
+  # so nothing ever parks, and there is no concurrency -- there is simply no race
+  # to construct. See the file's banner.
+  #
+  # Links the `mcke` umbrella rather than mcke_core (unlike every other test
+  # target) because it contains device code of its own.
+  if(MCKE_ENABLE_CUDA)
+    add_executable(mcke_test_stream_safety tests/test_stream_safety.cu)
+    target_link_libraries(mcke_test_stream_safety PRIVATE mcke)
+    target_include_directories(mcke_test_stream_safety PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_test(NAME stream_safety COMMAND mcke_test_stream_safety)
+    # 77 == "no CUDA device at runtime". A CUDA-capable TOOLCHAIN does not imply
+    # a GPU on the machine running ctest; without this, a build host that cannot
+    # execute the test would report it as PASSED -- precisely the false pass this
+    # test exists to prevent.
+    #
+    # The timeout is generous because the test builds a fresh allocator per trial
+    # (160 trials x one slab reserve) so that every trial starts from an
+    # identical state; a slow or shared GPU should not fail for scheduling
+    # reasons.
+    set_tests_properties(stream_safety PROPERTIES
+      SKIP_RETURN_CODE 77
+      TIMEOUT 600)
+  endif()
 endif()

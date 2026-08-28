@@ -61,6 +61,63 @@ using EventHandle  = void*;
 
 enum class StreamPriority { kHigh, kNormal, kLow };
 
+// -----------------------------------------------------------------------------
+// Non-blocking completion query on a *raw handle*.
+//
+// WHY this exists as a free function when Stream::query() already does the same
+// thing: our allocator stores bare `StreamHandle`s, not `Stream` objects. It has
+// to — a `Stream` is a move-only RAII owner with a private constructor, so an
+// allocator cannot store or reconstruct one, and it must not own the caller's
+// stream anyway. Without this free function the allocator's pending-free
+// reclaim logic is literally unwritable.
+//
+// Returns true if every operation enqueued on `h` so far has completed. Note the
+// asymmetry with the CUDA API: cudaStreamQuery returns cudaErrorNotReady (not an
+// error!) for "still running", so anything other than cudaSuccess must be read
+// as "not done" rather than propagated as a failure.
+//
+// In a host-only build this is unconditionally true — there is no async work.
+// That is exactly why the allocator needs a test seam to exercise the "not yet
+// safe to reuse" branch on a machine with no GPU (see buddy_allocator.hpp).
+[[nodiscard]] inline bool stream_query([[maybe_unused]] StreamHandle h) {
+#if MCKE_WITH_CUDA
+  return cudaStreamQuery(h) == cudaSuccess;
+#else
+  return true;
+#endif
+}
+
+// Raw-handle event operations, for the same reason stream_query exists: the
+// allocator holds bare handles, not the move-only RAII wrappers.
+//
+// event_record marks "this point in this stream" so that a later event_query can
+// answer "has the work that was queued before the free finished?" — which is a
+// strictly more precise question than stream_query's "is this whole stream idle?".
+[[nodiscard]] inline bool event_record([[maybe_unused]] EventHandle e,
+                                      [[maybe_unused]] StreamHandle s) {
+#if MCKE_WITH_CUDA
+  return cudaEventRecord(e, s) == cudaSuccess;
+#else
+  return true;
+#endif
+}
+
+[[nodiscard]] inline bool event_query([[maybe_unused]] EventHandle e) {
+#if MCKE_WITH_CUDA
+  // As with cudaStreamQuery, cudaErrorNotReady means "still running", not
+  // "failed" — so anything non-success must be read as "not done".
+  return cudaEventQuery(e) == cudaSuccess;
+#else
+  return true;
+#endif
+}
+
+inline void event_synchronize([[maybe_unused]] EventHandle e) {
+#if MCKE_WITH_CUDA
+  (void)cudaEventSynchronize(e);
+#endif
+}
+
 class Event;
 
 // -----------------------------------------------------------------------------

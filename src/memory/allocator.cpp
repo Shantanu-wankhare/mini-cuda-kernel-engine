@@ -20,7 +20,8 @@ std::string AllocatorStats::to_string() const {
   const double mib = 1024.0 * 1024.0;
   os << "allocs=" << alloc_calls << " frees=" << free_calls
      << " raw_mallocs=" << raw_malloc_calls << " raw_frees=" << raw_free_calls
-     << " oom=" << oom_events << " deferred=" << deferred_reuses << '\n'
+     << " oom=" << oom_events << " deferred=" << deferred_reuses
+     << " blocking_drains=" << blocking_drains << '\n'
      << "  reserved=" << bytes_reserved / mib << " MiB"
      << "  in_use=" << bytes_in_use / mib << " MiB"
      << "  requested=" << bytes_requested / mib << " MiB"

@@ -93,6 +93,17 @@ namespace mcke {
 // the headline weakness of a buddy allocator. If you don't record it you cannot
 // report it.
 // -----------------------------------------------------------------------------
+// Sentinel `slab_id` meaning "this block did not come from a slab at all — it was
+// served directly by the underlying device malloc".
+//
+// WHY a sentinel and not just a lookup: `slab_id` defaults to 0, which is also a
+// perfectly valid real slab index. Without a distinct value, `deallocate` has no
+// way to tell a pooled block from a bypassed one except by probing a hash map on
+// *every single call* — a hash lookup on the hot path purely to answer a question
+// the allocation itself could have carried. With the sentinel it is one integer
+// compare, and the map is touched only on the (rare) bypass branch.
+inline constexpr std::uint32_t kBypassSlabId = 0xFFFFFFFFu;
+
 struct Allocation {
   void*       ptr             = nullptr;
   std::size_t bytes           = 0;   // usable size of the block handed out
@@ -121,6 +132,13 @@ struct AllocatorStats {
   std::uint64_t raw_free_calls     = 0;
   std::uint64_t oom_events         = 0;   // requests we could not satisfy
   std::uint64_t deferred_reuses    = 0;   // blocks parked awaiting an event (rule 2)
+
+  // Times we blocked the host to reclaim parked blocks rather than report a
+  // spurious OOM. This project's whole thesis is "no hidden synchronisation", so
+  // a stall we cannot see is worse than one we chose: an untracked host stall
+  // shows up later as an unexplainable latency spike in a benchmark. Counting it
+  // turns "why was p99 40 microseconds?" into a number you can point at.
+  std::uint64_t blocking_drains    = 0;
 
   std::size_t bytes_reserved       = 0;   // total cudaMalloc'd (our footprint)
   std::size_t bytes_in_use         = 0;   // handed out right now

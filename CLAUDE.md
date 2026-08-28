@@ -72,6 +72,8 @@ ctest --test-dir build-host --output-on-failure
 # --- No CMake installed? One-command host test (this is verified to work):
 clang++ -std=c++20 -Wall -Wextra -I include -DMCKE_WITH_CUDA=0 \
   tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp \
+  src/core/host_timer.cpp \
+  src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp \
   -o /tmp/mcke_tests && /tmp/mcke_tests
 ```
 
@@ -129,16 +131,18 @@ CMakeLists.txt          modern CMake; CUDA is an optional language
 include/mcke/
   core/       config.hpp  status.hpp  dtype.hpp  device.hpp
   runtime/    cuda_check.hpp  stream.hpp            # the CUDA boundary
-  memory/     buddy_math.hpp  allocator.hpp  buddy_allocator.hpp  freelist_allocator.hpp
+  memory/     buddy_math.hpp  allocator.hpp  reuse_policy.hpp
+              buddy_allocator.hpp  freelist_allocator.hpp
   tensor/     shape.hpp  tensor.hpp
   graph/      op.hpp  graph.hpp  executor.hpp
   kernels/    kernels.hpp                           # launcher declarations only
-  profiling/  profiler.hpp
+  profiling/  profiler.hpp  host_timer.hpp
 src/          host implementations (.cpp) — no device code
 kernels/      *.cu — kernels + launch sites, nvcc only
 tools/        device_query, smoke tests
 tests/        host-only unit tests (no GTest dependency)
-bench/        benchmark harnesses (Google Benchmark from Phase 5)
+bench/        benchmark harnesses (Google Benchmark from Phase 5);
+              alloc_bench.cpp (Phase 2c) is host-only, no CUDA required
 scripts/      build helpers, SLURM job scripts
 docs/         ROADMAP.md  PROFILING.md  ENVIRONMENTS.md
 ```

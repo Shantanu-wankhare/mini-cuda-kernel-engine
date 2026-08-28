@@ -20,16 +20,41 @@
 //  RUN (macOS, no CUDA, no CMake needed):
 //    clang++ -std=c++20 -I include -DMCKE_WITH_CUDA=0 \
 //        tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp \
+//        src/core/host_timer.cpp \
+//        src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp \
 //        -o /tmp/mcke_tests && /tmp/mcke_tests
+//
+//  NOTE: test_buddy_validate_detects_corruption deliberately abandons live
+//  allocations after corrupting the tree, so BuddyAllocator's leak warning
+//  appears on stderr during that test. That is expected output, not a failure.
 // =============================================================================
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <map>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "mcke/memory/allocator.hpp"
+#include "mcke/memory/buddy_allocator.hpp"
 #include "mcke/memory/buddy_math.hpp"
+#include "mcke/memory/freelist_allocator.hpp"
+#include "mcke/profiling/host_timer.hpp"
 #include "mcke/tensor/shape.hpp"
+
+// -----------------------------------------------------------------------------
+// Test access to BuddyAllocator internals.
+//
+// Declared a friend by the allocator (see buddy_allocator.hpp). Needed because
+// the most valuable assertions are about free-list *shape* — the exact structural
+// signature left by one split-down, and that a full free coalesces back to only
+// the root being free — and no public API can expose that. Exposing internals
+// publicly, or #ifdef-ing the tested binary away from the shipped one, would both
+// be worse.
+// -----------------------------------------------------------------------------
+// Allocator-internals access shims, shared with tests/test_stream_safety.cu.
+#include "test_access.hpp"
 
 namespace {
 
@@ -202,6 +227,1349 @@ void test_raw_allocator() {
   CHECK_EQ(alloc.stats().raw_malloc_calls, alloc.stats().alloc_calls);
 }
 
+// =============================================================================
+//  BuddyAllocator
+//
+//  Every test uses a deliberately TINY arena: 64 KiB with a 256 B minimum block,
+//  so K=16, M=8, L=8, 511 nodes, 256 leaves. Small enough to enumerate
+//  exhaustively, deep enough to have 9 levels — and deliberately the SAME K and M
+//  as test_buddy_math above, so both groups reason about one identical tree.
+//
+//  Property-based over spot checks wherever possible, matching the philosophy of
+//  the buddy-math tests. Randomness comes from a fixed-seed LCG written inline, so
+//  a failure reproduces byte for byte with no <random> portability questions.
+// =============================================================================
+
+using mcke::BuddyTestAccess;
+using NodeState = mcke::BuddyTestAccess::NodeState;
+
+constexpr std::size_t kTestSlab = std::size_t{1} << 16;   // 64 KiB
+constexpr std::size_t kTestMin  = 256;
+constexpr unsigned    kTestK    = 16;   // log2(64 KiB)
+constexpr unsigned    kTestL    = 8;    // = kTestK - log2(kTestMin)
+
+// A config that cannot grow, so exhaustion tests actually reach OOM instead of
+// quietly reserving more memory.
+mcke::BuddyConfig fixed_config() {
+  mcke::BuddyConfig c;
+  c.initial_slab_bytes    = kTestSlab;
+  c.max_total_bytes       = kTestSlab;      // no growth
+  c.min_block_bytes       = kTestMin;
+  c.large_alloc_threshold = SIZE_MAX;       // nothing bypasses: test the tree
+  return c;
+}
+
+// Deterministic LCG (Numerical Recipes constants). Inline rather than <random>
+// because the standard specifies engine recurrences bit-exactly but NOT
+// distributions, so uniform_int_distribution would not reproduce across
+// libc++/libstdc++ — and a property test you cannot reproduce is not a test.
+struct Lcg {
+  std::uint32_t s;
+  std::uint32_t next() { s = s * 1664525u + 1013904223u; return s; }
+  std::size_t below(std::size_t n) { return next() % n; }
+};
+
+void test_buddy_geometry() {
+  std::printf("test_buddy_geometry\n");
+
+  // Slab size rounds UP to a power of two, so reserve(N) actually guarantees an
+  // N-byte request can be served.
+  struct { std::size_t ask; std::size_t want; } cases[] = {
+      {1, kTestMin}, {256, 256}, {257, 512}, {4096, 4096}, {4097, 8192},
+      {kTestSlab, kTestSlab}, {kTestSlab + 1, kTestSlab * 2},
+  };
+  for (const auto& c : cases) {
+    mcke::BuddyConfig cfg;
+    cfg.min_block_bytes = kTestMin;
+    cfg.max_total_bytes = 0;
+    mcke::BuddyAllocator a(cfg);
+    CHECK(a.reserve(c.ask).ok());
+    CHECK_EQ(BuddyTestAccess::slab_bytes(a, 0), c.want);
+    CHECK(a.validate().ok());
+  }
+
+  {  // reserve(0) is an argument error, not an OOM
+    mcke::BuddyAllocator a(fixed_config());
+    const mcke::Status st = a.reserve(0);
+    CHECK(!st.ok());
+    CHECK_EQ(static_cast<int>(st.code()), static_cast<int>(mcke::StatusCode::kInvalidArgument));
+  }
+
+  // Config geometry must be REJECTED, never silently clamped: a min block below
+  // kDeviceAlignment would hand out misaligned pointers, whose only symptom is
+  // uncoalesced loads three phases later.
+  const std::size_t bad_mins[] = {128, 300};
+  for (std::size_t m : bad_mins) {
+    mcke::BuddyConfig cfg = fixed_config();
+    cfg.min_block_bytes = m;
+    mcke::BuddyAllocator a(cfg);
+    CHECK(!a.reserve(kTestSlab).ok());
+  }
+  {
+    mcke::BuddyConfig cfg = fixed_config();
+    cfg.growth_factor = 1.0;              // could never grow: reject, don't clamp
+    mcke::BuddyAllocator a(cfg);
+    CHECK(!a.reserve(kTestSlab).ok());
+  }
+}
+
+void test_buddy_exact_levels() {
+  std::printf("test_buddy_exact_levels\n");
+  // For every level, a request of exactly that block size must come back with
+  // zero waste, at offset 0, and with the block_id the always-descend-left policy
+  // predicts. Asserting the exact block_id is what pins that policy.
+  for (unsigned l = 0; l <= kTestL; ++l) {
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    const std::size_t want = mcke::buddy::block_bytes_at_level(kTestK, l);
+    auto r = a.allocate(want, mcke::rt::StreamHandle{});
+    CHECK(r.ok());
+    if (!r.ok()) continue;
+    CHECK_EQ(r->bytes, want);
+    CHECK_EQ(r->requested_bytes, want);
+    CHECK_EQ(r->internal_waste(), 0u);
+    CHECK_EQ(r->block_id, mcke::buddy::heap_index(l, 0));
+    CHECK(r->ptr == BuddyTestAccess::base(a, 0));       // leftmost => offset 0
+    CHECK_EQ(reinterpret_cast<std::uintptr_t>(r->ptr) % mcke::kDeviceAlignment, 0u);
+    CHECK(a.validate().ok());
+    CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+    CHECK(a.validate().ok());
+  }
+}
+
+void test_buddy_split_signature() {
+  std::printf("test_buddy_split_signature\n");
+  // One allocation of the SMALLEST block from a fresh slab must split the tree
+  // all the way down, leaving exactly one free block at every level except the
+  // root. This exact shape is unreachable through the public API, and it is the
+  // cheapest possible proof that alloc_node pushes one buddy per level descended
+  // rather than churning.
+  mcke::BuddyAllocator a(fixed_config());
+  CHECK(a.reserve(kTestSlab).ok());
+  auto r = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+  CHECK(r.ok());
+  if (!r.ok()) return;
+
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 0u);   // root consumed
+  for (unsigned l = 1; l <= kTestL; ++l)
+    CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, l), 1u);
+  CHECK_EQ(r->block_id, mcke::buddy::heap_index(kTestL, 0));  // leftmost leaf
+  CHECK(a.validate().ok());
+  CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+  // ...and freeing it must merge all the way back to a single free root.
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 1u);
+  for (unsigned l = 1; l <= kTestL; ++l)
+    CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, l), 0u);
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_exhaust_and_coalesce() {
+  std::printf("test_buddy_exhaust_and_coalesce\n");
+  // Densest possible state: every leaf allocated. Covers exhaustion, OOM, the
+  // raw_malloc_calls claim, and address-space tiling in one test.
+  const std::size_t n_leaves = kTestSlab / kTestMin;      // 256
+  CHECK_EQ(n_leaves, 256u);
+
+  for (int order = 0; order < 3; ++order) {
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+
+    std::vector<mcke::Allocation> live;
+    for (std::size_t i = 0; i < n_leaves; ++i) {
+      auto r = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+      CHECK(r.ok());
+      if (r.ok()) live.push_back(*r);
+    }
+    CHECK_EQ(live.size(), n_leaves);
+
+    // One more must fail, and must fail as OOM rather than anything else.
+    auto over = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+    CHECK(!over.ok());
+    CHECK_EQ(static_cast<int>(over.status().code()),
+             static_cast<int>(mcke::StatusCode::kOutOfMemory));
+
+    mcke::AllocatorStats st = a.stats();
+    CHECK_EQ(st.alloc_calls, n_leaves + 1);
+    CHECK_EQ(st.oom_events, 1u);
+    CHECK_EQ(st.bytes_in_use, kTestSlab);
+    CHECK_EQ(st.largest_free_block, 0u);
+    // THE THESIS: 257 allocate calls, one driver allocation.
+    CHECK_EQ(st.raw_malloc_calls, 1u);
+    CHECK(a.validate().ok());
+
+    // The 256 blocks must tile [base, base+64K) exactly: no gap, no overlap.
+    std::vector<std::uintptr_t> addrs;
+    addrs.reserve(live.size());
+    for (const auto& al : live) addrs.push_back(reinterpret_cast<std::uintptr_t>(al.ptr));
+    std::sort(addrs.begin(), addrs.end());
+    CHECK_EQ(addrs[0], reinterpret_cast<std::uintptr_t>(BuddyTestAccess::base(a, 0)));
+    bool tiled = true;
+    for (std::size_t i = 0; i + 1 < addrs.size(); ++i)
+      if (addrs[i + 1] - addrs[i] != kTestMin) tiled = false;
+    CHECK(tiled);
+
+    // Free everything in three different orders. The permutation is what finds
+    // real coalescing bugs; the ordered runs make a failure readable.
+    if (order == 1) std::reverse(live.begin(), live.end());
+    if (order == 2) {
+      Lcg rng{0xC0FFEEu};
+      for (std::size_t i = live.size(); i > 1; --i) std::swap(live[i - 1], live[rng.below(i)]);
+    }
+    for (const auto& al : live) CHECK(a.deallocate(al, mcke::rt::StreamHandle{}).ok());
+
+    // Maximal coalescing: after a full free, ONLY the root is free.
+    CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 1u);
+    for (unsigned l = 1; l <= kTestL; ++l)
+      CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, l), 0u);
+    st = a.stats();
+    CHECK_EQ(st.bytes_in_use, 0u);
+    CHECK_EQ(st.largest_free_block, kTestSlab);
+    CHECK_EQ(st.raw_malloc_calls, 1u);       // still one, after 256 frees
+    CHECK(a.validate().ok());
+  }
+}
+
+void test_buddy_property_no_overlap() {
+  std::printf("test_buddy_property_no_overlap\n");
+  // The flagship test. Mixed power-of-two and DL-shaped sizes, random churn, with
+  // every invariant checked on every iteration against ground truth the test
+  // maintains itself (rather than trusting the allocator's own counters).
+  mcke::BuddyConfig cfg = fixed_config();
+  cfg.max_total_bytes = kTestSlab;
+  mcke::BuddyAllocator a(cfg);
+  CHECK(a.reserve(kTestSlab).ok());
+
+  const std::size_t sizes[] = {1, 255, 256, 257, 768, 3072, 4097, 8192};
+  Lcg rng{0x1234567u};
+
+  struct Live { mcke::Allocation al; unsigned char magic; };
+  std::vector<Live> live;
+  std::size_t truth_in_use = 0, truth_requested = 0, truth_peak = 0;
+  std::size_t oom = 0;
+  int overlap_failures = 0, magic_failures = 0, invariant_failures = 0;
+
+  for (int iter = 0; iter < 20000; ++iter) {
+    const bool do_alloc = live.empty() || (rng.next() % 100) < 60;
+    if (do_alloc) {
+      const std::size_t want = sizes[rng.below(sizeof(sizes) / sizeof(sizes[0]))];
+      auto r = a.allocate(want, mcke::rt::StreamHandle{});
+      if (!r.ok()) { ++oom; continue; }
+      if (r->bytes < want) ++invariant_failures;
+      if (!mcke::buddy::is_power_of_two(r->bytes)) ++invariant_failures;
+      if (r->bytes < kTestMin) ++invariant_failures;
+      if (reinterpret_cast<std::uintptr_t>(r->ptr) % mcke::kDeviceAlignment) ++invariant_failures;
+      // Actually WRITE the block. Pointer bookkeeping that agrees with itself can
+      // still be wrong (correct offset, oversized `bytes`); a magic-byte check
+      // catches genuine aliasing that no amount of accounting would.
+      //
+      // HOST BUILD ONLY, and this is not a cop-out. In a CUDA build `r->ptr` is a
+      // cudaMalloc pointer and a host memset on it segfaults immediately. But the
+      // thing under test here — where the allocator decides a block lives — is
+      // `offset_of()` / the bump pointer / the class ladder, all of which are pure
+      // host integer arithmetic that is byte-for-byte IDENTICAL in both builds.
+      // The backend only changes what `raw_device_malloc` returns, never how we
+      // carve it. So host coverage of this property is complete; a device version
+      // (cudaMemset + D2H cudaMemcpy per op) would add ~40k driver calls to a
+      // 20k-iteration test to re-prove something backend-independent.
+      const unsigned char magic = static_cast<unsigned char>(1 + (r->block_id % 251));
+#if !MCKE_WITH_CUDA
+      std::memset(r->ptr, magic, r->bytes);
+#endif
+      live.push_back({*r, magic});
+      truth_in_use    += r->bytes;
+      truth_requested += r->requested_bytes;
+      truth_peak = std::max(truth_peak, truth_in_use);
+    } else {
+      const std::size_t i = rng.below(live.size());
+      const Live v = live[i];
+      // Verify nothing else scribbled on us while we were live. Host-only for the
+      // same reason as the write above.
+#if !MCKE_WITH_CUDA
+      const unsigned char* p = static_cast<const unsigned char*>(v.al.ptr);
+      for (std::size_t b = 0; b < v.al.bytes; ++b)
+        if (p[b] != v.magic) { ++magic_failures; break; }
+#endif
+      if (!a.deallocate(v.al, mcke::rt::StreamHandle{}).ok()) ++invariant_failures;
+      truth_in_use    -= v.al.bytes;
+      truth_requested -= v.al.requested_bytes;
+      live[i] = live.back();
+      live.pop_back();
+    }
+
+    // Independently maintained ground truth vs the allocator's own counters. This
+    // is the check that catches every stats bug.
+    const mcke::AllocatorStats st = a.stats();
+    if (st.bytes_in_use != truth_in_use || st.bytes_requested != truth_requested ||
+        st.peak_bytes_in_use != truth_peak)
+      ++invariant_failures;
+
+    // Live blocks must be pairwise disjoint in the address space.
+    if ((iter % 50) == 0) {
+      std::map<std::uintptr_t, std::size_t> ivs;
+      for (const auto& v : live) ivs[reinterpret_cast<std::uintptr_t>(v.al.ptr)] = v.al.bytes;
+      std::uintptr_t prev_end = 0;
+      for (const auto& [off, len] : ivs) {
+        if (off < prev_end) { ++overlap_failures; break; }
+        prev_end = off + len;
+      }
+    }
+    if ((iter % 100) == 0 && !a.validate().ok()) ++invariant_failures;
+  }
+
+  CHECK_EQ(overlap_failures, 0);
+  CHECK_EQ(magic_failures, 0);
+  CHECK_EQ(invariant_failures, 0);
+  CHECK(oom > 0);            // a 64 KiB arena under this size mix must hit OOM
+  CHECK(a.validate().ok());
+
+  for (const auto& v : live) CHECK(a.deallocate(v.al, mcke::rt::StreamHandle{}).ok());
+  CHECK_EQ(a.stats().bytes_in_use, 0u);
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 1u);   // merged back to root
+  CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+  CHECK(a.validate().ok());
+  std::printf("  20000 ops, %zu OOM (expected: 64 KiB arena), coalesced back to root\n", oom);
+}
+
+void test_buddy_internal_waste() {
+  std::printf("test_buddy_internal_waste\n");
+  // Pin the exact rounding numbers that will appear in RESULTS.md section 2b.
+  struct { std::size_t ask; std::size_t block; } cases[] = {
+      {257, 512}, {768, 1024}, {3072, 4096}, {4097, 8192},
+  };
+  mcke::BuddyAllocator a(fixed_config());
+  CHECK(a.reserve(kTestSlab).ok());
+  std::size_t sum_ask = 0, sum_block = 0;
+  std::vector<mcke::Allocation> live;
+  for (const auto& c : cases) {
+    auto r = a.allocate(c.ask, mcke::rt::StreamHandle{});
+    CHECK(r.ok());
+    if (!r.ok()) continue;
+    CHECK_EQ(r->bytes, c.block);
+    CHECK_EQ(r->internal_waste(), c.block - c.ask);
+    sum_ask += c.ask;
+    sum_block += c.block;
+    live.push_back(*r);
+  }
+  const mcke::AllocatorStats st = a.stats();
+  CHECK_EQ(st.bytes_requested, sum_ask);
+  CHECK_EQ(st.bytes_in_use, sum_block);
+  CHECK_EQ(st.internal_waste(), sum_block - sum_ask);
+  std::printf("  DL-shaped sizes: requested %zu B, blocks %zu B, waste %zu B (%.1f%%)\n",
+              sum_ask, sum_block, sum_block - sum_ask,
+              100.0 * double(sum_block - sum_ask) / double(sum_block));
+  for (const auto& al : live) CHECK(a.deallocate(al, mcke::rt::StreamHandle{}).ok());
+}
+
+void test_buddy_too_large_and_edges() {
+  std::printf("test_buddy_too_large_and_edges\n");
+  mcke::BuddyAllocator a(fixed_config());
+  CHECK(a.reserve(kTestSlab).ok());
+
+  // Larger than the arena, growth forbidden => clean OOM.
+  auto big = a.allocate(kTestSlab + 1, mcke::rt::StreamHandle{});
+  CHECK(!big.ok());
+  CHECK_EQ(static_cast<int>(big.status().code()),
+           static_cast<int>(mcke::StatusCode::kOutOfMemory));
+
+  // SIZE_MAX must not crash. This works only because the level_for_size sentinel
+  // is checked BEFORE any align_up — buddy_math.hpp documents that align_up wraps
+  // near SIZE_MAX, so the ordering is load-bearing, not incidental.
+  auto huge = a.allocate(SIZE_MAX, mcke::rt::StreamHandle{});
+  CHECK(!huge.ok());
+
+  // Zero bytes is an argument error and must NOT be counted as an OOM — otherwise
+  // this allocator's oom_events would not be comparable with another's.
+  const std::uint64_t oom_before = a.stats().oom_events;
+  auto zero = a.allocate(0, mcke::rt::StreamHandle{});
+  CHECK(!zero.ok());
+  CHECK_EQ(static_cast<int>(zero.status().code()),
+           static_cast<int>(mcke::StatusCode::kInvalidArgument));
+  CHECK_EQ(a.stats().oom_events, oom_before);
+
+  // The allocator must still be fully usable after all of that. An alloc_node
+  // that half-split the tree before discovering it could not finish would fail
+  // exactly here.
+  auto ok = a.allocate(1, mcke::rt::StreamHandle{});
+  CHECK(ok.ok());
+  CHECK(a.validate().ok());
+  if (ok.ok()) {
+    CHECK_EQ(ok->bytes, kTestMin);          // 1 byte rounds up to the min block
+    CHECK(a.deallocate(*ok, mcke::rt::StreamHandle{}).ok());
+  }
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_growth() {
+  std::printf("test_buddy_growth\n");
+  mcke::BuddyConfig cfg;
+  cfg.initial_slab_bytes    = kTestSlab;          // 64 KiB
+  cfg.max_total_bytes       = 3 * kTestSlab;      // 192 KiB
+  cfg.min_block_bytes       = kTestMin;
+  cfg.growth_factor         = 2.0;
+  cfg.large_alloc_threshold = SIZE_MAX;
+  mcke::BuddyAllocator a(cfg);
+  CHECK(a.reserve(kTestSlab).ok());
+  CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+
+  std::vector<mcke::Allocation> live;
+  auto grab = [&](std::size_t n) {
+    auto r = a.allocate(n, mcke::rt::StreamHandle{});
+    if (r.ok()) live.push_back(*r);
+    return r.ok();
+  };
+
+  CHECK(grab(kTestSlab));                       // fills slab 0 entirely
+  CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+  CHECK(grab(kTestSlab));                       // must grow: 64 KiB -> 128 KiB
+  CHECK_EQ(a.stats().raw_malloc_calls, 2u);
+  CHECK_EQ(a.stats().bytes_reserved, 3 * kTestSlab);
+  CHECK(grab(kTestSlab));                       // second half of slab 1: no growth
+  CHECK_EQ(a.stats().raw_malloc_calls, 2u);
+  CHECK(a.validate().ok());
+
+  // Now the cap must bite: every candidate slab size is refused.
+  CHECK(!grab(kTestSlab));
+  CHECK_EQ(a.stats().raw_malloc_calls, 2u);
+  CHECK_EQ(a.stats().oom_events, 1u);
+
+  for (const auto& al : live) CHECK(a.deallocate(al, mcke::rt::StreamHandle{}).ok());
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_bypass() {
+  std::printf("test_buddy_bypass\n");
+  mcke::BuddyConfig cfg = fixed_config();
+  cfg.large_alloc_threshold = 4096;
+  mcke::BuddyAllocator a(cfg);
+  CHECK(a.reserve(kTestSlab).ok());
+  const std::uint64_t raw0 = a.stats().raw_malloc_calls;
+
+  // Pin the boundary: exactly at the threshold stays in the pool, one byte over
+  // bypasses. This is the classic > vs >= off-by-one.
+  auto at = a.allocate(4096, mcke::rt::StreamHandle{});
+  CHECK(at.ok());
+  if (at.ok()) CHECK(at->slab_id != mcke::kBypassSlabId);
+
+  auto over = a.allocate(4097, mcke::rt::StreamHandle{});
+  CHECK(over.ok());
+  if (over.ok()) {
+    CHECK_EQ(over->slab_id, mcke::kBypassSlabId);
+    // Bypass reports zero waste to stay directly comparable with RawDeviceAllocator.
+    CHECK_EQ(over->bytes, over->requested_bytes);
+    CHECK_EQ(a.stats().raw_malloc_calls, raw0 + 1);
+    CHECK(a.validate().ok());
+    CHECK(a.deallocate(*over, mcke::rt::StreamHandle{}).ok());
+    CHECK_EQ(a.stats().raw_free_calls, 1u);
+  }
+  if (at.ok()) CHECK(a.deallocate(*at, mcke::rt::StreamHandle{}).ok());
+  CHECK_EQ(a.stats().bytes_in_use, 0u);
+  CHECK_EQ(a.stats().bytes_reserved, kTestSlab);      // bypassed bytes released
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_trim_preserves_slab_ids() {
+  std::printf("test_buddy_trim_preserves_slab_ids\n");
+  // This test exists to pin ONE decision: trim() must not erase from slabs_,
+  // because erasing shifts indices and invalidates the slab_id inside every
+  // Allocation the caller still holds.
+  mcke::BuddyConfig cfg;
+  cfg.initial_slab_bytes    = kTestSlab;
+  cfg.max_total_bytes       = 3 * kTestSlab;
+  cfg.min_block_bytes       = kTestMin;
+  cfg.large_alloc_threshold = SIZE_MAX;
+  mcke::BuddyAllocator a(cfg);
+  CHECK(a.reserve(kTestSlab).ok());
+
+  auto a0 = a.allocate(kTestSlab, mcke::rt::StreamHandle{});     // fills slab 0
+  CHECK(a0.ok());
+  auto a1 = a.allocate(kTestSlab, mcke::rt::StreamHandle{});     // grows slab 1
+  CHECK(a1.ok());
+  if (!a0.ok() || !a1.ok()) return;
+  CHECK_EQ(a1->slab_id, 1u);
+  CHECK_EQ(BuddyTestAccess::slab_count(a), 2u);
+
+  CHECK(a.deallocate(*a0, mcke::rt::StreamHandle{}).ok());        // slab 0 now idle
+  CHECK(a.trim().ok());
+  CHECK(BuddyTestAccess::base(a, 0) == nullptr);                  // dead slot, not erased
+  CHECK_EQ(BuddyTestAccess::slab_count(a), 2u);                   // NOT shrunk
+  CHECK(BuddyTestAccess::base(a, 1) != nullptr);                  // still live
+  CHECK_EQ(a.stats().raw_free_calls, 1u);
+  CHECK(a.validate().ok());
+
+  // The still-outstanding allocation must deallocate correctly. If trim() had
+  // erased slab 0, a1->slab_id == 1 would now be out of range.
+  CHECK(a.deallocate(*a1, mcke::rt::StreamHandle{}).ok());
+  CHECK_EQ(a.stats().bytes_in_use, 0u);
+
+  // A dead slot must be reused rather than leaked.
+  CHECK(a.trim().ok());
+  auto a2 = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+  CHECK(a2.ok());
+  CHECK_EQ(BuddyTestAccess::slab_count(a), 2u);
+  if (a2.ok()) CHECK(a.deallocate(*a2, mcke::rt::StreamHandle{}).ok());
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_bad_handles() {
+  std::printf("test_buddy_bad_handles\n");
+  mcke::BuddyAllocator a(fixed_config());
+  CHECK(a.reserve(kTestSlab).ok());
+  auto r = a.allocate(1024, mcke::rt::StreamHandle{});
+  CHECK(r.ok());
+  if (!r.ok()) return;
+
+  CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+  // Double free must be a diagnosable Status, not silent tree corruption — a
+  // Phase 4 executor bug will hit this path.
+  const mcke::Status dbl = a.deallocate(*r, mcke::rt::StreamHandle{});
+  CHECK(!dbl.ok());
+  CHECK_EQ(static_cast<int>(dbl.code()),
+           static_cast<int>(mcke::StatusCode::kFailedPrecondition));
+
+  mcke::Allocation bad = *r;
+  bad.slab_id = 99;
+  CHECK_EQ(static_cast<int>(a.deallocate(bad, mcke::rt::StreamHandle{}).code()),
+           static_cast<int>(mcke::StatusCode::kInvalidArgument));
+
+  bad = *r;
+  bad.block_id = 100000;
+  CHECK_EQ(static_cast<int>(a.deallocate(bad, mcke::rt::StreamHandle{}).code()),
+           static_cast<int>(mcke::StatusCode::kInvalidArgument));
+
+  bad = *r;
+  bad.ptr = nullptr;                                    // free(nullptr) convention
+  CHECK(a.deallocate(bad, mcke::rt::StreamHandle{}).ok());
+
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_validate_detects_corruption() {
+  std::printf("test_buddy_validate_detects_corruption\n");
+  // A validate() that has never caught anything is decoration. Inject each class
+  // of corruption behind the allocator's back and confirm it is reported, with the
+  // offending node named in the message.
+  auto message_names_node = [](const mcke::Status& st, std::size_t node) {
+    return st.message().find(std::to_string(node)) != std::string::npos;
+  };
+
+  // NOTE: these cases deliberately abandon live allocations after corrupting the
+  // tree (freeing a corrupted node is meaningless), so the allocator's
+  // leak warning fires on stderr during this test. That is expected output.
+
+  {  // a node marked kUsed while still sitting in a free list.
+     //
+     // Corrupt the BUDDY of the allocated block rather than the block itself.
+     // Corrupting the block would flip it to kFree next to its already-free
+     // buddy, which trips the parent's "both children kFree" check first — a
+     // correct catch, but it names the PARENT, so it cannot pin the
+     // "message identifies the offending node" property. Choosing a corruption
+     // whose own check fires first is what makes that assertion meaningful.
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    auto r = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+    CHECK(r.ok());
+    if (r.ok()) {
+      const std::size_t buddy = mcke::buddy::buddy_of(r->block_id);
+      BuddyTestAccess::set_node_state(a, 0, buddy, NodeState::kUsed);
+      const mcke::Status st = a.validate();
+      CHECK(!st.ok());
+      CHECK_EQ(static_cast<int>(st.code()), static_cast<int>(mcke::StatusCode::kInternal));
+      CHECK(message_names_node(st, buddy));
+    }
+  }
+  {  // a kFree node missing from its free list, caught from the parent side
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    auto r = a.allocate(kTestMin, mcke::rt::StreamHandle{});
+    CHECK(r.ok());
+    if (r.ok()) {
+      BuddyTestAccess::set_node_state(a, 0, r->block_id, NodeState::kFree);
+      const mcke::Status st = a.validate();
+      CHECK(!st.ok());
+      CHECK_EQ(static_cast<int>(st.code()), static_cast<int>(mcke::StatusCode::kInternal));
+      // Caught as a maximal-coalescing violation at the parent — two free buddies
+      // that should have merged. Assert the diagnosis, not a specific node id.
+      CHECK(st.message().find("coalescing not maximal") != std::string::npos ||
+            st.message().find("should have coalesced") != std::string::npos);
+    }
+  }
+  {  // a reachable node marked kDetached
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    BuddyTestAccess::set_node_state(a, 0, 0, NodeState::kDetached);
+    const mcke::Status st = a.validate();
+    CHECK(!st.ok());
+    CHECK(message_names_node(st, 0));
+  }
+  {  // nonempty_mask disagreeing with the lists
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    BuddyTestAccess::clear_mask_bit(a, 0, 0);
+    CHECK(!a.validate().ok());
+  }
+  {  // coalescing not maximal: two free buddies left unmerged
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    auto x = a.allocate(kTestSlab / 2, mcke::rt::StreamHandle{});
+    auto y = a.allocate(kTestSlab / 2, mcke::rt::StreamHandle{});
+    CHECK(x.ok() && y.ok());
+    if (x.ok() && y.ok()) {
+      CHECK(a.validate().ok());
+      // Flip both halves to kFree without touching the free lists: exactly the
+      // state a coalesce loop that exits one iteration early would leave.
+      BuddyTestAccess::set_node_state(a, 0, x->block_id, NodeState::kFree);
+      BuddyTestAccess::set_node_state(a, 0, y->block_id, NodeState::kFree);
+      CHECK(!a.validate().ok());
+    }
+  }
+}
+
+void test_buddy_stats_thesis() {
+  std::printf("test_buddy_stats_thesis\n");
+  // The mirror image of the assertion at the end of test_raw_allocator: where the
+  // baseline is FORCED into raw_malloc_calls == alloc_calls, the pool must reach
+  // raw_malloc_calls << alloc_calls.
+  mcke::BuddyAllocator a(fixed_config());
+  CHECK(a.reserve(kTestSlab).ok());
+
+  // Warm up, then confirm the driver is never touched again.
+  auto warm = a.allocate(1024, mcke::rt::StreamHandle{});
+  CHECK(warm.ok());
+  if (warm.ok()) CHECK(a.deallocate(*warm, mcke::rt::StreamHandle{}).ok());
+  const std::uint64_t raw_after_warmup = a.stats().raw_malloc_calls;
+
+  for (int i = 0; i < 10000; ++i) {
+    auto r = a.allocate(1024, mcke::rt::StreamHandle{});
+    CHECK(r.ok());
+    if (r.ok()) CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+  }
+  const mcke::AllocatorStats st = a.stats();
+  CHECK_EQ(st.raw_malloc_calls, raw_after_warmup);      // delta of EXACTLY zero
+  CHECK_EQ(st.raw_malloc_calls, 1u);
+  CHECK(st.alloc_calls > 10000u);
+  CHECK_EQ(st.bytes_in_use, 0u);
+  CHECK_EQ(st.blocking_drains, 0u);                     // never stalled the host
+  CHECK(a.validate().ok());
+  std::printf("  %llu allocate calls -> %llu driver allocations (delta after warm-up: 0)\n",
+              (unsigned long long)st.alloc_calls, (unsigned long long)st.raw_malloc_calls);
+}
+
+
+// =============================================================================
+//  FreeListAllocator
+//
+//  Test ladder, deliberately tiny so every class can be enumerated:
+//      granularity 512 B, split at 4 KiB  ->  8 linear classes
+//          class 0..7 = 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096
+//      then powers of two ->  class 8..11 = 8 KiB, 16 KiB, 32 KiB, 64 KiB
+//  Slab 64 KiB with a hard footprint cap, matching the buddy tests, so the two
+//  allocators can be run head-to-head on identical requests.
+// =============================================================================
+
+mcke::FreeListConfig fl_config() {
+  mcke::FreeListConfig c;
+  c.slab_bytes              = kTestSlab;      // 64 KiB
+  c.max_total_bytes         = kTestSlab;      // no growth
+  c.small_class_granularity = 512;
+  c.small_large_split       = 4096;
+  c.large_alloc_threshold   = kTestSlab;
+  return c;
+}
+
+void test_freelist_size_classes() {
+  std::printf("test_freelist_size_classes\n");
+  mcke::FreeListAllocator a(fl_config());
+  CHECK_EQ(mcke::FreeListTestAccess::n_small(a), 8u);
+  CHECK_EQ(a.num_classes(), 12u);
+
+  // Exact class block sizes, both regimes and the boundary between them.
+  const std::size_t want[] = {512, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
+                              8192, 16384, 32768, 65536};
+  for (std::size_t c = 0; c < 12; ++c) CHECK_EQ(a.class_block_bytes(c), want[c]);
+
+  // THE invariant that matters: a class must never hand out a block SMALLER than
+  // the request. An off-by-one here is memory corruption, not mere waste — so
+  // check every single byte count in the linear regime rather than sampling.
+  int too_small = 0, not_minimal = 0;
+  for (std::size_t n = 1; n <= 4096; ++n) {
+    const std::size_t cls = a.size_class_of(n);
+    const std::size_t bs  = a.class_block_bytes(cls);
+    if (bs < n) ++too_small;
+    // ...and it must be the SMALLEST such class, or we are wasting more than the
+    // ladder's granularity requires.
+    if (cls > 0 && a.class_block_bytes(cls - 1) >= n) ++not_minimal;
+  }
+  CHECK_EQ(too_small, 0);
+  CHECK_EQ(not_minimal, 0);
+
+  // Boundary: 4096 is the last linear class, 4097 jumps to the power-of-two ladder.
+  CHECK_EQ(a.size_class_of(4096), 7u);
+  CHECK_EQ(a.size_class_of(4097), 8u);
+  CHECK_EQ(a.class_block_bytes(a.size_class_of(4097)), 8192u);
+  CHECK_EQ(a.size_class_of(8192), 8u);
+  CHECK_EQ(a.size_class_of(8193), 9u);
+
+  // The predicted quirk: a 256 B request cannot be represented by a 512 B
+  // granularity, so this design wastes 50% on its smallest class — exactly where
+  // buddy (min block 256 B) is perfect.
+  CHECK_EQ(a.class_block_bytes(a.size_class_of(256)), 512u);
+  std::printf("  256 B request -> 512 B class block (50.0%% wasted; buddy: 0%%)\n");
+}
+
+void test_freelist_basic() {
+  std::printf("test_freelist_basic\n");
+  mcke::FreeListAllocator a(fl_config());
+  CHECK(a.reserve(kTestSlab).ok());
+  CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+
+  auto r = a.allocate(3000, mcke::rt::StreamHandle{});
+  CHECK(r.ok());
+  if (!r.ok()) return;
+  CHECK_EQ(r->bytes, 3072u);                 // class 5
+  CHECK_EQ(r->requested_bytes, 3000u);
+  CHECK_EQ(r->internal_waste(), 72u);
+  CHECK_EQ(reinterpret_cast<std::uintptr_t>(r->ptr) % mcke::kDeviceAlignment, 0u);
+  CHECK(a.validate().ok());
+
+  void* first = r->ptr;
+  CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+  CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 5), 1u);
+  CHECK_EQ(a.stats().bytes_in_use, 0u);
+
+  // A same-class request must hit the cache, not carve new space.
+  auto r2 = a.allocate(2600, mcke::rt::StreamHandle{});   // also class 5
+  CHECK(r2.ok());
+  if (r2.ok()) {
+    CHECK(r2->ptr == first);
+    CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+    CHECK(a.deallocate(*r2, mcke::rt::StreamHandle{}).ok());
+  }
+
+  // The thesis, same as buddy's: allocate calls grow, driver calls do not.
+  for (int i = 0; i < 5000; ++i) {
+    auto x = a.allocate(1500, mcke::rt::StreamHandle{});
+    CHECK(x.ok());
+    if (x.ok()) CHECK(a.deallocate(*x, mcke::rt::StreamHandle{}).ok());
+  }
+  CHECK_EQ(a.stats().raw_malloc_calls, 1u);
+  CHECK(a.validate().ok());
+}
+
+void test_freelist_no_coalescing() {
+  std::printf("test_freelist_no_coalescing\n");
+  // The defining behavioural difference, run as a head-to-head on identical
+  // requests: fill a 64 KiB arena with 512 B blocks, then free two ADJACENT ones.
+  // Buddy merges them; this design cannot.
+  const std::size_t n = kTestSlab / 512;    // 128 blocks
+
+  std::size_t fl_largest = 0, bd_largest = 0;
+  {
+    mcke::FreeListAllocator a(fl_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    std::vector<mcke::Allocation> live;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto x = a.allocate(512, mcke::rt::StreamHandle{});
+      CHECK(x.ok());
+      if (x.ok()) live.push_back(*x);
+    }
+    CHECK_EQ(a.stats().largest_free_block, 0u);   // arena fully carved
+    CHECK(a.deallocate(live[0], mcke::rt::StreamHandle{}).ok());
+    CHECK(a.deallocate(live[1], mcke::rt::StreamHandle{}).ok());
+    fl_largest = a.stats().largest_free_block;
+    CHECK(a.validate().ok());
+    for (std::size_t i = 2; i < live.size(); ++i)
+      CHECK(a.deallocate(live[i], mcke::rt::StreamHandle{}).ok());
+  }
+  {
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    std::vector<mcke::Allocation> live;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto x = a.allocate(512, mcke::rt::StreamHandle{});
+      CHECK(x.ok());
+      if (x.ok()) live.push_back(*x);
+    }
+    CHECK_EQ(a.stats().largest_free_block, 0u);
+    // The first two 512 B blocks buddy hands out are siblings, so they merge.
+    CHECK_EQ(mcke::buddy::buddy_of(live[0].block_id), live[1].block_id);
+    CHECK(a.deallocate(live[0], mcke::rt::StreamHandle{}).ok());
+    CHECK(a.deallocate(live[1], mcke::rt::StreamHandle{}).ok());
+    bd_largest = a.stats().largest_free_block;
+    CHECK(a.validate().ok());
+    for (std::size_t i = 2; i < live.size(); ++i)
+      CHECK(a.deallocate(live[i], mcke::rt::StreamHandle{}).ok());
+  }
+
+  CHECK_EQ(fl_largest, 512u);    // two 512 B holes, forever separate
+  CHECK_EQ(bd_largest, 1024u);   // merged into one 1 KiB block
+  std::printf("  freed 2 adjacent 512 B blocks: freelist largest_free=%zu B, "
+              "buddy=%zu B\n", fl_largest, bd_largest);
+}
+
+void test_freelist_external_fragmentation() {
+  std::printf("test_freelist_external_fragmentation\n");
+  // The money test. Identical request sequence to both allocators:
+  //   fill the arena with 512 B blocks, free ALL of them, then ask for 8 KiB.
+  // Every byte is free in both cases. Only one of them can serve the request.
+  const std::size_t n = kTestSlab / 512;
+
+  bool fl_ok = false, bd_ok = false;
+  std::size_t fl_free_bytes = 0, fl_largest = 0;
+  {
+    mcke::FreeListAllocator a(fl_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    std::vector<mcke::Allocation> live;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto x = a.allocate(512, mcke::rt::StreamHandle{});
+      if (x.ok()) live.push_back(*x);
+    }
+    for (const auto& al : live) CHECK(a.deallocate(al, mcke::rt::StreamHandle{}).ok());
+    CHECK_EQ(a.stats().bytes_in_use, 0u);
+    fl_free_bytes = a.stats().bytes_reserved - a.stats().bytes_in_use;
+    fl_largest    = a.stats().largest_free_block;
+
+    auto big = a.allocate(8192, mcke::rt::StreamHandle{});
+    fl_ok = big.ok();
+    if (big.ok()) CHECK(a.deallocate(*big, mcke::rt::StreamHandle{}).ok());
+    else CHECK_EQ(static_cast<int>(big.status().code()),
+                  static_cast<int>(mcke::StatusCode::kOutOfMemory));
+    CHECK(a.validate().ok());
+  }
+  {
+    mcke::BuddyAllocator a(fixed_config());
+    CHECK(a.reserve(kTestSlab).ok());
+    std::vector<mcke::Allocation> live;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto x = a.allocate(512, mcke::rt::StreamHandle{});
+      if (x.ok()) live.push_back(*x);
+    }
+    for (const auto& al : live) CHECK(a.deallocate(al, mcke::rt::StreamHandle{}).ok());
+    CHECK_EQ(a.stats().largest_free_block, kTestSlab);   // fully coalesced
+    auto big = a.allocate(8192, mcke::rt::StreamHandle{});
+    bd_ok = big.ok();
+    if (big.ok()) CHECK(a.deallocate(*big, mcke::rt::StreamHandle{}).ok());
+    CHECK(a.validate().ok());
+  }
+
+  // This is the whole Phase 2 tradeoff in two booleans.
+  CHECK(!fl_ok);   // holds 64 KiB free, largest contiguous 512 B -> cannot serve 8 KiB
+  CHECK(bd_ok);    // coalesced back to one 64 KiB block -> serves it trivially
+  std::printf("  after freeing 128x512 B: freelist has %zu B free but largest block "
+              "%zu B -> 8 KiB request %s; buddy -> %s\n",
+              fl_free_bytes, fl_largest, fl_ok ? "OK" : "OOM", bd_ok ? "OK" : "OOM");
+}
+
+void test_freelist_beats_buddy_on_dl_shapes() {
+  std::printf("test_freelist_beats_buddy_on_dl_shapes\n");
+  // The other direction: where a finer-than-power-of-two ladder wins. These are
+  // the literal sizes from the roadmap's DL trace.
+  const std::size_t sizes[] = {768 * 4, 3072 * 4, 50257 * 4};   // 3072, 12288, 201028 B
+
+  mcke::FreeListConfig fc;
+  fc.slab_bytes              = std::size_t{4} << 20;
+  fc.max_total_bytes         = std::size_t{4} << 20;
+  fc.small_class_granularity = 512;
+  fc.small_large_split       = std::size_t{1} << 20;
+  fc.large_alloc_threshold   = std::size_t{4} << 20;
+
+  mcke::BuddyConfig bc;
+  bc.initial_slab_bytes    = std::size_t{4} << 20;
+  bc.max_total_bytes       = std::size_t{4} << 20;
+  bc.min_block_bytes       = 256;
+  bc.large_alloc_threshold = SIZE_MAX;
+
+  mcke::FreeListAllocator fl(fc);
+  mcke::BuddyAllocator    bd(bc);
+  CHECK(fl.reserve(fc.slab_bytes).ok());
+  CHECK(bd.reserve(bc.initial_slab_bytes).ok());
+
+  std::size_t requested = 0, fl_blocks = 0, bd_blocks = 0;
+  for (std::size_t n : sizes) {
+    auto f = fl.allocate(n, mcke::rt::StreamHandle{});
+    auto b = bd.allocate(n, mcke::rt::StreamHandle{});
+    CHECK(f.ok() && b.ok());
+    if (!f.ok() || !b.ok()) continue;
+    CHECK(f->bytes >= n);
+    CHECK(b->bytes >= n);
+    requested += n;
+    fl_blocks += f->bytes;
+    bd_blocks += b->bytes;
+    CHECK(fl.deallocate(*f, mcke::rt::StreamHandle{}).ok());
+    CHECK(bd.deallocate(*b, mcke::rt::StreamHandle{}).ok());
+  }
+  CHECK(fl_blocks < bd_blocks);        // the finer ladder wins here
+  CHECK(fl_blocks >= requested);
+  // 768 f32 = 3072 B is exactly a multiple of 512, so freelist is EXACT while
+  // buddy must round to 4096.
+  std::printf("  requested %zu B: freelist %zu B (%.1f%% eff), buddy %zu B (%.1f%% eff)\n",
+              requested, fl_blocks, 100.0 * double(requested) / double(fl_blocks),
+              bd_blocks, 100.0 * double(requested) / double(bd_blocks));
+  CHECK(fl.validate().ok());
+  CHECK(bd.validate().ok());
+}
+
+void test_freelist_split_large_blocks() {
+  std::printf("test_freelist_split_large_blocks\n");
+  // With splitting off, a cached 1 KiB block cannot serve a 512 B request and we
+  // carve new space. With it on, the 1 KiB block is split and the remainder
+  // re-cached -- lower footprint, at the cost of creating a small block that can
+  // never merge back.
+  std::size_t bump_off = 0, bump_on = 0;
+  for (int on = 0; on < 2; ++on) {
+    mcke::FreeListConfig c = fl_config();
+    c.split_large_blocks = (on == 1);
+    mcke::FreeListAllocator a(c);
+    CHECK(a.reserve(kTestSlab).ok());
+
+    auto big = a.allocate(1024, mcke::rt::StreamHandle{});   // class 1
+    CHECK(big.ok());
+    if (!big.ok()) continue;
+    CHECK(a.deallocate(*big, mcke::rt::StreamHandle{}).ok());
+    CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 1), 1u);
+
+    auto small = a.allocate(512, mcke::rt::StreamHandle{});  // class 0
+    CHECK(small.ok());
+    if (!small.ok()) continue;
+    if (on) {
+      // Served by splitting the cached 1 KiB: its class is now empty and a 512 B
+      // remainder appeared in class 0.
+      CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 1), 0u);
+      CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 0), 1u);
+    } else {
+      // The 1 KiB block just sits there, unusable for this request.
+      CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 1), 1u);
+      CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 0), 0u);
+    }
+    CHECK(a.validate().ok());
+    const std::size_t bump = a.stats().bytes_in_use;
+    if (on) bump_on = bump; else bump_off = bump;
+    CHECK(a.deallocate(*small, mcke::rt::StreamHandle{}).ok());
+  }
+  CHECK_EQ(bump_off, 512u);
+  CHECK_EQ(bump_on, 512u);
+}
+
+void test_freelist_bad_handles() {
+  std::printf("test_freelist_bad_handles\n");
+  mcke::FreeListAllocator a(fl_config());
+  CHECK(a.reserve(kTestSlab).ok());
+  auto r = a.allocate(1024, mcke::rt::StreamHandle{});
+  CHECK(r.ok());
+  if (!r.ok()) return;
+  CHECK(a.deallocate(*r, mcke::rt::StreamHandle{}).ok());
+  // The double-free check that live_ is actually paying for.
+  const mcke::Status dbl = a.deallocate(*r, mcke::rt::StreamHandle{});
+  CHECK(!dbl.ok());
+  CHECK_EQ(static_cast<int>(dbl.code()),
+           static_cast<int>(mcke::StatusCode::kFailedPrecondition));
+
+  mcke::Allocation bogus = *r;
+  bogus.ptr = reinterpret_cast<void*>(std::uintptr_t{0xDEAD000});
+  CHECK(!a.deallocate(bogus, mcke::rt::StreamHandle{}).ok());
+  CHECK(a.validate().ok());
+
+  // Config rejection: granularity below the device alignment must be refused,
+  // not clamped -- misaligned blocks are a silent performance bug later.
+  mcke::FreeListConfig bad = fl_config();
+  bad.small_class_granularity = 128;
+  mcke::FreeListAllocator b(bad);
+  CHECK(!b.reserve(kTestSlab).ok());
+  CHECK(!b.allocate(512, mcke::rt::StreamHandle{}).ok());
+}
+
+
+// =============================================================================
+//  LatencyStats — percentile edge cases.
+//
+//  This is the whole reason percentile math lives in a header rather than as a
+//  static function inside bench/alloc_bench.cpp's main(): a static function in
+//  a bench cannot be unit-tested, and off-by-one errors in nearest-rank
+//  indexing are exactly the kind of bug that hides at n=1 or n=2 and then
+//  silently mis-reports a p99 on a 100,000-sample run.
+// =============================================================================
+void test_latency_stats_edge_cases() {
+  std::printf("test_latency_stats_edge_cases\n");
+
+  { // n=1: every percentile must return the single sample.
+    mcke::LatencyStats s(1);
+    s.add(777);
+    s.finalize();
+    CHECK_EQ(s.percentile(0.0), 777u);
+    CHECK_EQ(s.percentile(50.0), 777u);
+    CHECK_EQ(s.percentile(99.9), 777u);
+    CHECK_EQ(s.percentile(100.0), 777u);
+    CHECK_EQ(s.min(), 777u);
+    CHECK_EQ(s.max(), 777u);
+  }
+  { // n=2: nearest-rank must not go out of bounds in either direction.
+    mcke::LatencyStats s(2);
+    s.add(10);
+    s.add(20);
+    s.finalize();
+    CHECK_EQ(s.percentile(0.0), 10u);
+    CHECK_EQ(s.percentile(100.0), 20u);
+    // p50 of 2 samples, nearest-rank: ceil(0.5*2)-1 = 0 -> the lower one.
+    CHECK_EQ(s.median(), 10u);
+  }
+  { // all-equal: every percentile collapses to the one value, no divide-by-zero
+    // anywhere in the mean either.
+    mcke::LatencyStats s(5);
+    for (int i = 0; i < 5; ++i) s.add(42);
+    s.finalize();
+    CHECK_EQ(s.median(), 42u);
+    CHECK_EQ(s.p99(), 42u);
+    CHECK_EQ(s.min(), 42u);
+    CHECK_EQ(s.max(), 42u);
+    CHECK(s.mean_ns() > 41.9 && s.mean_ns() < 42.1);
+  }
+  { // n=100: pins the exact nearest-rank definition against values 1..100.
+    // p99 -> ceil(0.99*100)-1 = 98 (0-indexed) -> the 99th smallest value = 99.
+    mcke::LatencyStats s(100);
+    for (int i = 1; i <= 100; ++i) s.add(static_cast<std::uint64_t>(i));
+    s.finalize();
+    CHECK_EQ(s.percentile(1.0), 1u);
+    CHECK_EQ(s.percentile(50.0), 50u);
+    CHECK_EQ(s.percentile(99.0), 99u);
+    CHECK_EQ(s.percentile(100.0), 100u);
+  }
+  { // empty: must not crash, and must report 0 rather than garbage.
+    mcke::LatencyStats s(0);
+    s.finalize();
+    CHECK_EQ(s.count(), 0u);
+    CHECK_EQ(s.median(), 0u);
+    CHECK(s.empty());
+  }
+
+  // ClockCalibration must produce a sane, self-consistent measurement: nonzero
+  // floor, and paired_median never below tick (the floor is a max of the two).
+  const mcke::ClockCalibration cal = mcke::ClockCalibration::measure(20000);
+  CHECK(cal.floor_ns > 0);
+  CHECK(cal.floor_ns >= cal.tick_ns);
+  CHECK(cal.floor_ns >= cal.paired_median_ns);
+  CHECK(cal.is_below_floor(cal.floor_ns));           // at the floor: not trustworthy
+  CHECK(!cal.is_below_floor(cal.floor_ns * 1000));   // far above it: trustworthy
+  std::printf("  clock: %s\n", cal.describe().c_str());
+}
+
+// =============================================================================
+//  Stream-ordered reuse
+//
+//  These tests only exist because of two observations that together make the
+//  safety-critical deferral path reachable with no GPU:
+//
+//   1. In a host-only build rt::stream_query and rt::event_query are
+//      unconditionally true, so every free would be immediate and the parking
+//      branch would be dead code. The protected `stream_completed` /
+//      `event_completed` seams let a test subclass say "still running".
+//
+//   2. rt::StreamHandle is an opaque void* that the allocator only ever COMPARES
+//      and passes along — it never dereferences it. So a test can fabricate
+//      distinct fake handles and get N distinguishable streams for free.
+//
+//  Together, both rule 1 (same-stream) and rule 2 (cross-stream) run through real
+//  production code paths on a laptop. Guarded off under CUDA, where handing the
+//  driver a fake non-null stream handle would be a genuine crash.
+// =============================================================================
+#if !MCKE_WITH_CUDA
+
+mcke::rt::StreamHandle fake_stream(std::uintptr_t id) {
+  return reinterpret_cast<mcke::rt::StreamHandle>(id);
+}
+
+class TestBuddy : public mcke::BuddyAllocator {
+ public:
+  using mcke::BuddyAllocator::BuddyAllocator;
+  std::set<mcke::rt::StreamHandle> busy_streams;   // "still has work in flight"
+  std::set<std::uint32_t>          busy_events;    // per-slot, see event_completed
+
+ protected:
+  bool stream_completed(mcke::rt::StreamHandle h) const override {
+    return busy_streams.find(h) == busy_streams.end();
+  }
+  bool event_completed(std::uint32_t slot) const override {
+    return busy_events.find(slot) == busy_events.end();
+  }
+};
+
+mcke::BuddyConfig policy_config(mcke::ReusePolicy p) {
+  mcke::BuddyConfig c = fixed_config();
+  c.reuse_policy = p;
+  return c;
+}
+
+void test_buddy_rule1_same_stream() {
+  std::printf("test_buddy_rule1_same_stream\n");
+  // Rule 1 must hold under EVERY policy, and must cost no completion proof: a
+  // block freed on stream S is immediately reusable by S because the stream is
+  // in-order. Every stream is marked busy, so any policy that reached for a
+  // completion probe would fail to reuse and we would see a different pointer.
+  const mcke::ReusePolicy policies[] = {mcke::ReusePolicy::kSameStreamOnly,
+                                        mcke::ReusePolicy::kCoarseStreamPoll,
+                                        mcke::ReusePolicy::kPerFreeEvent};
+  for (mcke::ReusePolicy pol : policies) {
+    TestBuddy a(policy_config(pol));
+    CHECK(a.reserve(kTestSlab).ok());
+    const auto s1 = fake_stream(1);
+    a.busy_streams.insert(s1);              // S1 is NOT idle
+    a.busy_events.insert(0);                // nor is any event on it
+
+    auto r1 = a.allocate(4096, s1);
+    CHECK(r1.ok());
+    if (!r1.ok()) continue;
+    void* first = r1->ptr;
+    CHECK(a.deallocate(*r1, s1).ok());
+
+    auto r2 = a.allocate(4096, s1);         // same stream => reuse without proof
+    CHECK(r2.ok());
+    if (r2.ok()) {
+      CHECK(r2->ptr == first);
+      CHECK_EQ(a.stats().raw_malloc_calls, 1u);   // no growth was needed
+      CHECK(a.deallocate(*r2, s1).ok());
+    }
+    CHECK(a.validate().ok());
+  }
+}
+
+void test_buddy_cross_stream_defers() {
+  std::printf("test_buddy_cross_stream_defers\n");
+  // The safety property, driven deterministically with no GPU.
+  TestBuddy a(policy_config(mcke::ReusePolicy::kCoarseStreamPoll));
+  CHECK(a.reserve(kTestSlab).ok());
+  const auto s1 = fake_stream(1), s2 = fake_stream(2);
+  a.busy_streams.insert(s1);                       // S1 has work in flight
+
+  auto r1 = a.allocate(4096, s1);
+  CHECK(r1.ok());
+  if (!r1.ok()) return;
+  void* first = r1->ptr;
+
+  CHECK(a.deallocate(*r1, s1).ok());
+  CHECK_EQ(a.stats().deferred_reuses, 1u);         // parked, not freed
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);
+  // The whole point: the block is still kUsed in the tree, so it cannot be
+  // handed out or coalesced while S1 might still be reading it.
+  CHECK(BuddyTestAccess::node_state(a, 0, r1->block_id) == NodeState::kUsed);
+  CHECK(a.validate().ok());
+
+  auto r2 = a.allocate(4096, s2);                  // different stream => must NOT reuse
+  CHECK(r2.ok());
+  if (r2.ok()) CHECK(r2->ptr != first);
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u); // still parked
+
+  // Now S1 drains. The next allocate must reclaim it.
+  a.busy_streams.erase(s1);
+  auto r3 = a.allocate(4096, s2);
+  CHECK(r3.ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 0u);
+  CHECK(a.validate().ok());
+
+  if (r2.ok()) CHECK(a.deallocate(*r2, s2).ok());
+  if (r3.ok()) CHECK(a.deallocate(*r3, s2).ok());
+}
+
+void test_buddy_deferred_does_not_coalesce() {
+  std::printf("test_buddy_deferred_does_not_coalesce\n");
+  // The subtle invariant. Two buddies: free one normally, park the other. They
+  // must NOT merge, because a merged block spans memory that a live kernel may
+  // still be reading — and the merged block is exactly what a later allocate
+  // would hand to some other stream.
+  TestBuddy a(policy_config(mcke::ReusePolicy::kCoarseStreamPoll));
+  CHECK(a.reserve(kTestSlab).ok());
+  const auto s1 = fake_stream(1), s2 = fake_stream(2), s3 = fake_stream(3);
+
+  auto x = a.allocate(kTestSlab / 2, s1);          // node 1, level 1
+  auto y = a.allocate(kTestSlab / 2, s2);          // node 2, its buddy
+  CHECK(x.ok() && y.ok());
+  if (!x.ok() || !y.ok()) return;
+  CHECK_EQ(mcke::buddy::buddy_of(x->block_id), y->block_id);
+
+  CHECK(a.deallocate(*x, s1).ok());                // S1 idle => freed immediately
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 0u);
+
+  a.busy_streams.insert(s2);
+  CHECK(a.deallocate(*y, s2).ok());                // S2 busy => parked
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);
+
+  // Both halves are logically free from the caller's point of view, but the tree
+  // must still show only ONE free half and no merged root.
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 1), 1u);
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 0u);
+  CHECK_EQ(a.stats().largest_free_block, kTestSlab / 2);
+  CHECK(a.validate().ok());
+
+  // Release S2. The next allocate reclaims the parked block, and only THEN may
+  // the two halves merge back into the whole arena.
+  a.busy_streams.erase(s2);
+  auto probe = a.allocate(kTestMin, s3);
+  CHECK(probe.ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 0u);
+  if (probe.ok()) CHECK(a.deallocate(*probe, s3).ok());
+  CHECK_EQ(a.stats().largest_free_block, kTestSlab);   // fully merged now
+  CHECK_EQ(BuddyTestAccess::free_list_size(a, 0, 0), 1u);
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_policy_same_stream_only() {
+  std::printf("test_buddy_policy_same_stream_only\n");
+  // kSameStreamOnly never probes for completion, so capacity is stream-affine:
+  // a block freed on S1 stays parked until S1 itself allocates again, EVEN IF S1
+  // is provably idle. That is the policy's defining weakness, asserted rather
+  // than described.
+  TestBuddy a(policy_config(mcke::ReusePolicy::kSameStreamOnly));
+  CHECK(a.reserve(kTestSlab).ok());
+  const auto s1 = fake_stream(1), s2 = fake_stream(2);
+  // Note: busy_streams is EMPTY — every stream is idle. A probing policy would
+  // reclaim instantly. This one still will not.
+
+  auto r1 = a.allocate(4096, s1);
+  CHECK(r1.ok());
+  if (!r1.ok()) return;
+  CHECK(a.deallocate(*r1, s1).ok());
+  CHECK_EQ(a.stats().deferred_reuses, 1u);        // parks even on an idle stream
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);
+
+  auto r2 = a.allocate(4096, s2);                 // S2 cannot claim S1's block
+  CHECK(r2.ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);
+  if (r2.ok()) CHECK(a.deallocate(*r2, s2).ok());  // now two parked, one per stream
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 2u);
+
+  // An allocate on S1 must reclaim ONLY S1's block, via rule 1.
+  auto r3 = a.allocate(4096, s1);
+  CHECK(r3.ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);  // S2's block still parked
+  CHECK(a.validate().ok());
+
+  // trim() drains unconditionally — the documented escape hatch for exactly the
+  // capacity leak this policy creates.
+  if (r3.ok()) CHECK(a.deallocate(*r3, s1).ok());
+  CHECK(a.trim().ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 0u);
+  CHECK(a.stats().blocking_drains > 0u);           // and it counted the stall
+  CHECK(a.validate().ok());
+}
+
+void test_buddy_policy_per_free_event() {
+  std::printf("test_buddy_policy_per_free_event\n");
+  // Per-block precision: two blocks freed on the SAME stream get separate events,
+  // so one can be reclaimed while the other is still in flight. Coarse polling
+  // cannot express that — it would hold both or release both.
+  TestBuddy a(policy_config(mcke::ReusePolicy::kPerFreeEvent));
+  CHECK(a.reserve(kTestSlab).ok());
+  const auto s1 = fake_stream(1), s2 = fake_stream(2);
+
+  auto x = a.allocate(4096, s1);
+  auto y = a.allocate(4096, s1);
+  CHECK(x.ok() && y.ok());
+  if (!x.ok() || !y.ok()) return;
+
+  CHECK(a.deallocate(*x, s1).ok());        // -> event slot 0
+  CHECK(a.deallocate(*y, s1).ok());        // -> event slot 1
+  CHECK_EQ(a.stats().deferred_reuses, 2u); // records unconditionally, by design
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 2u);
+
+  a.busy_events.insert(0);                 // x's work is still running; y's is done
+  auto probe = a.allocate(kTestMin, s2);   // cross-stream: forces the event check
+  CHECK(probe.ok());
+  // Exactly one released. This is the granularity a stream-level probe cannot
+  // reach, and the reason the seam takes a slot rather than a handle.
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 1u);
+  CHECK(BuddyTestAccess::node_state(a, 0, x->block_id) == NodeState::kUsed);
+  CHECK(a.validate().ok());
+
+  a.busy_events.erase(0);
+  auto probe2 = a.allocate(kTestMin, s2);
+  CHECK(probe2.ok());
+  CHECK_EQ(BuddyTestAccess::pending_count(a), 0u);
+
+  if (probe.ok())  CHECK(a.deallocate(*probe, s2).ok());
+  if (probe2.ok()) CHECK(a.deallocate(*probe2, s2).ok());
+  CHECK(a.trim().ok());
+  CHECK(a.validate().ok());
+}
+
+
+class TestFreeList : public mcke::FreeListAllocator {
+ public:
+  using mcke::FreeListAllocator::FreeListAllocator;
+  std::set<mcke::rt::StreamHandle> busy_streams;
+  std::set<std::uint32_t>          busy_events;
+ protected:
+  bool stream_completed(mcke::rt::StreamHandle h) const override {
+    return busy_streams.find(h) == busy_streams.end();
+  }
+  bool event_completed(std::uint32_t slot) const override {
+    return busy_events.find(slot) == busy_events.end();
+  }
+};
+
+void test_freelist_reuse_policies() {
+  std::printf("test_freelist_reuse_policies\n");
+  // Same three policies, same shared decision function as buddy -- which is the
+  // point: any divergence here would contaminate the Phase 2c comparison.
+  const mcke::ReusePolicy pols[] = {mcke::ReusePolicy::kSameStreamOnly,
+                                    mcke::ReusePolicy::kCoarseStreamPoll,
+                                    mcke::ReusePolicy::kPerFreeEvent};
+  for (mcke::ReusePolicy pol : pols) {
+    mcke::FreeListConfig c = fl_config();
+    c.reuse_policy = pol;
+    TestFreeList a(c);
+    CHECK(a.reserve(kTestSlab).ok());
+    const auto s1 = fake_stream(1);
+    a.busy_streams.insert(s1);
+    a.busy_events.insert(0);
+
+    auto r1 = a.allocate(1024, s1);
+    CHECK(r1.ok());
+    if (!r1.ok()) continue;
+    void* first = r1->ptr;
+    CHECK(a.deallocate(*r1, s1).ok());
+    // Rule 1: same stream reuses with no completion proof, under every policy.
+    auto r2 = a.allocate(1024, s1);
+    CHECK(r2.ok());
+    if (r2.ok()) {
+      CHECK(r2->ptr == first);
+      CHECK(a.deallocate(*r2, s1).ok());
+    }
+    CHECK(a.validate().ok());
+  }
+
+  // Cross-stream deferral, and the invariant that a parked block is in NEITHER
+  // live_ nor a class list -- the analogue of buddy keeping a parked node kUsed.
+  {
+    mcke::FreeListConfig c = fl_config();
+    c.reuse_policy = mcke::ReusePolicy::kCoarseStreamPoll;
+    TestFreeList a(c);
+    CHECK(a.reserve(kTestSlab).ok());
+    const auto s1 = fake_stream(1), s2 = fake_stream(2);
+    a.busy_streams.insert(s1);
+
+    auto r = a.allocate(1024, s1);
+    CHECK(r.ok());
+    if (!r.ok()) return;
+    void* first = r->ptr;
+    CHECK(a.deallocate(*r, s1).ok());
+    CHECK_EQ(mcke::FreeListTestAccess::pending_count(a), 1u);
+    CHECK_EQ(mcke::FreeListTestAccess::cached_count(a, 1), 0u);  // NOT reusable yet
+    CHECK_EQ(mcke::FreeListTestAccess::live_count(a), 0u);
+    CHECK(a.validate().ok());
+
+    auto other = a.allocate(1024, s2);      // must not get the parked block
+    CHECK(other.ok());
+    if (other.ok()) CHECK(other->ptr != first);
+
+    a.busy_streams.erase(s1);
+    auto after = a.allocate(1024, s2);      // now the reclaim releases it
+    CHECK(after.ok());
+    CHECK_EQ(mcke::FreeListTestAccess::pending_count(a), 0u);
+    CHECK(a.validate().ok());
+    if (other.ok()) CHECK(a.deallocate(*other, s2).ok());
+    if (after.ok()) CHECK(a.deallocate(*after, s2).ok());
+  }
+}
+
+#endif  // !MCKE_WITH_CUDA
+
 }  // namespace
 
 int main() {
@@ -209,6 +1577,37 @@ int main() {
   test_buddy_math();
   test_shape();
   test_raw_allocator();
+  test_buddy_geometry();
+  test_buddy_exact_levels();
+  test_buddy_split_signature();
+  test_buddy_exhaust_and_coalesce();
+  test_buddy_property_no_overlap();
+  test_buddy_internal_waste();
+  test_buddy_too_large_and_edges();
+  test_buddy_growth();
+  test_buddy_bypass();
+  test_buddy_trim_preserves_slab_ids();
+  test_buddy_bad_handles();
+  test_buddy_validate_detects_corruption();
+  test_buddy_stats_thesis();
+  test_freelist_size_classes();
+  test_freelist_basic();
+  test_freelist_no_coalescing();
+  test_freelist_external_fragmentation();
+  test_freelist_beats_buddy_on_dl_shapes();
+  test_freelist_split_large_blocks();
+  test_freelist_bad_handles();
+  test_latency_stats_edge_cases();
+#if !MCKE_WITH_CUDA
+  // Stream-ordered reuse: needs fake stream handles, which are only safe to
+  // fabricate when no driver will ever see them.
+  test_buddy_rule1_same_stream();
+  test_buddy_cross_stream_defers();
+  test_buddy_deferred_does_not_coalesce();
+  test_buddy_policy_same_stream_only();
+  test_buddy_policy_per_free_event();
+  test_freelist_reuse_policies();
+#endif
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }
