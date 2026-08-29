@@ -70,7 +70,7 @@ ctest --test-dir build-host --output-on-failure
 
 ```bash
 # --- No CMake installed? One-command host test (this is verified to work):
-clang++ -std=c++20 -Wall -Wextra -I include -DMCKE_WITH_CUDA=0 \
+clang++ -std=c++20 -Wall -Wextra -I include -I tests -DMCKE_WITH_CUDA=0 \
   tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp \
   src/core/host_timer.cpp \
   src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp \

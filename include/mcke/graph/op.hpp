@@ -159,7 +159,11 @@ class GemmOp final : public Op {
 // is the cheapest large win in the whole project and the reason kernel fusion
 // exists as a discipline.
 struct BiasActParams {
-  enum class Act { kNone, kRelu, kGelu, kGeluTanh } act = Act::kGelu;
+  // Spelled kGeluErf, matching kernels::Activation exactly. These two enums
+  // describe the same four activations and BiasActOp::launch will translate
+  // between them in Phase 4; letting the same activation carry two different
+  // names across that boundary is how a translation quietly maps the wrong case.
+  enum class Act { kNone, kRelu, kGeluErf, kGeluTanh } act = Act::kGeluErf;
   // GELU has an exact form (0.5x(1+erf(x/sqrt2))) and a tanh approximation.
   // erff() on device is ~20 instructions; the tanh form is ~10 but differs in
   // the 3rd decimal. We implement both and measure, because "which GELU" is a

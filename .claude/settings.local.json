@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/shantanuwankhare/.claude/projects/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime--/memory/**)"
+      "Read(//Users/shantanuwankhare/.claude/projects/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime--/memory/**)",
+      "Bash(python3)",
+      "Bash(cd \"/Users/shantanuwankhare/Downloads/Projects/Mini CUDA Kernel Engine \\(GPU Compute Runtime\\)\" && sed -n '/^namespace mcke {$/,/^}  \\\\/\\\\/ namespace mcke$/p' tests/test_host_core.cpp | head -60)",
+      "Bash(clang++ -std=c++20 -Wall -Wextra -Wpedantic -fsyntax-only -I include -I __TRACKED_VAR__/fakecuda -DMCKE_WITH_CUDA=1 bench/alloc_bench.cpp)"
     ]
   }
 }

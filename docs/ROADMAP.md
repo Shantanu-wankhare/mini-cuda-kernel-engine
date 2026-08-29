@@ -79,8 +79,16 @@ external fragmentation; O(1) coalescing via the buddy XOR identity.
 ---
 
 ## Phase 3 — Kernels
-**Env: [Colab]** to get each variant *correct*, then **[Explorer]** for the
-authoritative table, then **[5060]** for interactive Nsight Compute GUI work.
+**Env: [Colab]** to verify and measure, then **[Explorer]** for the authoritative
+table, then **[5060]** for interactive Nsight Compute GUI work.
+
+**Batched into TWO Colab trips, not one per variant:** 3a/3b/3c together (they
+share a bench driver and a set of assumptions, so they debug together), then 3d.
+Everything is written, type-checked against `scripts/typecheck_cuda.sh`, and
+host-unit-tested on the Mac first — the trips are for verification and
+measurement, not for discovering that something does not compile.
+
+These 3a–3d letters match `RESULTS.md` §3a–§3d one-to-one.
 
 Order matters — one idea per step, benchmark after each:
 

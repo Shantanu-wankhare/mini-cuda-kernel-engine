@@ -55,6 +55,8 @@
 // -----------------------------------------------------------------------------
 // Allocator-internals access shims, shared with tests/test_stream_safety.cu.
 #include "test_access.hpp"
+#include "reference.hpp"
+#include "mcke/kernels/softmax_online.hpp"
 
 namespace {
 
@@ -1251,6 +1253,323 @@ void test_latency_stats_edge_cases() {
   std::printf("  clock: %s\n", cal.describe().c_str());
 }
 
+
+// =============================================================================
+//  The Phase-3 validation harness itself.
+//
+//  These test the TESTER. Every kernel correctness check in Phase 3 routes
+//  through compare(), so a bug here would silently weaken all of them -- a
+//  tolerance that is accidentally infinite passes everything, and one that
+//  mishandles zero fails correct code until someone "fixes" it by loosening it.
+//  Both failure modes end with a test nobody trusts.
+// =============================================================================
+void test_reference_compare() {
+  std::printf("test_reference_compare\n");
+  using namespace mcke::testing;
+
+  {  // identical inputs match at any tolerance, including zero
+    const float a[] = {1.0f, -2.5f, 0.0f, 1e8f, -1e-8f};
+    const CompareResult r = compare(a, a, 5, 0.0, 0.0);
+    CHECK(r.ok());
+    CHECK_EQ(r.mismatches, 0u);
+  }
+  {  // THE near-zero case a pure relative test gets wrong.
+     // want == 0 exactly (what ReLU produces for half its inputs). A relative
+     // test divides by zero here; the mixed form falls back to abs_tol.
+    const float want[] = {0.0f, 0.0f};
+    const float got[]  = {1e-9f, 1e-3f};
+    const CompareResult r = compare(got, want, 2, /*rel_tol=*/1e-5, /*abs_tol=*/1e-8);
+    CHECK_EQ(r.mismatches, 1u);          // 1e-9 passes on abs_tol, 1e-3 does not
+    CHECK_EQ(r.worst_index, 1u);
+  }
+  {  // ...and the large-magnitude case a pure ABSOLUTE test gets wrong: an error
+     // of 1.0 next to 1e8 is 1e-8 relative and entirely acceptable.
+    const float want[] = {1e8f};
+    const float got[]  = {1e8f + 1.0f};
+    CHECK(compare(got, want, 1, /*rel_tol=*/1e-5).ok());
+  }
+  {  // the tolerance boundary is respected in both directions
+    const float want[] = {1.0f, 1.0f};
+    const float just_under[] = {1.0f + 9e-6f, 1.0f};
+    const float just_over[]  = {1.0f + 2e-5f, 1.0f};
+    CHECK(compare(just_under, want, 2, 1e-5).ok());
+    CHECK(!compare(just_over, want, 2, 1e-5).ok());
+  }
+  {  // NaN is reported SEPARATELY, not folded into the mismatch count. A
+     // NaN compares false against everything including itself, so without the
+     // explicit flag an all-NaN output and a slightly-off output are
+     // indistinguishable -- and they are completely different bugs. NaN in a
+     // softmax almost always means the max-subtraction was skipped.
+    const float want[] = {1.0f, 2.0f};
+    const float got[]  = {std::nanf(""), 2.0f};
+    const CompareResult r = compare(got, want, 2, 1e-5);
+    CHECK(!r.ok());
+    CHECK(r.any_nan);
+    CHECK_EQ(r.mismatches, 1u);
+  }
+  {  // an Inf where a finite value was expected must not silently pass
+    const float want[] = {1.0f};
+    const float got[]  = {std::numeric_limits<float>::infinity()};
+    const CompareResult r = compare(got, want, 1, 1e-5);
+    CHECK(!r.ok());
+    CHECK(r.any_inf);
+  }
+  {  // fill_random must be deterministic and in range -- the whole
+     // cross-machine reproducibility argument rests on this
+    std::vector<float> a(64), b(64);
+    fill_random(a.data(), 64, 12345);
+    fill_random(b.data(), 64, 12345);
+    int differing = 0, out_of_range = 0;
+    for (int i = 0; i < 64; ++i) {
+      if (a[i] != b[i]) ++differing;
+      if (a[i] < -1.0f || a[i] > 1.0f) ++out_of_range;
+    }
+    CHECK_EQ(differing, 0);
+    CHECK_EQ(out_of_range, 0);
+    std::vector<float> c(64);
+    fill_random(c.data(), 64, 999);      // a different seed must differ
+    int same = 0;
+    for (int i = 0; i < 64; ++i) if (a[i] == c[i]) ++same;
+    CHECK(same < 64);
+  }
+}
+
+void test_reference_kernels() {
+  std::printf("test_reference_kernels\n");
+  using namespace mcke::testing;
+  namespace K = mcke::kernels;
+
+  {  // bias+act against values computed by hand
+    const float x[]    = {1.0f, -1.0f, 0.5f, -0.5f};
+    const float bias[] = {0.0f, 0.0f};
+    float y[4];
+    reference_bias_act(x, bias, y, 2, 2, K::Activation::kRelu);
+    CHECK(y[0] == 1.0f && y[1] == 0.0f && y[2] == 0.5f && y[3] == 0.0f);
+
+    reference_bias_act(x, bias, y, 2, 2, K::Activation::kNone);
+    CHECK(y[1] == -1.0f);
+
+    // The two GELU forms must AGREE to ~1e-3 but not to 1e-7 -- that gap is the
+    // entire reason "which GELU" is a real question. If they matched exactly,
+    // one of them is not implementing what it claims.
+    float ye[4], yt[4];
+    reference_bias_act(x, bias, ye, 2, 2, K::Activation::kGeluErf);
+    reference_bias_act(x, bias, yt, 2, 2, K::Activation::kGeluTanh);
+    const CompareResult loose = compare(yt, ye, 4, 1e-2);
+    const CompareResult tight = compare(yt, ye, 4, 1e-7);
+    CHECK(loose.ok());
+    CHECK(!tight.ok());
+  }
+  {  // row reduce: sum / mean / max, including an ALL-NEGATIVE row, which is
+     // where a max-identity of 0 instead of -inf silently produces 0
+     const float x[] = {1.0f, 2.0f, 3.0f, 4.0f,
+                        -5.0f, -1.0f, -9.0f, -3.0f};
+    float out[2];
+    reference_row_reduce(x, out, 2, 4, K::ReduceKind::kSum);
+    CHECK(out[0] == 10.0f && out[1] == -18.0f);
+    reference_row_reduce(x, out, 2, 4, K::ReduceKind::kMean);
+    CHECK(out[0] == 2.5f && out[1] == -4.5f);
+    reference_row_reduce(x, out, 2, 4, K::ReduceKind::kMax);
+    CHECK(out[0] == 4.0f);
+    CHECK(out[1] == -1.0f);            // NOT 0 -- the all-negative trap
+  }
+  {  // softmax: rows sum to 1, order is preserved, and a huge logit does NOT
+     // produce NaN (which it would without the max subtraction: expf(1000)=inf)
+    // Ordering, on a MODERATE row where every entry stays representable.
+    const float xm[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float y[4];
+    reference_row_softmax(xm, y, 1, 4);
+    double sum = 0.0;
+    for (int i = 0; i < 4; ++i) sum += y[i];
+    CHECK(std::fabs(sum - 1.0) < 1e-6);
+    CHECK(y[3] > y[2] && y[2] > y[1] && y[1] > y[0]);
+
+    // Overflow safety, on an EXTREME row. Note what is and is not asserted here:
+    // the max subtraction guarantees no NaN/Inf, but it does NOT prevent the
+    // small entries underflowing to EXACTLY 0.0 -- exp(1 - 1000) = e^-999 is
+    // ~1e-434, far below the smallest representable double. So the three losing
+    // entries are all exactly zero and are NOT strictly ordered. That is correct
+    // softmax behaviour at this dynamic range, not a defect; asserting strict
+    // ordering here (as an earlier version of this test did) fails on correct
+    // code. Without the max subtraction this row would be expf(1000) = inf and
+    // the whole result NaN, which is what the isnan checks pin.
+    const float xe[] = {1.0f, 2.0f, 3.0f, 1000.0f};
+    reference_row_softmax(xe, y, 1, 4);
+    CHECK(!std::isnan(y[0]) && !std::isnan(y[3]));
+    CHECK(std::fabs(y[3] - 1.0f) < 1e-6);   // the 1000 dominates completely
+    CHECK(y[0] == 0.0f && y[1] == 0.0f);    // underflowed, as they must
+    double esum = 0.0;
+    for (int i = 0; i < 4; ++i) esum += y[i];
+    CHECK(std::fabs(esum - 1.0) < 1e-6);    // still sums to 1
+
+    // A uniform row must give exactly 1/n.
+    const float u[] = {5.0f, 5.0f, 5.0f, 5.0f};
+    reference_row_softmax(u, y, 1, 4);
+    for (int i = 0; i < 4; ++i) CHECK(std::fabs(y[i] - 0.25f) < 1e-6);
+  }
+  {  // GEMM against a hand-computed 2x2, then alpha/beta which are easy to drop
+    const float a[] = {1.0f, 2.0f, 3.0f, 4.0f};      // [[1,2],[3,4]]
+    const float b[] = {5.0f, 6.0f, 7.0f, 8.0f};      // [[5,6],[7,8]]
+    float c[] = {0.0f, 0.0f, 0.0f, 0.0f};
+    reference_gemm(a, b, c, 2, 2, 2, 1.0f, 0.0f);
+    CHECK(c[0] == 19.0f && c[1] == 22.0f && c[2] == 43.0f && c[3] == 50.0f);
+
+    // beta must accumulate onto the EXISTING C, not overwrite it.
+    float c2[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    reference_gemm(a, b, c2, 2, 2, 2, 2.0f, 3.0f);
+    CHECK(c2[0] == 2.0f * 19.0f + 3.0f);
+    CHECK(c2[3] == 2.0f * 50.0f + 3.0f);
+
+    // A non-square, non-tile-multiple shape: this is where indexing bugs live.
+    const float a3[] = {1, 2, 3, 4, 5, 6};            // 2x3
+    const float b3[] = {1, 2, 3, 4, 5, 6, 7, 8};      // 3x... (use 3x2)
+    float c3[4] = {0, 0, 0, 0};
+    reference_gemm(a3, b3, c3, 2, 2, 3, 1.0f, 0.0f);
+    CHECK(c3[0] == 1*1 + 2*3 + 3*5);                  // 22
+    CHECK(c3[1] == 1*2 + 2*4 + 3*6);                  // 28
+  }
+}
+
+
+// =============================================================================
+//  The online-softmax rescaling recurrence.
+//
+//  This is the trickiest arithmetic in Phase 3 and it is testable here, on a
+//  machine with no GPU, because the recurrence is MCKE_HOST_DEVICE. Verifying it
+//  exhaustively on the Mac -- against the independent three-pass reference, on
+//  random AND adversarial rows -- means that when softmax.cu later disagrees with
+//  the reference on a GPU, the recurrence is already ruled out and the bug is in
+//  the kernel's parallel decomposition. That is worth far more than the twenty
+//  lines it costs.
+// =============================================================================
+void test_online_softmax_recurrence() {
+  std::printf("test_online_softmax_recurrence\n");
+  using mcke::kernels::OnlineState;
+  using mcke::kernels::online_identity;
+  using mcke::kernels::online_update;
+  using mcke::kernels::online_combine;
+
+  // Sequentially folding a whole row must reproduce the three-pass (max, sum).
+  auto fold_all = [](const float* row, int n) {
+    OnlineState s = online_identity();
+    for (int i = 0; i < n; ++i) s = online_update(s, row[i]);
+    return s;
+  };
+  // The three-pass answer, in double, as the thing to be judged against.
+  auto three_pass = [](const float* row, int n, double& m_out, double& d_out) {
+    double m = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n; ++i) m = std::max(m, (double)row[i]);
+    double d = 0.0;
+    for (int i = 0; i < n; ++i) d += std::exp((double)row[i] - m);
+    m_out = m; d_out = d;
+  };
+
+  {  // THE IDENTITY. Two empty partials must combine to an empty partial, NOT
+     // to NaN. With -INFINITY as the identity this computes 0*exp(NaN) and the
+     // whole block reduction is poisoned. This is the single highest-value
+     // assertion in the file, and it is only reachable when cols < blockDim.
+    const OnlineState e = online_identity();
+    const OnlineState ee = online_combine(e, e);
+    CHECK(!std::isnan(ee.m));
+    CHECK(!std::isnan(ee.d));
+    CHECK_EQ(ee.d, 0.0f);
+    // An identity combined with real data must leave the data untouched.
+    OnlineState s = online_update(online_identity(), 3.0f);
+    const OnlineState se = online_combine(s, e);
+    CHECK(std::fabs(se.m - s.m) < 1e-6f);
+    CHECK(std::fabs(se.d - s.d) < 1e-6f);
+  }
+
+  int mismatches = 0, nans = 0, assoc_failures = 0;
+  // Random rows of several lengths, including lengths below a warp.
+  const int lens[] = {1, 2, 17, 31, 32, 33, 255, 256, 1000};
+  for (int li = 0; li < 9; ++li) {
+    const int n = lens[li];
+    std::vector<float> row(static_cast<std::size_t>(n));
+    mcke::testing::fill_random(row.data(), row.size(), 0xABCDEF00ull + li, -8.0f, 8.0f);
+
+    const OnlineState got = fold_all(row.data(), n);
+    double m_ref = 0.0, d_ref = 0.0;
+    three_pass(row.data(), n, m_ref, d_ref);
+    if (std::isnan(got.m) || std::isnan(got.d)) ++nans;
+    if (std::fabs((double)got.m - m_ref) > 1e-6) ++mismatches;
+    // Online accumulates rescaling error, so the sum gets a looser bound than
+    // the max -- the max is a pure selection and must be exact.
+    if (std::fabs((double)got.d - d_ref) / d_ref > 1e-5) ++mismatches;
+
+    // ASSOCIATIVITY is the property the whole parallel decomposition rests on:
+    // if folding [0,k) and [k,n) separately and merging does not equal folding
+    // straight through, then no tree reduction of this operator is valid.
+    for (int k = 1; k < n; k += (n / 4 + 1)) {
+      const OnlineState a = fold_all(row.data(), k);
+      const OnlineState b = fold_all(row.data() + k, n - k);
+      const OnlineState merged = online_combine(a, b);
+      if (std::fabs((double)merged.m - (double)got.m) > 1e-6) ++assoc_failures;
+      if (std::fabs((double)merged.d - (double)got.d) / (double)got.d > 1e-5)
+        ++assoc_failures;
+      // ...and COMMUTATIVITY, since a warp shuffle merges in an arbitrary order.
+      const OnlineState swapped = online_combine(b, a);
+      if (std::fabs((double)swapped.d - (double)merged.d) / (double)merged.d > 1e-6)
+        ++assoc_failures;
+    }
+  }
+  CHECK_EQ(nans, 0);
+  CHECK_EQ(mismatches, 0);
+  CHECK_EQ(assoc_failures, 0);
+
+  {  // ADVERSARIAL: a monotonically increasing row spanning 0..90 is the WORST
+     // case for this algorithm -- the running max updates on every single
+     // element, so every element pays a rescale, and the accumulated error is at
+     // its maximum. It also proves the overflow guard: expf(90) is +inf, so a
+     // formulation without the max subtraction would produce inf/inf = NaN here.
+    const int n = 512;
+    std::vector<float> row(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) row[i] = 90.0f * (float)i / (float)(n - 1);
+    const OnlineState got = fold_all(row.data(), n);
+    double m_ref = 0.0, d_ref = 0.0;
+    three_pass(row.data(), n, m_ref, d_ref);
+    CHECK(!std::isnan(got.m) && !std::isnan(got.d));
+    CHECK(!std::isinf(got.d));
+    CHECK(std::fabs((double)got.m - m_ref) < 1e-6);
+    const double rel = std::fabs((double)got.d - d_ref) / d_ref;
+    CHECK(rel < 1e-4);       // looser: this is the maximum-rescaling case
+    std::printf("  worst case (monotone 0..90, rescale on every element): "
+                "rel err %.2e\n", rel);
+
+    // Reversed: the max arrives FIRST, so no rescale ever happens after it.
+    //
+    // MEASURED RESULT, which CONTRADICTED the prediction and is worth keeping:
+    // the reversed row is *slightly LESS* accurate (2.50e-07 vs 1.73e-07), not
+    // more. The prediction assumed "rescaling is the error source, so no
+    // rescaling means less error." That reasoning is incomplete.
+    //
+    // What actually happens: rescaling does not only introduce error, it also
+    // RENORMALISES. In the forward (monotone increasing) case every new element
+    // IS the new max, so each step computes d = d*exp(m_old - m_new) + 1 -- the
+    // accumulator is damped by a factor < 1 and then has 1.0 added, keeping d at
+    // O(1) throughout and always summing quantities of comparable magnitude,
+    // which is the numerically favourable regime.
+    //
+    // In the reversed case the max arrives first, so d starts at 1.0 and every
+    // subsequent term is exp(very negative) -- a long tail of tiny values added
+    // to a large accumulator. That is the classic ill-conditioned summation
+    // pattern, and it costs more than the rescaling saved.
+    //
+    // So: rescaling error and summation conditioning pull in OPPOSITE directions
+    // here. Both stay at ~2e-7, far inside any tolerance, so neither ordering
+    // matters practically -- but asserting the predicted ordering would be
+    // asserting something false. Assert what is actually guaranteed: both are
+    // small.
+    std::vector<float> rev(row.rbegin(), row.rend());
+    const OnlineState got_rev = fold_all(rev.data(), n);
+    const double rel_rev = std::fabs((double)got_rev.d - d_ref) / d_ref;
+    std::printf("  same row reversed (max first, zero rescaling):        "
+                "rel err %.2e  <- NOT better; see comment\n", rel_rev);
+    CHECK(rel_rev < 1e-4);
+    CHECK(!std::isnan(got_rev.d) && !std::isinf(got_rev.d));
+  }
+}
+
 // =============================================================================
 //  Stream-ordered reuse
 //
@@ -1598,6 +1917,9 @@ int main() {
   test_freelist_split_large_blocks();
   test_freelist_bad_handles();
   test_latency_stats_edge_cases();
+  test_reference_compare();
+  test_reference_kernels();
+  test_online_softmax_recurrence();
 #if !MCKE_WITH_CUDA
   // Stream-ordered reuse: needs fake stream handles, which are only safe to
   // fabricate when no driver will ever see them.

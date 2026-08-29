@@ -120,6 +120,9 @@ endif()
 if(MCKE_ENABLE_CUDA)
   add_library(mcke_kernels STATIC
     kernels/elementwise.cu
+    kernels/bias_act.cu
+    kernels/reduce.cu
+    kernels/softmax.cu
   )
   target_link_libraries(mcke_kernels PUBLIC mcke_core)
   target_compile_options(mcke_kernels PRIVATE
@@ -163,6 +166,38 @@ if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
 
   add_executable(mcke_fma_peak bench/fma_peak.cu)
   target_link_libraries(mcke_fma_peak PRIVATE mcke)
+endif()
+
+# Phase 3 kernel benches verify against the shared CPU reference in
+# tests/reference.hpp before they time anything -- correctness first, always --
+# so the bench targets need tests/ on their include path just as the test
+# targets do.
+set(MCKE_TESTS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+# Phase 3 kernel benches. Each is a .cpp, NOT a .cu: they contain no __global__
+# and no <<<>>>, only calls to the launchers declared in kernels.hpp -- which is
+# exactly the boundary that header exists to define, and tools/smoke_vector_add.cpp
+# is the precedent. Keeping nvcc off the benches also keeps the Colab edit-rebuild
+# loop fast.
+#
+# Gated on MCKE_ENABLE_CUDA (unlike alloc_bench, which is deliberately ungated):
+# in a host-only build kernels/*.cu is never compiled, so every launcher would be
+# an undefined symbol at link time, and there is nothing useful for these to do
+# without a GPU anyway.
+if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
+  foreach(_b bias_act reduce softmax)
+    add_executable(mcke_${_b}_bench bench/${_b}_bench.cpp)
+    target_link_libraries(mcke_${_b}_bench PRIVATE mcke)
+    # tests/ for reference.hpp (the CPU reference each bench validates against
+    # before timing), bench/ for bench_common.hpp.
+    target_include_directories(mcke_${_b}_bench PRIVATE
+      ${MCKE_TESTS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    # mcke_core's warning flags are PRIVATE and are NOT inherited by consumers.
+    # These files do pointer and size arithmetic where -Wextra earns its keep.
+    target_compile_options(mcke_${_b}_bench PRIVATE
+      $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+      $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+  endforeach()
 endif()
 
 # alloc_bench is deliberately NOT gated on MCKE_ENABLE_CUDA: it is a plain .cpp

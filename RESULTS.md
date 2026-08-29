@@ -380,47 +380,153 @@ proves nothing when the real allocators pass.
 
 ## 3. Phase 3 — Kernels
 
-### 3a. GEMM, f32, square M=N=K
+Section letters match `docs/ROADMAP.md` Phase 3 one-to-one: **3a fusion, 3b row
+reduction, 3c row softmax, 3d GEMM.** They are build-order identifiers used in
+commit messages and log entries, so they name work items, not presentation
+order. (An earlier version of this file lettered them 3a=GEMM, 3b=reduce+softmax,
+3c=fusion — three letters for four workloads, contradicting the roadmap. Fixed
+here while §3 was still empty and the fix was free.)
 
-| Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | occupancy | median ms | TFLOP/s | % of measured FMA peak | Machine |
+**Denominators for every "% of peak" in this section** (RESULTS.md rule 5),
+both measured on the Colab T4, never spec-sheet figures:
+`peak_gb_s = 235.4` (from `bench/stream_triad`), `peak_tflops = 8.130` (from
+`bench/fma_peak`), ridge point **34.2 FLOP/byte**.
+
+> Every kernel in §3a–§3c has an arithmetic intensity between 0.08 and 2.8 —
+> **12× to 400× below the ridge point.** They are all memory-bound, so those
+> tables report **GB/s and never TFLOP/s**. Only §3d's GEMM (AI ≈ 682) is
+> compute-bound and reports TFLOP/s. Reporting TFLOP/s for a reduction is the
+> red flag `graph/op.hpp` already warns about.
+
+### 3a. Fusion — bias + activation
+
+Shape **8192 × 4096** (`N = 33,554,432`), identical to §3b/§3c so the three
+memory-bound kernels are directly comparable. At 256 MiB the working set is 64×
+the T4's 4 MiB L2, so nothing caches.
+
+Ideal bytes: fused `(2N + cols)·4` = 268,451,840; unfused pair `(4N + cols)·4` =
+536,887,296. The `cols·4` = 16 KiB bias term is 0.006% of the total — it is in
+the formula because rule 4 requires the count to be reconstructible, not because
+it moves any number.
+
+| Kernel | Activation | vector_width | median ms | min ms | Ideal bytes | GB/s | % measured BW | Machine |
+|---|---|---|---|---|---|---|---|---|
+| _pending_ | | | | | | | | |
+
+Row plan: `{relu, gelu_tanh, gelu_erf} × {fused, unfused}` at vw=4 (6 rows);
+`{vw1, vw2, vw4}` fused + vw1 unfused at gelu_tanh (4); an **L2-resident control**
+at 512×512 (2); a **deliberately occupancy-starved** vw sweep (see below).
+
+**Predictions (2026-08-29, before any run):**
+- Fused ≈ **2×** the unfused pair, because traffic halves and the op is
+  bandwidth-bound.
+- The **L2-resident control at 512×512 should collapse that to ~1.0–1.2×**,
+  because the unfused pair's second kernel then reads its intermediate from L2
+  rather than DRAM. This pre-answers, with a controlled experiment, the question
+  the original prediction paragraph raised as a possible excuse.
+- **`vector_width` buys 0–10% at full occupancy and may be inside the noise** —
+  the T4 absorbs ~3.7 B/cycle/SM while an SM issues ~512 B/cycle of requests,
+  so instruction issue is nowhere near the limiter. The *same sweep at ~6%
+  occupancy* (40 blocks, grid-strided) should show a large win, because vector
+  width buys memory-level parallelism and MLP is only scarce when occupancy is.
+- **`kGeluErf` vs `kGeluTanh` should be invisible** (within ~2%): ~20 vs ~10
+  instructions/element is ~100 µs of FP32-pipe work against a ~1140 µs memory
+  floor. If erf shows up 5–9% slower instead, the arithmetic is no longer fully
+  hidden — which is itself the finding, and `ncu`'s top warp-stall reason
+  (`long_scoreboard` → `mio_throttle`) settles which happened.
+
+Footnote to record: not fusing also costs a full 128 MiB intermediate tensor.
+That is the memory-planner argument Phase 4 will make, measured here.
+
+### 3b. Row reduction
+
+Shape **8192 × 4096**. Ideal bytes `(rows·cols + rows)·4` = 134,250,496
+(128.03 MiB) → 0.570 ms at 235.4 GB/s. AI = 0.25, matching `op.hpp`'s own note.
+
+**Convention:** all three variants use this same ideal-byte count, including
+`kTwoPass`, so the GB/s column ranks them like-for-like. `kTwoPass`'s extra
+partial-staging traffic (~512 KiB, +0.4%) is *algorithmic*, not compulsory, and
+belongs in a footnote rather than the denominator.
+
+| Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | __syncthreads | Machine |
 |---|---|---|---|---|---|---|---|---|---|
-| naive | 4096 | — | | | | | | | |
-| tiled_smem | 4096 | 32,32,32,1,1 | | | | | | | |
-| tiled_regblock | 4096 | 128,128,8,8,8 | | | | | | | |
-| warptile_dbuf | 4096 | 128,128,8,8,8 | | | | | | | |
-| cuBLAS | 4096 | — | — | — | — | | | | |
+| row_reduce_sum | smem_tree_256t | 8192 × 4096 | | | 128.03 MiB | | | **9** | |
+| row_reduce_sum | warp_shuffle_256t | 8192 × 4096 | | | 128.03 MiB | | | **1** | |
+| row_reduce_sum | two_pass_256t_s8 | 8192 × 4096 | | | 128.03 MiB | | | 1 | |
+| row_reduce_sum | two_pass_256t | **64 × 524288** | | | 128.03 MiB | | | 1 | |
+| row_reduce_sum | warp_shuffle_256t | **64 × 524288** | | | 128.03 MiB | | | 1 | |
 
-**Predictions (2026-08-24):** naive 2-4% of peak (AI = 0.25, memory-bound);
-tiled_smem 15-25%; tiled_regblock 45-65%; warptile+double-buffer 60-80%; cuBLAS
-is the ceiling. Each row must attribute its gain to *one* change.
+The barrier count is `1 + log2(blockDim)` = **9** at 256 threads, not 8 — the
+load-into-smem barrier before the tree starts is a real barrier. (Both this
+column and `kernels.hpp` previously said 8.)
 
-Ideal cost: `flops = 2·M·N·K`, `bytes = (M·K + K·N + M·N)·4`.
+**Predictions:** warp-shuffle beats the smem tree by 10–30%. But note the
+ceiling: both move the same 128 MiB and DRAM is the wall, so **if smem_tree
+already reaches ~90% of 235.4 GB/s the maximum possible win is ~11%.** Predict
+the absolute GB/s as well as the ratio — the absolute number is what says whether
+the prediction had room to be true.
 
-### 3b. Reduction / softmax
+**The second shape is the whole justification for `kTwoPass`.** At 8192 rows,
+one block per row gives ~51 waves — saturated, and `kTwoPass` is predicted
+**1–3% slower** (pure overhead). At 64 rows it is 0.4 waves with 24 of 40 SMs
+idle, and `kTwoPass` is predicted **3–10× faster** because it is the only variant
+that can fill the machine. Benchmarked only at the first shape, the variant looks
+like it never wins.
 
-| Kernel | Variant | rows × cols | median ms | GB/s | % measured BW | __syncthreads count | Machine |
-|---|---|---|---|---|---|---|---|
-| row_reduce_sum | smem_tree | 8192 × 4096 | | | | log2(block) | |
-| row_reduce_sum | warp_shuffle | 8192 × 4096 | | | | 1 | |
-| row_softmax | three_pass | 8192 × 4096 | | | | | |
-| row_softmax | online_one_pass | 8192 × 4096 | | | | | |
+### 3c. Row softmax
 
-**Predictions:** warp-shuffle beats the smem tree by 10-30% (fewer barriers, no
-bank conflicts, less smem → higher occupancy). Online softmax reduces global
-traffic from 3 passes to 1-2 and should approach the reduce kernel's bandwidth.
-Both are memory-bound: report **GB/s, not TFLOP/s**.
+Shape **8192 × 4096**. Ideal bytes: **compulsory** traffic `2N·4` = 268,435,456
+for both variants (read x once, write y once), so the GB/s column ranks them
+directly. Algorithmic traffic differs — three-pass reads x three times
+(`4N·4` = 537 MB), online reads it twice (`3N·4` = 403 MB) — and goes in a
+footnote.
 
-### 3c. Fusion
+| Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | max abs(Σrow − 1) | Machine |
+|---|---|---|---|---|---|---|---|---|---|
+| row_softmax | three_pass_256t | 8192 × 4096 | | | 256.0 MiB | | | | |
+| row_softmax | online_one_pass_256t | 8192 × 4096 | | | 256.0 MiB | | | | |
 
-| Kernel | median ms | Ideal bytes | GB/s | Machine |
-|---|---|---|---|---|
-| bias_add then gelu (2 kernels) | | 4·N·4 | | |
-| fused bias_gelu (1 kernel) | | 2·N·4 | | |
+**Predictions:**
+- Speedup **4/3 ≈ 1.33×, not 3×.** "One-pass" names the *statistics* passes
+  (max and sum computed together), not the memory passes — you still need x
+  again to produce y. Netting out likely L2 reuse: **1.0–1.25×**.
+- **Watch for L2 masking the result.** Each row is 16 KiB; ~160 resident blocks
+  give a 2.5 MiB working set that *fits* the T4's 4 MiB L2, so three-pass's 2nd
+  and 3rd reads may never touch DRAM. If three-pass beats its own traffic model,
+  that is the finding, not an error — `dram__bytes_read.sum` vs `3·N·4` settles it.
+- Online should reach **90–100% of `row_reduce`'s GB/s** — equally efficient per
+  byte while moving 3× the bytes. That is what "approaches the reduce kernel's
+  bandwidth" means, and it is a claim about GB/s, not about time.
+- **Online is slightly LESS accurate**, and that is expected: its rescaling chain
+  adds error, and its numerator and denominator are no longer computed from an
+  identical expression. Predict online's max relative error at **2–5×**
+  three-pass's, both under 1e-5. The `Σrow − 1` column is reference-free and
+  exposes exactly that inconsistency (predict ~1e-7 three-pass, ~3e-7 online).
 
-**Prediction:** ~2× speedup, because traffic halves and the op is bandwidth-bound.
-If the measured speedup is well under 2×, find out why (launch overhead
-dominating? cache hits making the second kernel's reads cheap?) — that
-investigation is the deliverable, not the 2×.
+### 3d. GEMM, f32, square M=N=K
+
+| Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | occupancy | median ms | min ms | TFLOP/s | % of measured FMA peak | Machine |
+|---|---|---|---|---|---|---|---|---|---|---|
+| naive | 4096 | — | | | | | | | | |
+| tiled_smem | 4096 | 32,32,32,1,1 | | | | | | | | |
+| tiled_regblock | 4096 | 128,128,8,8,8 | | | | | | | | |
+| warptile_nodbuf | 4096 | 128,128,8,8,8 | | | | | | | | |
+| warptile_dbuf | 4096 | 128,128,8,8,8 | | | | | | | | |
+| cuBLAS | 4096 | — | — | — | — | | | | | |
+
+Ideal cost: `flops = 2·M·N·K` = 1.37e11, `bytes = (M·K + K·N + M·N)·4` = 2.01e8,
+**AI ≈ 682** — deep in compute-bound territory, 20× past the ridge point.
+
+**Predictions (2026-08-24, kept verbatim):** naive 2–4% of peak (AI = 0.25 for
+the *naive access pattern*, memory-bound); tiled_smem 15–25%; tiled_regblock
+45–65%; warptile+double-buffer 60–80%; cuBLAS is the ceiling. Each row must
+attribute its gain to *one* change — which is why `warptile_nodbuf` was added to
+the variant enum, so warp tiling and double buffering get separate rows instead
+of one row with two causes.
+
+`occupancy` is the **hand-computed** figure from regs/thread and smem/block, to
+be compared against Nsight's measured `achieved_occupancy` in §5. Per the
+roadmap, that three-way comparison is the learning; the TFLOP/s is just the score.
 
 ---
 
