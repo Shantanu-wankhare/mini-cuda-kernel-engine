@@ -261,3 +261,193 @@ Next: Phase 2 — `BuddyAllocator`. Design and unit-test the split/merge and
 stream-ordered pending-free logic on the Mac (the logic needs no GPU at all),
 then bring real `raw_malloc_calls`-vs-`alloc_calls` and fragmentation numbers
 back from a GPU session.
+
+---
+
+## 2026-08-26 to 2026-08-29 — Session 3: Phase 2 (2a-2d) — allocators, bench, race test
+
+**Environment:** MacBook Air (Apple Silicon), Apple clang 21.0.0, host-only, for
+all design and implementation. Colab Tesla T4 (driver 580.82.07, nvcc 12.8.93)
+for two verification runs (2026-08-28 and 2026-08-29) via a separate forked
+session, per the owner's request to keep GPU fix-compile-run loops out of the
+main design thread.
+
+### What was built
+
+**Memory (`include/mcke/memory/`, `src/memory/`)**
+- `buddy_allocator.hpp/.cpp` — full implementation: power-of-two slab rounding
+  with OOM halving-retry, split-downward `alloc_node` (search toward the root
+  via `nonempty_mask` + `countl_zero`), coalesce-upward `free_node`, an
+  iterative (non-recursive) `validate()` checking nine invariants, `dump_free_map()`.
+- `freelist_allocator.hpp/.cpp` — linear (512 B granularity) + power-of-two
+  size-class ladder, bump-pointer slab carving, no coalescing by design,
+  optional `split_large_blocks`.
+- `reuse_policy.hpp` — the three cross-stream reuse policies
+  (`kSameStreamOnly`, `kCoarseStreamPoll`, `kPerFreeEvent`) and the single
+  `pending_reusable()` decision function BOTH allocators route through.
+  Extracted into its own header specifically so the Phase 2c buddy-vs-freelist
+  comparison could not be contaminated by the two pools disagreeing about what
+  "safe to reuse" means.
+- `settle_pending()` added to `DeviceAllocator` (2026-08-29, post-Colab fix,
+  see below) — reclaim parked blocks without releasing slabs, distinct from
+  `trim()` which also releases idle slabs to the driver.
+
+**Profiling (`include/mcke/profiling/host_timer.hpp`, `src/core/host_timer.cpp`)**
+- `ClockCalibration`, `LatencyStats` (retained-sample nearest-rank percentiles,
+  log2 histogram), `HostTimer` — kept as a sibling to `profiler.hpp` rather than
+  merged into it, because that file's own banner declares itself GPU-roofline
+  scoped and conditionally includes NVTX; a host-malloc latency type there would
+  make the banner false.
+
+**Benchmark (`bench/alloc_bench.cpp`)**
+- Deterministic trace generator: `uniform_pow2` (13 power-of-two classes,
+  proportional-control live-set targeting, LIFO warmup → random-victim churn →
+  FIFO+size-ratchet adversarial → full drain) and `dl_transformer` (GPT-2-small
+  shapes, long-lived weights + short-lived per-layer/per-decode-step
+  activations), both seeded from a fixed `std::mt19937_64` using **raw engine
+  output only** (never `<random>` distributions — those are not portably
+  specified, engines are).
+- `dl_transformer_bypass`: the DL trace plus a 147 MiB embedding table, kept as
+  its own trace so its one extra permanent driver allocation never muddies the
+  clean traces' `raw_malloc_calls` flatline. Plus a fourth, isolated bypass
+  probe (allocate/assert/free, no churn).
+- Reports three named fragmentation ratios (`block_eff`, `reserv_eff`,
+  `utilisation`) rather than the header's single `utilisation()`, because that
+  one number conflates internal fragmentation with slab over-provisioning.
+- All allocators run under all three reuse policies (7 configs: raw + buddy×3 +
+  freelist×3), so the deallocate-latency comparison decomposes into "pure
+  bookkeeping" vs. "+ one `cudaStreamQuery`" vs. "+ one `cudaEventRecord`".
+
+**Test (`tests/test_stream_safety.cu`, `tests/test_access.hpp`)**
+- The repo's first `.cu` test target. Constructs a real cross-stream reuse race
+  on hardware: a naive one-block pool with no stream tracking (expected to
+  corrupt), each allocator × policy (expected clean), a same-stream control
+  (reuses the identical pointer, still must be clean), and a positive check that
+  `RawDeviceAllocator` is safe because `cudaFree` synchronises.
+- Determinism by construction, not a timed spin: the reader blocks on a flag in
+  mapped pinned host memory; the host only releases it after
+  `cudaStreamSynchronize` proves the corrupting write already landed. A timed
+  spin was in the original design and was replaced after a dedicated red-team
+  pass found it only probabilistically correct (tuned to one GPU's clock,
+  silently degrading elsewhere) — see rejected alternatives below.
+- `test_access.hpp` extracted from `test_host_core.cpp` as a shared friend-access
+  header so both the host test and the `.cu` test assert on the identical
+  `pending_count()` definition rather than risking two copies drifting apart.
+
+### Bugs found and fixed (four, in order of how they were found)
+
+1. **A real bug in Phase 0 header claims**, found by design review before any
+   GPU touched the code: `trim()` as originally declared would have erased from
+   `slabs_`, invalidating the `slab_id` in every outstanding `Allocation`;
+   `Allocation::slab_id` defaulted to 0, colliding with real slab 0; and
+   `reclaim_completed` was literally unwritable — no way to query a bare
+   `StreamHandle`. Fixed with `kBypassSlabId` sentinel, "mark dead, never erase"
+   slabs, and a new `rt::stream_query()` free function.
+2. **`free_node` was O(n), not O(log n), as declared.** Removing a coalesced
+   buddy from the middle of `std::vector<size_t>` free_lists is a linear scan,
+   and a 256 MiB slab's deepest level can hold 524,288 entries — genuinely
+   reachable state. Fixed by adding `pos[]` (node → its index in its own free
+   list) for O(1) swap-and-pop removal.
+3. **A real crash, found by a pre-Colab code audit**: `test_buddy_property_no_overlap`
+   did a host `std::memset`/byte-read on `r->ptr`, which is a `cudaMalloc`
+   pointer in a CUDA build — an immediate segfault, in the flagship
+   20,000-iteration test, registered unconditionally. Guarded to
+   `#if !MCKE_WITH_CUDA`, since the allocator's address computation is pure host
+   arithmetic and identical in both backends — host coverage is sufficient, a
+   device-side version would only re-prove something backend-independent.
+4. **`settle_pending()` — found by the actual Colab run, not by review.** The
+   first GPU run of `test_stream_safety` failed two arms
+   (`buddy/same_stream_only`, `freelist/same_stream_only`) on a secondary
+   diagnostic ("did not park + refuse cross-stream reclaim"), even though the
+   actual safety property held (both CLEAN 20/20). Root cause: under
+   `kSameStreamOnly`, a parked block only settles via a *same-stream* reclaim;
+   the per-trial warm-up round-trip's own frees parked unconditionally with no
+   later same-stream allocate *within the warm-up* to reclaim them, so residue
+   from warm-up polluted the trial's own pending-count delta. The identical
+   mechanism explained `alloc_bench`'s "silently overshot!" lines on
+   `uniform_pow2`: a trace's final drain-phase free has no later same-trace
+   allocate to settle it, so `largest_free_block` understated capacity until the
+   probe's own allocate reclaimed (and for buddy, coalesced) the leftover as an
+   unrelated side effect. Fixed by adding a **public** `DeviceAllocator::settle_pending()`
+   — deliberately not `trim()`, which also releases idle slabs and would have
+   undone the warm-up's whole purpose (keeping a driver call out of the measured
+   window) or invalidated an already-captured fragmentation snapshot.
+
+### Design decisions taken (and alternatives rejected)
+
+| Decision | Chosen | Rejected | Why |
+|---|---|---|---|
+| Free-list node removal | `pos[]` index array, O(1) swap-and-pop | Linear scan (as originally declared) | A 256 MiB slab's level can hold 524,288 free entries; the "O(log n) free" claim needs this to be true, not aspirational |
+| Cross-stream reuse policy | All three (`kSameStreamOnly`/`kCoarseStreamPoll`/`kPerFreeEvent`) implemented and benchmarked, sharing one decision function | Pick one up front | Owner's explicit call; also the only way the Colab deallocate-latency table decomposes into "bookkeeping" vs. "probe cost" |
+| Race-test determinism | Host-released mapped-pinned gate flag | A timed spin (~100 ms, tuned per-GPU) | Red-team review: a timed spin is only probabilistically correct and silently degrades on a different GPU; a false CLEAN would read as proof of safety |
+| Race-test corruption check | Integer mismatch count via one atomicAdd per thread | Warp-shuffle block reduction | The repo has no `__shfl_down_sync` anywhere yet (that's Phase 3b's teaching content); a test whose job is to be unimpeachable shouldn't add a correctness dependency on unproven-in-this-project device code |
+| Settling parked blocks before a measurement | New public `DeviceAllocator::settle_pending()` | Reuse the existing `trim()` | `trim()` also releases idle slabs to the driver — exactly the side effect that would undo a warm-up or invalidate an already-captured stat |
+| Stream-safety unsafe control | A ~25-line `naive_pool` in the test's own anonymous namespace | A `stream_ordered=false` flag on `BuddyConfig` | The flag would be a public header, letting anyone disable the safety property in shipped code forever; a toy pool in a test TU can't escape its translation unit |
+
+### Benchmarks run
+
+**Host (MacBook, `MCKE_WITH_CUDA=0`, 2026-08-26/27):** 37,354 checks, 0
+failures (up from Phase 1's 4,410) — the full buddy/freelist test suite
+including the 20,000-op property test, the stream-ordered reuse policy tests
+(driven via fabricated stream handles, since a host build's real handles are
+all `nullptr`), and the head-to-head allocator comparisons
+(`test_freelist_no_coalescing`, `test_freelist_external_fragmentation`,
+`test_freelist_beats_buddy_on_dl_shapes`). Fragmentation figures from
+`alloc_bench` on this build are **authoritative** (pure host bookkeeping) and
+match the Colab run byte-for-byte.
+
+**Colab T4 (`MCKE_WITH_CUDA=1`, 2026-08-29, after the `settle_pending()` fix):**
+- `ctest`: `host_core` and `stream_safety` both `Passed`. `stream_safety` full
+  breakdown: `naive_pool` corrupted 524,288/524,288 elements on all 20 trials;
+  all six allocator×policy arms plus the same-stream control were CLEAN 20/20
+  with correct mechanism (parked + refused cross-stream reclaim, or reclaimed
+  via rule 1 for the control); `raw(cudaMalloc)` confirmed stream-idle
+  immediately after `deallocate`.
+- `stream_triad` 235.3 GB/s, `fma_peak` 8.126 TFLOP/s — both within 0.1% of the
+  Phase 1 session's numbers, confirming this machine is comparable.
+- `alloc_bench` full latency table across 3 traces × 7 allocator configs (see
+  `RESULTS.md` sec 2a for all figures). Headline: `raw` allocate median
+  1.8-2.9 µs vs. pooled medians 56-182 ns; `raw_malloc_calls` stays at 2-6 total
+  across 26k-99k logical `allocate()` calls for every pooled configuration, vs.
+  being forced equal to `alloc_calls` for raw by construction.
+
+### What was learned — including things that turned out to be wrong
+
+- **The roadmap's freelist prediction was wrong, and the reason is more useful
+  than the number.** Predicted 85-95% `block_eff` on DL shapes; measured 64.0%
+  — an exact tie with buddy. `FreeListConfig::small_large_split` (1 MiB) puts
+  the ladder into power-of-two mode above that point, and multi-MiB tensors are
+  ~all the bytes in a transformer, so the two designs must round identically
+  there. The free-list's real advantage (99.9% vs. 76.6%, pinned in
+  `test_freelist_beats_buddy_on_dl_shapes`) only shows up on sub-1-MiB
+  non-power-of-two shapes — the decode-step sizes, not the weights.
+- **The free-path cost story flips depending on whether you look at median or
+  tail.** Host build and initial reasoning suggested "buddy pays a coalesce
+  cascade on free, freelist doesn't" as a clean tradeoff. Real GPU numbers:
+  buddy's `same_stream` deallocate median is *lower* than freelist's on
+  `dl_transformer` (56 ns vs. 123 ns) — freelist's `unordered_map` insert/erase
+  costs more in the common case than buddy's usually-short coalesce check. The
+  cascade is real but shows up in the tail (p999/max), not the median. A
+  median-only comparison would have said the opposite of what's true.
+  (Owner check-back pending: why do median and tail disagree here, and which
+  one should a caller planning for worst-case latency actually read?)
+- **A safety property can hold while its diagnostic is wrong** — the
+  `settle_pending()` bug (#4 above) is the clean illustration: both failing
+  arms were CLEAN 20/20 in the run that reported `FAIL`. Worth being able to
+  tell these apart under pressure: "the test is red" is not the same claim as
+  "the thing under test is broken."
+
+### What's next
+
+Phase 2 is closed: all 4 sub-parts (buddy, freelist, bench, race test) built,
+tested on the Mac, and verified on real Colab T4 hardware, with
+`docs/ROADMAP.md`'s Phase 2 exit criteria satisfied and `RESULTS.md` sec 2
+holding final numbers.
+
+Next: Phase 3 — kernels (GEMM, reductions, softmax, fused bias+GELU). Per the
+owner's mode/model/effort mapping, expect Plan mode for each kernel variant's
+tiling strategy, Opus, high effort for the warp-tiling/double-buffering GEMM
+work specifically; correctness-critical but simpler fusion ops can run at
+lower effort. `docs/ROADMAP.md` Phase 3 section has the variant-by-variant
+plan already; start with `naive` GEMM to get a correctness and roofline-position
+baseline before tiling.

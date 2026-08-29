@@ -73,6 +73,13 @@ gap is consistent with ordinary run-to-run timing noise rather than a real
 difference between them. The 70-85% guess assumed more daylight between the
 two kernels than actually exists.
 
+**Re-confirmed 2026-08-29** (same Colab T4, different session, used here to
+validate the Phase 2 machine against Phase 1's): `stream_triad` 235.3 GB/s
+(73.5% of spec peak), `fma_peak` 8.126 TFLOP/s — both within 0.1% of the
+2026-08-26 figures. This machine is the same class of result as the one that
+produced the numbers above, so the Phase 2 figures below are directly
+comparable to Phase 1's.
+
 ---
 
 ## 2. Phase 2 — Allocator
@@ -100,28 +107,99 @@ two measures what each safety mechanism actually costs. Without row 1 there is
 no baseline and the deallocate comparison silently becomes a driver-latency
 benchmark.
 
-### 2a. Latency
+### 2a. Latency — **Colab Tesla T4, 2026-08-29, driver 580.82.07 / nvcc 12.8.93**
 
-**Not yet collected — must come from a GPU.** In the host-only build
-`raw_device_malloc` is `aligned_alloc` (~150 ns), not `cudaMalloc` (~10–100 µs),
-so the headline pool-vs-raw speedup is a GPU phenomenon this machine physically
-cannot demonstrate. The bench prints that caveat itself.
+`./build/bin/mcke_alloc_bench` after the `settle_pending()` fix (commit
+`e5c8b9d`). Clock: `tick=22ns paired_median=25ns floor=25ns` — an x86-64 TSC via
+vDSO, ~1000× finer than the Mac's 41 ns ARM timebase, which is why this table
+(not the host build) is the authoritative source for every number in it.
 
-Additionally, the MacBook's host clock has a **41 ns tick** (24 MHz timebase;
-`hw.tbfrequency`), and its own call overhead is also ~41 ns — so any median at or
-below ~82 ns is instrument-limited, not a physical measurement. The bench marks
-those with `*`. An x86-64 host reading the TSC via vDSO resolves ~1 ns, which is
-why this table's authoritative numbers come from Colab.
+**`raw` is real `cudaMalloc`/`cudaFree` here** (unlike the host build, where it
+is `aligned_alloc`), so this is the first table where the 100-1000× pool speedup
+is actually demonstrable.
 
-| Trace | Allocator | Policy | Op | median ns | p90 | p99 | p999 | max | amortised ns | alloc_calls | raw_mallocs | Machine |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| _pending_ | | | | | | | | | | | | |
+**Trace `uniform_pow2`** (99,816 allocs, small blocks 256 B – 1 MiB):
+
+| Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
+|---|---|---|---|---|---|---|---|---|---|
+| raw | allocate | 2913 | 5415 | 11098 | 78140 | 719836 | 3978.0 | 99816 | 99816 |
+| raw | deallocate | 3487 | 7271 | 14003 | 60256 | 402893 | – | – | – |
+| buddy/same_stream | allocate | 63 | 152 | 486 | 2346 | 29753 | 52.0 | 99816 | 2 |
+| buddy/same_stream | deallocate | 42* | 84 | 141 | 441 | 71163 | – | – | – |
+| buddy/coarse_poll | allocate | 56 | 77 | 429 | 524 | 17013 | 279.8 | 99816 | 2 |
+| buddy/coarse_poll | deallocate | 472 | 548 | 654 | 4749 | 34177 | – | – | – |
+| buddy/event | allocate | 62 | 140 | 471 | 597 | 26254 | 403.6 | 99816 | 2 |
+| buddy/event | deallocate | 526 | 978 | 1301 | 7082 | 107915 | – | – | – |
+| freelist/same_stream | allocate | 120 | 169 | 258 | 496 | 303011 | 109.3 | 99816 | 5 |
+| freelist/same_stream | deallocate | 108 | 195 | 322 | 579 | 400805 | – | – | – |
+| freelist/coarse_poll | allocate | 113 | 148 | 256 | 467 | 309729 | 345.2 | 99816 | 5 |
+| freelist/coarse_poll | deallocate | 604 | 717 | 1061 | 7701 | 555192 | – | – | – |
+| freelist/event | allocate | 125 | 187 | 286 | 515 | 307205 | 538.3 | 99816 | 5 |
+| freelist/event | deallocate | 656 | 1214 | 1737 | 8430 | 525543 | – | – | – |
+
+**Trace `dl_transformer`** (26,010 allocs, GPT-2-small shapes, multi-MiB tensors
+dominate):
+
+| Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
+|---|---|---|---|---|---|---|---|---|---|
+| raw | allocate | 1855 | 66439 | 105048 | 137964 | 309106 | 32879.1 | 26010 | 26010 |
+| raw | deallocate | 1838 | 121022 | 489471 | 573950 | 978282 | – | – | – |
+| buddy/same_stream | allocate | 144 | 1412 | 1672 | 7614 | 438994 | 244.1 | 26010 | 3 |
+| buddy/same_stream | deallocate | 56 | 63 | 94 | 173 | 17100 | – | – | – |
+| buddy/coarse_poll | allocate | 101 | 1460 | 1659 | 7802 | 407527 | 677.3 | 26010 | 3 |
+| buddy/coarse_poll | deallocate | 958 | 1080 | 1138 | 12560 | 35995 | – | – | – |
+| buddy/event | allocate | 182 | 1509 | 1709 | 6381 | 364438 | 770.9 | 26010 | 3 |
+| buddy/event | deallocate | 1028 | 1126 | 1177 | 13066 | 18882 | – | – | – |
+| freelist/same_stream | allocate | 157 | 236 | 266 | 413 | 102191 | 126.4 | 26010 | 5 |
+| freelist/same_stream | deallocate | 123 | 135 | 169 | 316 | 17586 | – | – | – |
+| freelist/coarse_poll | allocate | 145 | 160 | 195 | 404 | 134252 | 564.1 | 26010 | 5 |
+| freelist/coarse_poll | deallocate | 1063 | 1127 | 1186 | 12741 | 58471 | – | – | – |
+| freelist/event | allocate | 166 | 241 | 327 | 592 | 104856 | 604.6 | 26010 | 5 |
+| freelist/event | deallocate | 1055 | 1167 | 1327 | 13401 | 1879240 | – | – | – |
+
+**Trace `dl_transformer_bypass`** (26,011 allocs, same shapes + one 147 MiB
+embedding table taking the bypass path):
+
+| Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
+|---|---|---|---|---|---|---|---|---|---|
+| raw | allocate | 2275 | 86233 | 120732 | 152884 | 1970152 | 26905.3 | 26011 | 26011 |
+| raw | deallocate | 2113 | 114587 | 336525 | 383271 | 1524228 | – | – | – |
+| buddy/same_stream | allocate | 78 | 678 | 798 | 1349 | 273937 | 129.6 | 26011 | 4 |
+| buddy/same_stream | deallocate | 36* | 42* | 107 | 130 | 199844 | – | – | – |
+| buddy/coarse_poll | allocate | 61 | 692 | 822 | 2763 | 255691 | 343.7 | 26011 | 4 |
+| buddy/coarse_poll | deallocate | 493 | 554 | 696 | 5974 | 206069 | – | – | – |
+| buddy/event | allocate | 93 | 736 | 848 | 1802 | 240317 | 396.4 | 26011 | 4 |
+| buddy/event | deallocate | 517 | 578 | 688 | 6893 | 183931 | – | – | – |
+| freelist/same_stream | allocate | 90 | 131 | 156 | 332 | 88066 | 74.7 | 26011 | 6 |
+| freelist/same_stream | deallocate | 76 | 86 | 117 | 192 | 163973 | – | – | – |
+| freelist/coarse_poll | allocate | 91 | 106 | 124 | 194 | 77632 | 301.3 | 26011 | 6 |
+| freelist/coarse_poll | deallocate | 565 | 606 | 641 | 9481 | 222100 | – | – | – |
+| freelist/event | allocate | 94 | 138 | 164 | 304 | 72531 | 323.7 | 26011 | 6 |
+| freelist/event | deallocate | 546 | 626 | 652 | 5768 | 195660 | – | – | – |
+
+`*` = at or below the 25 ns instrument floor.
 
 *The `amortised` column is one timestamp bracket around the whole bare loop
 divided by op count — it recovers fast-path cost on a coarse clock, where the
 per-op median is quantised. Per-op timing is kept anyway because averaging a
 batch provably erases the p99 tail, which is the entire reason p99 is an exit
 criterion.*
+
+**The deallocate decomposition, exactly as designed** (see the policy table
+above). `same_stream` never probes; `coarse_poll` and `event` each add one real
+driver round trip. On `dl_transformer`: same_stream deallocate median 56 ns,
+coarse_poll 958 ns, event 1028 ns — a ~900-1000 ns tax for the completion proof,
+on top of whatever the allocator's own bookkeeping costs. That tax is close to
+constant across allocators and traces (compare buddy 958 ns vs. freelist 1063 ns
+coarse_poll on the same trace), which is exactly what "you're paying for a
+`cudaStreamQuery`, not for the allocator" should look like.
+
+**The headline claim, on real hardware:** `raw` allocate median ranges
+1.8–2.9 µs and its p99 climbs into the 11-120 µs range depending on trace (real
+`cudaMalloc` against the live driver state) — three orders of magnitude above
+any pooled allocator's median. `raw_malloc_calls` is forced to equal
+`alloc_calls` by construction; every pooled configuration in every trace stays
+at 2-6 total driver allocations for 26k-99k logical allocate calls.
 
 ### 2b. Fragmentation — **authoritative, host-only build**
 
@@ -139,8 +217,12 @@ allocator that wasted literally zero bytes:
 - **`utilisation`** = their product; what the header's accessor reports.
 
 Measured 2026-08-26, MacBook Air (Apple Silicon), Apple clang 21.0.0,
-`MCKE_WITH_CUDA=0`. Policy does not affect fragmentation, so one row per
-allocator (all three policies produced identical figures except where noted).
+`MCKE_WITH_CUDA=0`, and **re-confirmed byte-for-byte on Colab Tesla T4,
+2026-08-29** after the `settle_pending()` fix — every peak/waste/largest_free
+figure below matched exactly across the two machines, which is the expected
+outcome for numbers that are pure host bookkeeping with no GPU dependency.
+Policy does not affect fragmentation, so one row per allocator (all three
+policies produced identical figures).
 
 **Trace `uniform_pow2`** — the control. Every size is `2^k ≥ kMinBlockBytes`,
 so buddy's internal waste **must** be exactly zero; any other value is an
@@ -149,7 +231,7 @@ allocator bug, not a result.
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 29.80 MiB | 29.80 MiB | 29.80 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
-| buddy | 48.00 MiB | 29.80 MiB | 29.80 MiB | **100.0%** | 62.1% | 62.1% | **0 B** | 16–32 MiB | no |
+| buddy | 48.00 MiB | 29.80 MiB | 29.80 MiB | **100.0%** | 62.1% | 62.1% | **0 B** | 32.00 MiB | no |
 | freelist | 80.00 MiB | 36.38 MiB | 29.04 MiB | 79.8% | 45.5% | 36.3% | 7.34 MiB | 8.00 MiB | no |
 
 Buddy's 0 B is the control assertion holding. Freelist's 7.34 MiB comes from its
@@ -233,22 +315,66 @@ measured, and neither allocator is categorically better:
 |---|---|---|
 | largest contiguous free block after full drain | **wins** (32 MiB vs 16 MiB) | |
 | internal fragmentation on sub-1 MiB non-pow2 shapes | | **wins** (99.9% vs 76.6%) |
-| free-path cost | pays a coalesce cascade | O(1) push, no cascade |
+| free-path cost (`same_stream` deallocate median, Colab T4, `dl_transformer`) | 56 ns | **wins**, 123 ns — but see below |
 
-### 2d. Stream-safety race — pending (GPU only)
+**On real hardware the free-path story is more nuanced than the host build
+suggested.** Buddy's `same_stream` deallocate median is *lower* than
+freelist's on `dl_transformer` (56 ns vs 123 ns) — freelist pays a
+`std::unordered_map` insert (`live_`) on every allocate and an erase on every
+free, which turns out to cost more than buddy's coalescing check in the common
+case where the coalesce loop terminates after 0-1 iterations. The coalesce
+*cascade* buddy pays for is real, but it shows up in the **tail**, not the
+median: buddy's p99 deallocate is close to freelist's or worse in several rows
+(e.g. `dl_transformer_bypass` freelist/event p999 5768 ns vs buddy/event
+6893 ns), and its `max` occasionally spikes far higher (buddy/same_stream
+`dl_transformer_bypass` max 199,844 ns — almost certainly one trial's
+first-touch/cudaEventCreate cost, not the allocator itself, since it does not
+recur at that magnitude elsewhere in the same row). The one-line qualitative
+story ("buddy pays a cascade, freelist doesn't") is directionally right but the
+median comparison alone would have said the opposite thing.
 
-`tests/test_stream_safety.cu`, `ctest -R stream_safety`. Cannot run host-only:
-with `MCKE_WITH_CUDA=0` both stream handles are `nullptr`, so rule 1 in
-`pending_reusable()` legitimately fires, `stream_query` is unconditionally true
-so nothing ever parks, and there is no concurrency — there is no race to
-construct.
+### 2d. Stream-safety race — **PASSED, Colab Tesla T4, 2026-08-29**
 
-| Arm | Expected | Observed | Aliased? | Refused reclaim? |
-|---|---|---|---|---|
-| naive_pool (no stream tracking) | CORRUPT 20/20 | _pending_ | | |
-| buddy/freelist × 3 policies | CLEAN 20/20 | _pending_ | | |
-| same-stream control | CLEAN 20/20, **same pointer** | _pending_ | | |
-| raw(cudaMalloc) | stream idle after free | _pending_ | | |
+`ctest --test-dir build -R stream_safety` → `Passed` (0.50 s), after the
+`settle_pending()` fix (an earlier run failed two arms — see below).
+
+`tests/test_stream_safety.cu`. Cannot run host-only: with `MCKE_WITH_CUDA=0`
+both stream handles are `nullptr`, so rule 1 in `pending_reusable()`
+legitimately fires, `stream_query` is unconditionally true so nothing ever
+parks, and there is no concurrency — there is no race to construct.
+
+The reader is gated on a host-released mapped-pinned flag, not a timed spin: the
+host only sets it after `cudaStreamSynchronize(S2)` proves the corrupting write
+already landed, so the ordering is structural rather than probabilistic. Every
+arm ran 20 trials.
+
+| Arm | Expected | Observed | Aliased? | Refused cross-stream reclaim? | Result |
+|---|---|---|---|---|---|
+| naive_pool (no stream tracking) | CORRUPT 20/20 | **CORRUPT 20/20** (524,288 of 524,288 elements every trial) | yes | – | ok |
+| buddy/same_stream_only | CLEAN 20/20 | CLEAN 20/20 | no | **yes** | ok |
+| buddy/coarse_poll | CLEAN 20/20 | CLEAN 20/20 | no | yes | ok |
+| buddy/per_free_event | CLEAN 20/20 | CLEAN 20/20 | no | yes | ok |
+| freelist/same_stream_only | CLEAN 20/20 | CLEAN 20/20 | no | **yes** | ok |
+| freelist/coarse_poll | CLEAN 20/20 | CLEAN 20/20 | no | yes | ok |
+| freelist/per_free_event | CLEAN 20/20 | CLEAN 20/20 | no | yes | ok |
+| buddy/same_stream **control** | CLEAN 20/20, same pointer | CLEAN 20/20 | **yes** | – | ok |
+| raw(cudaMalloc) | stream idle after free | stream idle | – | – | ok |
+
+**The two bold "yes" cells are the fix.** The first Colab run (before
+`settle_pending()`) reported these two as `NO` — not because the allocators
+were unsafe (both were CLEAN 20/20 in that run too) but because a block parked
+during the per-trial warm-up under `kSameStreamOnly` had no same-stream
+allocate *within the warm-up* to trigger its own reclaim, so it was still
+counted as pending when the trial's own block should have been the only thing
+there. `settle_pending()` (added to `DeviceAllocator`, see `PROJECT_LOG.md`)
+flushes that residue before the measured window opens. The safety **property**
+was correct in both runs; only this secondary mechanism diagnostic needed the
+fix.
+
+**The naive control matters as much as the failures.** Its 100%-of-elements
+corruption on every single trial is what makes every other row's CLEAN mean
+something — a race harness that never demonstrates the race is a harness that
+proves nothing when the real allocators pass.
 
 ---
 

@@ -46,7 +46,7 @@ spec bandwidth number differs from measured; grid-stride loops; coalescing.
 
 ---
 
-## Phase 2 — Memory management
+## Phase 2 — Memory management ✅ *(done, 2026-08-26 to 2026-08-29)*
 **Env: [Mac]** for 2a/2b logic and tests, **[Colab]** for 2c numbers.
 
 - **2a. `BuddyAllocator`** (`src/memory/buddy_allocator.cpp`). Split/merge over
@@ -66,7 +66,12 @@ spec bandwidth number differs from measured; grid-stride loops; coalescing.
 **Exit (all measured, into `RESULTS.md` §2):** allocate latency median + p99 for
 all three; `raw_malloc_calls` flat after warm-up; utilisation and internal waste
 per allocator per trace; a documented case where each design wins; the race test
-passing.
+passing. **All satisfied** — see `RESULTS.md` §2, `PROJECT_LOG.md` Session 3.
+Actually built as three traces (added `dl_transformer_bypass` for the
+large-allocation bypass path) and all three cross-stream reuse policies
+(`kSameStreamOnly`/`kCoarseStreamPoll`/`kPerFreeEvent`) rather than one, per an
+owner decision partway through — the deallocate-latency comparison decomposes
+cleanly into "pure bookkeeping" vs. "+ one driver call" as a result.
 
 **Concepts:** stream-ordered semantics; why `cudaFree` synchronises; internal vs
 external fragmentation; O(1) coalescing via the buddy XOR identity.
