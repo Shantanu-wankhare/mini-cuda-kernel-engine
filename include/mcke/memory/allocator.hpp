@@ -181,6 +181,29 @@ class DeviceAllocator {
   // and synchronising; never call it inside a timed region.
   virtual Status trim() { return OkStatus(); }
 
+  // Reclaim any parked (deferred cross-stream) blocks whose safety condition
+  // has since been satisfied, WITHOUT releasing any slab back to the driver.
+  //
+  // WHY THIS EXISTS, and why it is not the same thing as trim(): a stream-
+  // ordered pool can leave a freed block "parked" — logically returned by the
+  // caller, but not yet merged back into the free structure because its last
+  // consumer stream had not yet been proven idle. Until something reclaims it,
+  // every metric derived from the free structure (largest_free_block, an
+  // internal-fragmentation ratio, even a naive OOM check) UNDERSTATES real
+  // capacity. Normally that self-corrects on the very next allocate on a
+  // matching or now-idle stream — but a caller who wants an accurate snapshot
+  // *right now*, without also performing an allocation, has no way to force it.
+  // trim() looks like the answer but is the wrong tool: it releases entirely-
+  // idle SLABS back to the driver, which is a much bigger and more expensive
+  // operation this caller almost never wants (and one call site in this
+  // project — a per-trial warm-up in the stream-safety test — specifically
+  // must NOT trigger it, or the warm-up's whole purpose of avoiding a driver
+  // call inside a measured window is defeated).
+  //
+  // Default is a no-op: RawDeviceAllocator has no parking concept at all
+  // (cudaFree already synchronises), so there is nothing to settle.
+  virtual Status settle_pending() { return OkStatus(); }
+
   [[nodiscard]] virtual AllocatorStats stats() const = 0;
   [[nodiscard]] virtual std::string_view name() const = 0;
 

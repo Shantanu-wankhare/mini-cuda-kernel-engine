@@ -165,6 +165,7 @@ class BuddyAllocator : public DeviceAllocator {
   // (base == nullptr) and add_slab reuses it, so slab ids are stable for the
   // lifetime of the allocator.
   Status               trim() override;
+  Status               settle_pending() override;
   // NOT inline: largest_free_block is computed on demand rather than maintained
   // incrementally, so this needs a body. See compute_largest_free_block().
   [[nodiscard]] AllocatorStats  stats() const override;

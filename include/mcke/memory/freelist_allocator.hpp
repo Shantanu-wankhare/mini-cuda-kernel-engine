@@ -108,6 +108,7 @@ class FreeListAllocator : public DeviceAllocator {
   StatusOr<Allocation> allocate(std::size_t bytes, rt::StreamHandle stream) override;
   Status               deallocate(const Allocation& a, rt::StreamHandle stream) override;
   Status               trim() override;
+  Status               settle_pending() override;
   [[nodiscard]] AllocatorStats  stats() const override;
   [[nodiscard]] std::string_view name() const override { return "freelist"; }
   [[nodiscard]] Status validate() const override;

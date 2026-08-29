@@ -662,6 +662,20 @@ ReplayResult replay_timed(DeviceAllocator& alloc, const Trace& tr) {
 
   r.alloc_lat.finalize();
   r.free_lat.finalize();
+
+  // Settle before reading the FINAL snapshot, or largest_free_block understates
+  // reality by exactly however much the trace's own "drain" phase left parked.
+  // Concretely: under kSameStreamOnly / kPerFreeEvent, the trace's very LAST
+  // free(s) have no subsequent same-trace allocate to trigger their own
+  // reclaim, so they are still parked at this point. Left alone, that leftover
+  // gets reclaimed as an unrelated side effect of run_largest_free_block_probe's
+  // OWN allocate call below -- and for buddy, coalesces into something bigger
+  // than the stat just reported, making the probe's "over-fit must fail or
+  // grow" check silently pass on more memory than advertised. Untimed (after
+  // both LatencyStats are already finalized), so this cannot contaminate a
+  // latency sample; unlike trim() it never releases a slab, so it does not
+  // change bytes_reserved or invalidate the peak figures captured earlier.
+  (void)alloc.settle_pending();
   r.final_stats = alloc.stats();
   return r;
 }

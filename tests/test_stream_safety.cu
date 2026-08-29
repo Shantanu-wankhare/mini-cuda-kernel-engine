@@ -330,6 +330,17 @@ TrialResult run_trial(const ArmSpec& arm, rt::Stream& s1, rt::Stream& s2,
     MCKE_CUDA_CHECK(cudaStreamSynchronize(s2.native()));
   }
 
+  // Settle the allocator before measuring anything. Without this, kSameStreamOnly
+  // would start the measured window with w1/w2 (from the warm-up above) still
+  // parked -- neither ever got a same-stream allocate to trigger its rule-1
+  // reclaim within the warm-up itself -- and the FIRST unrelated cross-stream
+  // allocate in the trial below would reclaim one of them as a side effect,
+  // corrupting the pending_count delta the property assertion depends on.
+  // settle_pending() (allocator.hpp) exists exactly for this: unlike trim(), it
+  // never releases a slab, so it does not undo the warm-up's whole purpose of
+  // keeping a driver call out of the measured window. A no-op for naive_pool.
+  (void)alloc->settle_pending();
+
   const std::uint64_t raw_before = alloc->stats().raw_malloc_calls;
 
   gate.arm();
@@ -546,7 +557,6 @@ int main() {
   auto fl_pending = [](const DeviceAllocator& a) {
     return FreeListTestAccess::pending_count(static_cast<const FreeListAllocator&>(a));
   };
-
   std::vector<ArmSpec> arms;
   arms.push_back({"naive_pool", Verdict::kCorrupt, false, false,
                   []() -> std::unique_ptr<DeviceAllocator> {

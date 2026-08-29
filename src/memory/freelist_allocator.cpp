@@ -463,6 +463,14 @@ Status FreeListAllocator::deallocate(const Allocation& a, rt::StreamHandle strea
 // trim / stats / diagnostics
 // -----------------------------------------------------------------------------
 
+Status FreeListAllocator::settle_pending() {
+  if (!pending_.empty()) {
+    ++stats_.blocking_drains;
+    drain_pending_blocking();
+  }
+  return OkStatus();
+}
+
 Status FreeListAllocator::trim() {
   if (!pending_.empty()) { ++stats_.blocking_drains; drain_pending_blocking(); }
 

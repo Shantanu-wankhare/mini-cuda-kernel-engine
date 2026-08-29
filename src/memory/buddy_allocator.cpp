@@ -646,6 +646,18 @@ Status BuddyAllocator::deallocate(const Allocation& a, rt::StreamHandle stream) 
 // trim
 // -----------------------------------------------------------------------------
 
+Status BuddyAllocator::settle_pending() {
+  // Only the drain -- never trim()'s slab release. See allocator.hpp for why
+  // those must not be conflated: a caller reading largest_free_block() or
+  // computing a fragmentation ratio wants an up-to-date SNAPSHOT, not the much
+  // bigger (and much more expensive) act of returning idle slabs to the driver.
+  if (!pending_.empty()) {
+    ++stats_.blocking_drains;
+    drain_pending_blocking();
+  }
+  return OkStatus();
+}
+
 Status BuddyAllocator::trim() {
   // A parked block keeps its slab busy, so drain first or we would refuse to
   // release slabs that are in fact idle.
