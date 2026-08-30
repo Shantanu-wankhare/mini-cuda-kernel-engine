@@ -390,7 +390,12 @@ here while §3 was still empty and the fix was free.)
 **Denominators for every "% of peak" in this section** (RESULTS.md rule 5),
 both measured on the Colab T4, never spec-sheet figures:
 `peak_gb_s = 235.4` (from `bench/stream_triad`), `peak_tflops = 8.130` (from
-`bench/fma_peak`), ridge point **34.2 FLOP/byte**.
+`bench/fma_peak`), ridge point **34.2 FLOP/byte**. Re-measured on the Colab
+session that produced §3a–§3c below (2026-08-29): `stream_triad` 240.9 GB/s,
+`fma_peak` 8.184 TFLOP/s — both within ~2.3% of the Phase-1/2 baseline, so
+this is the same class of machine and the frozen denominators above are kept
+rather than replaced (replacing them per-session would make GB/s numbers
+across phases incomparable, which is the thing rule 5 exists to prevent).
 
 > Every kernel in §3a–§3c has an arithmetic intensity between 0.08 and 2.8 —
 > **12× to 400× below the ridge point.** They are all memory-bound, so those
@@ -411,7 +416,49 @@ it moves any number.
 
 | Kernel | Activation | vector_width | median ms | min ms | Ideal bytes | GB/s | % measured BW | Machine |
 |---|---|---|---|---|---|---|---|---|
-| _pending_ | | | | | | | | |
+| bias_relu fused | relu | vw4 | 1.102 | 1.100 | 268,451,840 | 243.7 | 103.5% | Colab T4 |
+| bias_relu unfused | relu | vw4 | 2.215 | 2.2 | 536,887,296 | 242.3 | 102.9% | Colab T4 |
+| bias_gelu_tanh fused | gelu_tanh | vw4 | 1.083 | 1.1 | 268,451,840 | 247.8 | 105.3% | Colab T4 |
+| bias_gelu_tanh unfused | gelu_tanh | vw4 | 2.226 | 2.2 | 536,887,296 | 241.2 | 102.5% | Colab T4 |
+| bias_gelu_erf fused | gelu_erf | vw4 | 1.104 | 1.1 | 268,451,840 | 243.2 | 103.3% | Colab T4 |
+| bias_gelu_erf unfused | gelu_erf | vw4 | 2.225 | 2.2 | 536,887,296 | 241.3 | 102.5% | Colab T4 |
+| bias_gelu_tanh fused | gelu_tanh | vw1 | 1.1 | 1.1 | 268,451,840 | 238.8 | 101.5% | Colab T4 |
+| bias_gelu_tanh fused | gelu_tanh | vw2 | 1.1 | 1.1 | 268,451,840 | 250.5 | 106.4% | Colab T4 |
+| bias_gelu_tanh fused, starved (40 blocks) | gelu_tanh | vw1 | 1.3 | 1.3 | 268,451,840 | 208.7 | 88.7% | Colab T4 |
+| bias_gelu_tanh fused, starved (40 blocks) | gelu_tanh | vw2 | 1.2 | 1.2 | 268,451,840 | 226.9 | 96.4% | Colab T4 |
+| bias_gelu_tanh fused, starved (40 blocks) | gelu_tanh | vw4 | 1.2 | 1.2 | 268,451,840 | 224.6 | 95.4% | Colab T4 |
+| bias_gelu_tanh fused, L2 control | gelu_tanh | vw4 | 0.008 | 0.0 | 2,099,200 | 271.1 | 115.2% | Colab T4 |
+| bias_gelu_tanh unfused, L2 control | gelu_tanh | vw4 | 0.011 | 0.0 | 4,196,352 | 391.5 | 166.3% | Colab T4 |
+
+Shape 8192×4096 unless noted; L2-control rows are 512×512 (256 KiB per array,
+fits the T4's 4 MiB L2). All correctness checks passed at this shape,
+including the two derived-tolerance fixes below.
+
+**Results vs. predictions (2026-08-29 Colab T4, `b01e48d`):**
+- **Fusion speedup landed almost exactly on the 2× prediction**: relu 2.01×,
+  gelu_tanh 2.05×, gelu_erf 2.02× (1.102/2.215, 1.083/2.226, 1.104/2.225 ms).
+- **The L2-resident control did NOT collapse to ~1.0–1.2× as predicted** — it
+  measured **1.38×** (0.008/0.011 ms). The prediction assumed the unfused
+  pair's second kernel reads its intermediate entirely from L2; in practice
+  some of that traffic still costs real time (likely L2 latency plus kernel
+  launch overhead dominating at sub-10-µs runtimes, not a clean DRAM-vs-L2
+  swap). This is a genuine partial miss, not just noise — worth revisiting
+  with `ncu` L2 hit-rate counters before trusting the mechanism, but the
+  direction (control ratio << full-DRAM ratio) still supports the argument.
+- **Vector width was flat at full occupancy and NOT flat when starved, as
+  predicted**: full-occupancy vw1/vw2/vw4 = 238.8/250.5/242.8 GB/s (within
+  noise of each other); starved vw1/vw2/vw4 = 208.7/226.9/224.6 GB/s — a real
+  ~5–8% width-dependent gap once occupancy, not vector width, is the scarce
+  resource. Confirms MLP is only worth buying when occupancy is low.
+- **erf vs tanh landed inside the predicted ±2%**: 1.104 vs 1.083 ms = +1.9%,
+  consistent with the FP32-pipe cost being hidden under the memory floor.
+- Two GELU-only validation failures were found and fixed this session (not a
+  kernel bug): `max_abs_err≈4.77e-7` (exactly 4 ULP) against the default
+  `abs_tol=1e-8`, caused by GELU's O(1) `(1+tanh(z))`/`(1+erf(z))` intermediate
+  turning a routine few-ULP libm disagreement into an absolute error
+  independent of the near-zero output magnitude at the curve's knee. Fixed by
+  adding `testing::kAbsTolGeluCancellation = 1e-6` (`tests/reference.hpp`) and
+  passing it at the three GELU `verify()` call sites in `bias_act_bench.cpp`.
 
 Row plan: `{relu, gelu_tanh, gelu_erf} × {fused, unfused}` at vw=4 (6 rows);
 `{vw1, vw2, vw4}` fused + vw1 unfused at gelu_tanh (4); an **L2-resident control**
@@ -450,28 +497,55 @@ belongs in a footnote rather than the denominator.
 
 | Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | __syncthreads | Machine |
 |---|---|---|---|---|---|---|---|---|---|
-| row_reduce_sum | smem_tree_256t | 8192 × 4096 | | | 128.03 MiB | | | **9** | |
-| row_reduce_sum | warp_shuffle_256t | 8192 × 4096 | | | 128.03 MiB | | | **1** | |
-| row_reduce_sum | two_pass_256t_s8 | 8192 × 4096 | | | 128.03 MiB | | | 1 | |
-| row_reduce_sum | two_pass_256t | **64 × 524288** | | | 128.03 MiB | | | 1 | |
-| row_reduce_sum | warp_shuffle_256t | **64 × 524288** | | | 128.03 MiB | | | 1 | |
+| row_reduce_sum | smem_tree_256t | 8192 × 4096 | 0.519 | 0.517 | 128.03 MiB | 258.5 | 109.8% | **9** | Colab T4 |
+| row_reduce_max | smem_tree_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 256.4 | 108.9% | 9 | Colab T4 |
+| row_reduce_mean | smem_tree_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 257.5 | 109.4% | 9 | Colab T4 |
+| row_reduce_sum | warp_shuffle_256t | 8192 × 4096 | 0.523 | 0.5 | 128.03 MiB | 256.9 | 109.1% | **1** | Colab T4 |
+| row_reduce_max | warp_shuffle_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 254.2 | 108.0% | 1 | Colab T4 |
+| row_reduce_mean | warp_shuffle_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 254.1 | 107.9% | 1 | Colab T4 |
+| row_reduce_sum | two_pass_256t | 8192 × 4096 | 0.537 | 0.5 | 128.03 MiB | 250.2 | 106.3% | 1 | Colab T4 |
+| row_reduce_sum | warp_shuffle_256t | **64 × 524288** | 0.937 | 0.9 | 128.03 MiB | 143.2 | 60.8% | 1 | Colab T4 |
+| row_reduce_sum | two_pass_256t | **64 × 524288** | 0.538 | 0.5 | 128.03 MiB | 249.3 | 105.9% | 1 | Colab T4 |
 
 The barrier count is `1 + log2(blockDim)` = **9** at 256 threads, not 8 — the
 load-into-smem barrier before the tree starts is a real barrier. (Both this
 column and `kernels.hpp` previously said 8.)
 
-**Predictions:** warp-shuffle beats the smem tree by 10–30%. But note the
-ceiling: both move the same 128 MiB and DRAM is the wall, so **if smem_tree
-already reaches ~90% of 235.4 GB/s the maximum possible win is ~11%.** Predict
-the absolute GB/s as well as the ratio — the absolute number is what says whether
-the prediction had room to be true.
-
-**The second shape is the whole justification for `kTwoPass`.** At 8192 rows,
-one block per row gives ~51 waves — saturated, and `kTwoPass` is predicted
-**1–3% slower** (pure overhead). At 64 rows it is 0.4 waves with 24 of 40 SMs
-idle, and `kTwoPass` is predicted **3–10× faster** because it is the only variant
-that can fill the machine. Benchmarked only at the first shape, the variant looks
-like it never wins.
+**Results vs. predictions (2026-08-29 Colab T4, `b01e48d`):**
+- **Warp-shuffle did NOT beat the smem tree by 10–30% — it landed within
+  ±1.3%** (sum -0.6%, max -0.9%, mean -1.3%, shuffle actually very slightly
+  slower on all three). The absolute-GB/s check explains why the prediction
+  had no room to be true: smem_tree already sits at ~108–110% of the 235.4
+  GB/s denominator (the denominator is a conservative floor, not a hard cap),
+  so both variants are already pinned to the DRAM wall and the 9-vs-1 barrier
+  difference is invisible next to it. Honest negative result: barrier count
+  does not matter here because bandwidth, not synchronization, is the limiter.
+- **`kTwoPass` at the saturated shape (8192×4096) was 2.7% slower than
+  warp_shuffle** (0.537 vs 0.523 ms) — inside the predicted 1–3% overhead
+  band, confirming it as pure algorithmic tax with no upside when the machine
+  is already full.
+- **`kTwoPass` at the starved shape (64×524288) was 1.74× faster than
+  warp_shuffle** (0.538 vs 0.937 ms) — real, but well short of the predicted
+  3–10×. `warp_shuffle`'s starved-shape efficiency (60.8% of peak) is much
+  higher than a naive one-block-per-row model suggests, likely because 64
+  blocks still gives partial multi-block-per-SM overlap on a 40-SM part
+  rather than true 24-SM idleness — worth an `ncu` occupancy check before
+  trusting the mechanism, but the qualitative point (two-pass is the only
+  variant that scales to few-rows/very-wide shapes) is confirmed.
+- One validation failure was found and fixed this session (not a kernel bug):
+  `kSum` at `max_abs_err≈1.5e-5` against the default `abs_tol=1e-8`, at a
+  near-zero-mean row (`want≈0.2`, routine for `[-1,1]` random fill, not
+  adversarial). Root cause: summation rounding error scales with the
+  magnitude of the terms being summed (~1), not the final sum, so a
+  near-cancelling row fails a pure-relative test even though the kernel is
+  correct; `kMean` is unaffected because dividing by `cols` shrinks the error
+  floor and the value together. Fixed by adding
+  `testing::kAbsTolReduceSum4096 = 5e-5` and passing it only at the `kSum`
+  `verify()` call in `reduce_bench.cpp`. A real diagnostic bug in
+  `compare()`'s "worst offender" tracker was found and fixed alongside this
+  (see `tests/reference.hpp`): it compared against `max_abs_err` after that
+  field had already been unconditionally updated in the same iteration,
+  so it reported the wrong element as "worst."
 
 ### 3c. Row softmax
 
@@ -483,8 +557,28 @@ footnote.
 
 | Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | max abs(Σrow − 1) | Machine |
 |---|---|---|---|---|---|---|---|---|---|
-| row_softmax | three_pass_256t | 8192 × 4096 | | | 256.0 MiB | | | | |
-| row_softmax | online_one_pass_256t | 8192 × 4096 | | | 256.0 MiB | | | | |
+| row_softmax | three_pass_256t | 8192 × 4096 | 2.053 | 2.051 | 256.0 MiB | 130.7 | 55.5% | 1.701e-07 | Colab T4 |
+| row_softmax | online_one_pass_256t | 8192 × 4096 | 1.767 | 1.8 | 256.0 MiB | 151.9 | 64.5% | 2.184e-07 | Colab T4 |
+
+**Results vs. predictions (2026-08-29 Colab T4, `b01e48d`):**
+- **Speedup landed at 1.16×**, inside the predicted 1.0–1.25× band (2.053 vs
+  1.767 ms), well short of the naive 3× a reader might guess from "one-pass."
+  Confirms the framing: "one-pass" names the statistics passes, not the
+  memory passes — both variants still read x again to produce y.
+- Neither variant showed the predicted L2 masking (three-pass did not beat
+  its own 3-read traffic model) — both land well below 100% of the 235.4
+  GB/s denominator (55.5% / 64.5%), consistent with the *extra* passes being
+  real DRAM traffic rather than L2 hits, unlike the L2-control finding in
+  §3a. This is worth an `ncu` `dram__bytes_read.sum` check before treating
+  it as settled, since the a-priori argument (2.5 MiB working set fits the
+  4 MiB L2) still holds on paper.
+- **Numerics landed close to prediction**: online is 1.28× less accurate by
+  the `Σrow−1` check (2.184e-07 vs 1.701e-07), both comfortably under 1e-5
+  and under the predicted ~3e-7. Lower ratio than the 2–5× predicted, but
+  the direction (online less accurate, both negligible) is confirmed.
+- No validation tolerance issues here — softmax's max-subtraction cancels the
+  magnitude sensitivity that caused the §3a/§3b tolerance bugs; both variants
+  passed at the pre-existing `kTolSoftmax=1e-5` on the first Colab run.
 
 **Predictions:**
 - Speedup **4/3 ≈ 1.33×, not 3×.** "One-pass" names the *statistics* passes

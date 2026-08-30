@@ -451,3 +451,159 @@ work specifically; correctness-critical but simpler fusion ops can run at
 lower effort. `docs/ROADMAP.md` Phase 3 section has the variant-by-variant
 plan already; start with `naive` GEMM to get a correctness and roofline-position
 baseline before tiling.
+
+## 2026-08-29 — Session 4: Phase 3 (3a-3c) — fusion, reduce, softmax on Colab T4
+
+**Hardware:** macOS host-only (design, implementation, host-suite verification,
+fake-CUDA type-checking) + Colab T4 (sm_75), driver 580.82.07, CUDA toolkit
+12.8.93, two trips (first trip hit a runtime disconnect mid-verification;
+second trip re-cloned fresh and re-ran everything in one consolidated cell).
+
+### What was built
+
+- `tests/reference.hpp`: CPU reference implementations for bias+activation,
+  row reduction, row softmax, and small-shape GEMM, all accumulating in
+  `double` so any disagreement is attributable to the GPU; `compare()` with
+  mixed absolute+relative tolerance (`numpy.allclose` form); deterministic
+  `fill_random` via raw `std::mt19937_64` output (not a `std::uniform_real_distribution`,
+  which isn't bit-specified across libc++/libstdc++).
+- `include/mcke/kernels/softmax_online.hpp`: `OnlineState{m,d}` running
+  max/sum pair implementing the Milakov & Gimelshein online-softmax
+  recurrence, host-testable (`MCKE_HOST_DEVICE`) without a GPU.
+- `kernels/bias_act.cu`, `kernels/reduce_ops.cuh`, `kernels/reduce.cu`,
+  `kernels/softmax.cu`: fused bias+{none,relu,gelu_tanh,gelu_erf} with
+  vector-width 1/2/4 variants; row reduction via smem-tree, warp-shuffle, and
+  two-pass (workspace-based, for row-starved shapes); three-pass and online
+  one-pass row softmax.
+- `bench/bias_act_bench.cpp`, `bench/reduce_bench.cpp`, `bench/softmax_bench.cpp`
+  + shared `bench/bench_common.hpp` (`make_roofline()` forces both
+  `peak_gb_s` and `peak_tflops` to be set explicitly — the roofline
+  `peak_tflops=0` silent-zero trap from Phase 1/2 planning is now
+  structurally hard to hit again).
+- `scripts/fakecuda/{cuda_runtime_api.h,cuda_lang_prelude.h}` +
+  `scripts/typecheck_cuda.sh`: stub CUDA runtime/cublas signatures and CUDA
+  language extensions so `MCKE_WITH_CUDA=1` code can be syntax-checked with
+  plain `clang++` on the Mac before ever touching a GPU. Confirmed effective —
+  the actual Colab build compiled clean on the first try across all new
+  kernels and benches.
+- Extended `tests/test_host_core.cpp`: `test_reference_compare()`,
+  `test_reference_kernels()`, `test_online_softmax_recurrence()`.
+- `RESULTS.md` §3a/3b/3c filled with real measured numbers (see below);
+  `docs/ROADMAP.md` Phase 3 env line updated for the two-trip Colab batching.
+
+### Bugs found and fixed
+
+1. **GELU validation false failures** (`bias_act_bench`, 3 configs):
+   `max_abs_err≈4.77e-7` (exactly 4 ULP at magnitude ~2) against the default
+   `abs_tol=1e-8`. Root cause: GELU's `(1+tanh(z))`/`(1+erf(z))` intermediate
+   is O(1), so a routine few-ULP device-vs-host libm disagreement becomes an
+   absolute error independent of the tiny output magnitude near the curve's
+   knee — not a kernel bug. Fixed with a derived (not guessed) constant,
+   `testing::kAbsTolGeluCancellation = 1e-6` (≥2× the observed error).
+2. **Row-sum validation false failures** (`reduce_bench`, `kSum` only):
+   `max_abs_err≈1.5e-5` at a near-zero-mean row (`want≈0.2`, routine for
+   `[-1,1]` random fill, not adversarial). Root cause: summation rounding
+   error scales with the magnitude of the terms being summed (~1), not the
+   final sum's magnitude, so a near-cancelling row fails a pure-relative test
+   even though the kernel is correct. `kMean` is unaffected because dividing
+   by `cols` shrinks the value and the error floor together. Fixed with
+   `testing::kAbsTolReduceSum4096 = 5e-5` (≥3× the observed error), applied
+   only at the `kSum` call site — `kMean` already passed with margin.
+3. **A real diagnostic bug in `compare()`'s "worst offender" tracker**, found
+   while investigating #2 (didn't affect pass/fail, only the reported worst
+   element): it compared `abs_err >= r.max_abs_err` after `max_abs_err` had
+   already been unconditionally updated in the same loop iteration, so it
+   reported "the last element to set a new global max that also happened to
+   fail" rather than the true worst mismatch. Fixed with a dedicated
+   `worst_mismatch_rel` variable scoped to failing elements only.
+4. **A wrong prediction in my own test, caught before spending GPU time**:
+   predicted the reversed-monotone-ramp softmax row (max arrives first, no
+   rescaling) would be more accurate than the forward ramp (max updates every
+   element, maximal rescaling) for the online recurrence. Measured on the Mac:
+   the reverse case was actually *less* accurate (2.50e-07 vs 1.73e-07).
+   Mechanism: rescaling both introduces error and renormalizes, keeping the
+   accumulator at O(1); the reversed case instead sums a large accumulator
+   against tiny tail terms, an ill-conditioned pattern that costs more than
+   the rescaling saved. Both remain far inside tolerance either way — fixed
+   the assertion to check what's actually guaranteed (small error, no
+   NaN/Inf) instead of asserting the wrong ordering.
+
+### Benchmarks run (Colab, Tesla T4, driver 580.82.07, CUDA toolkit 12.8.93)
+
+Sanity re-check against the Phase 1/2 baseline before trusting any new number:
+`stream_triad` 240.9 GB/s (baseline 235.4, +2.3%), `fma_peak` 8.184 TFLOP/s
+(baseline 8.130, +0.7%) — same class of machine, frozen denominators kept.
+
+Full results tables are in `RESULTS.md` §3a (fusion), §3b (row reduction),
+§3c (row softmax), each with a "results vs. predictions" writeup. Headline
+numbers:
+- **3a fusion**: relu/gelu_tanh/gelu_erf fused-vs-unfused speedup landed at
+  2.01×/2.05×/2.02×, matching the 2× prediction almost exactly. The L2-control
+  experiment (512×512) did **not** collapse to the predicted ~1.0–1.2× — it
+  measured 1.38×, a real partial miss worth an `ncu` L2 hit-rate follow-up.
+  Vector width was flat at full occupancy (238.8–250.5 GB/s across vw1/2/4)
+  and showed a real ~5–8% width-dependent gap once artificially starved to 40
+  blocks (208.7–226.9 GB/s), confirming MLP only matters when occupancy is
+  scarce.
+- **3b row reduction**: warp-shuffle did **not** beat the smem tree by the
+  predicted 10–30% — it landed within ±1.3% (sometimes fractionally slower).
+  Both variants already sit at ~108–110% of the 235.4 GB/s denominator, so
+  DRAM bandwidth, not the 9-vs-1 barrier count, is the limiter — an honest
+  negative result. `kTwoPass` was 2.7% slower at the saturated shape
+  (predicted 1–3% slower — confirmed) and 1.74× faster at the row-starved
+  shape (predicted 3–10× faster — real but smaller than predicted;
+  warp-shuffle's 60.8%-of-peak efficiency even when "starved" suggests
+  partial multi-block-per-SM overlap the naive one-block-per-row model
+  didn't account for).
+- **3c row softmax**: three-pass vs. online speedup landed at 1.16×, inside
+  the predicted 1.0–1.25× band — "one-pass" names the statistics passes, not
+  the memory passes. Neither variant showed the predicted L2 masking of
+  three-pass's extra reads (both land at 55.5%/64.5% of the bandwidth
+  denominator, well below the "beats its own traffic model" outcome) —
+  worth an `ncu` DRAM-bytes check before treating as settled. Online is 1.28×
+  less accurate by the reference-free `Σrow−1` check, both ~2e-7, as
+  predicted qualitatively though the ratio was smaller than the 2–5× guess.
+
+### Design decisions taken (and alternatives rejected)
+
+- Combined all Colab commands for the fresh-runtime re-verification into one
+  consolidated cell with `echo "=====SECTION====="` separators, rather than
+  the original one-cell-per-step flow, specifically because Colab sessions
+  die mid-work and a single paste-back-everything cell is cheaper to re-run
+  from scratch than re-issuing a dozen small cells after a disconnect.
+- Added a stream_triad/fma_peak re-run as an explicit sanity gate before
+  trusting any §3 number, rather than assuming the denominators frozen from
+  Phase 1/2 still apply — this is now the standing practice for every new
+  Colab session that reports numbers against those denominators.
+
+### What was learned — including things that turned out to be wrong
+
+- Tolerance bugs in this session were all in the *test*, not the kernel — and
+  both had the same shape: a tolerance derived from "typical" magnitude
+  reasoning broke down at routine near-zero outputs (GELU's knee, zero-mean
+  row sums), not at some adversarial edge case. The fix in both cases was to
+  measure the actual observed error and derive a named constant at ≥2-3×
+  margin, not to guess a bigger number.
+- Two of three "beats the prediction ceiling" arguments (§3b barrier count,
+  §3c L2 masking) turned out to be already-saturated-bandwidth situations
+  where the mechanism being tested had no room to show up — the absolute
+  GB/s numbers, which were predicted alongside the ratios specifically to
+  catch this, did their job.
+- The L2-control experiment in §3a is the one result that didn't cleanly
+  confirm its own hypothesis (1.38× instead of ~1.0–1.2×) — flagged rather
+  than smoothed over, pending an `ncu` L2 hit-rate check.
+
+### What's next
+
+Phase 3 stages 1-4 (fusion, row reduction, row softmax, validation harness)
+are verified on real Colab T4 hardware with all correctness checks passing
+and `RESULTS.md` §3a/3b/3c holding final numbers. Not yet started: Stage 5/6
+GEMM ladder (`kernels/gemm.cu`: naive → tiled_smem → tiled_regblock →
+kWarpTileNoDbuf → kWarpTile double-buffered → cuBLAS reference) and
+`bench/gemm_bench.cpp`, per the detailed tile/occupancy design already
+produced; `tools/gen_reference.py` NumPy cross-check (the "both" validation
+method the owner chose); Colab Trip 2 to verify + measure the GEMM ladder and
+run Nsight Compute for occupancy hand-calc vs. measured comparison, filling
+`RESULTS.md` §3d. `LEARNING_LOG.md` end-of-Phase-3 Q&A entries are also due
+once Phase 3 closes, per the owner's convention (not filled without being
+asked).
