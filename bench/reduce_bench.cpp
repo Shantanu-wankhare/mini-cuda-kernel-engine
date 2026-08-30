@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
   // ---------------------------------------------------------------------------
   int failures = 0;
   auto verify = [&](K::ReduceKind kind, K::ReduceVariant var,
-                    std::int64_t rows, std::int64_t cols, double tol, const char* why) {
+                    std::int64_t rows, std::int64_t cols, double tol, const char* why,
+                    double abs_tol = 1e-8) {
     MCKE_CUDA_CHECK(cudaMemsetAsync(dout.ptr, 0, obytes, stream->native()));
     const Status st = K::launch_row_reduce_f32(
         static_cast<const float*>(dx.ptr), static_cast<float*>(dout.ptr), rows, cols,
@@ -163,7 +164,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyDeviceToHost));
     testing::reference_row_reduce(hx.data(), href.data(), rows, cols, kind);
     const auto r = testing::compare(hout.data(), href.data(),
-                                    static_cast<std::size_t>(rows), tol);
+                                    static_cast<std::size_t>(rows), tol, abs_tol);
     char label[64];
     std::snprintf(label, sizeof(label), "%s/%s", kind_name(kind), variant_name(var));
     benchcfg::print_validation(label, r.ok(), r.max_rel_err, tol, why);
@@ -173,10 +174,18 @@ int main(int argc, char** argv) {
   std::printf("=== correctness (shape A, before timing) ===================\n");
   for (auto var : {K::ReduceVariant::kSmemTree, K::ReduceVariant::kWarpShuffle,
                    K::ReduceVariant::kTwoPass}) {
-    // Sum and mean accumulate 4096 terms, so the tolerance is sqrt(4096)*eps
-    // with margin -- derived, not tuned until it passed.
+    // Sum needs the derived absolute floor: the accumulated rounding error
+    // over 4096 zero-mean terms is set by the TERM magnitude (~1), not by the
+    // row's own sum, and some rows nearly cancel by chance -- routine, not
+    // adversarial. A pure relative test against the default 1e-8 floor
+    // spuriously fails those rows even though the kernel is correct. See
+    // tests/reference.hpp's derivation of kAbsTolReduceSum4096.
+    //
+    // Mean does NOT need it: both the value and the tolerance floor shrink by
+    // the same factor of cols, so the plain relative test already has margin.
     verify(K::ReduceKind::kSum,  var, kRowsA, kColsA, testing::kTolReduce4096,
-           "sqrt(4096)*f32 eps");
+           "sqrt(4096)*f32 eps, term-magnitude absolute floor",
+           testing::kAbsTolReduceSum4096);
     verify(K::ReduceKind::kMean, var, kRowsA, kColsA, testing::kTolReduce4096,
            "as sum, plus one divide");
     // MAX IS EXACT. It is a selection, not an arithmetic operation -- it returns

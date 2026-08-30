@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
   // ---------------------------------------------------------------------------
   int validation_failures = 0;
   auto verify = [&](const char* what, K::Activation act, int vw, double tol,
-                    const char* why) {
+                    const char* why, double abs_tol = 1e-8) {
     MCKE_CUDA_CHECK(cudaMemsetAsync(buf.y.ptr, 0, nbytes, stream->native()));
     const Status st = K::launch_bias_act_f32(
         static_cast<const float*>(buf.x.ptr), static_cast<const float*>(buf.bias.ptr),
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     testing::reference_bias_act(buf.hx.data(), buf.hbias.data(), buf.href.data(),
                                 kRows, kCols, act);
     const auto r = testing::compare(buf.hy.data(), buf.href.data(),
-                                    static_cast<std::size_t>(n), tol);
+                                    static_cast<std::size_t>(n), tol, abs_tol);
     benchcfg::print_validation(what, r.ok(), r.max_rel_err, tol, why);
     if (!r.ok()) { std::printf("   %s\n", r.to_string().c_str()); ++validation_failures; }
   };
@@ -205,12 +205,21 @@ int main(int argc, char** argv) {
   // The GELUs cannot be exact: device erff/tanhf and host std::erf/std::tanh are
   // different correct implementations (~2 ulp vs ~1 ulp), so ~10 ulp of
   // disagreement is expected and is not a bug.
+  // GELU needs the derived cancellation floor, not the generic 1e-8 default:
+  // (1+tanh(z)) / (1+erf(z)) is an O(1) intermediate, so a normal few-ULP
+  // libm disagreement is an ABSOLUTE error independent of the output's own
+  // magnitude -- and near the curve's knee the output is tiny, so the default
+  // floor reads a routine libm difference as a huge relative error. See
+  // tests/reference.hpp's derivation of kAbsTolGeluCancellation.
   verify("fused/gelu_tanh/vw4", K::Activation::kGeluTanh, 4, testing::kTolElementwise,
-         "device tanhf vs host std::tanh, ~10 ulp");
+         "device tanhf vs host std::tanh, ~4 ulp through (1+tanh)",
+         testing::kAbsTolGeluCancellation);
   verify("fused/gelu_erf/vw4",  K::Activation::kGeluErf,  4, testing::kTolElementwise,
-         "device erff vs host std::erf, ~10 ulp");
+         "device erff vs host std::erf, ~4 ulp through (1+erf)",
+         testing::kAbsTolGeluCancellation);
   verify("fused/gelu_tanh/vw1", K::Activation::kGeluTanh, 1, testing::kTolElementwise,
-         "width must not change the answer");
+         "width must not change the answer",
+         testing::kAbsTolGeluCancellation);
 
   // Negative test: the launcher must REJECT an illegal width rather than
   // silently downgrade. Validation that is never exercised does not work.

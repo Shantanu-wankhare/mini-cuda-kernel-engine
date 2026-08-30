@@ -250,6 +250,18 @@ inline CompareResult compare(const float* got, const float* want, std::size_t n,
                              double rel_tol, double abs_tol = 1e-8) {
   CompareResult r;
   r.n = n;
+  // Tracks the worst FLAGGED mismatch specifically -- deliberately separate
+  // from r.max_abs_err, which is a running max over EVERY element regardless
+  // of whether it failed tolerance. An earlier version of this function
+  // compared against r.max_abs_err directly, which is updated unconditionally
+  // just above -- so "abs_err >= r.max_abs_err" degenerated to "did this
+  // element just set a new global max", not "is this the worst mismatch".
+  // Concretely: an element with a large |want| can have the single largest
+  // abs_err in the whole array while still passing tolerance easily (its
+  // rel_tol*|want| term is large); that element would silently claim
+  // worst_index even though it never failed, starving the diagnostic of the
+  // element that actually caused the failure.
+  double worst_mismatch_rel = -1.0;
   for (std::size_t i = 0; i < n; ++i) {
     const double g = static_cast<double>(got[i]);
     const double w = static_cast<double>(want[i]);
@@ -262,12 +274,13 @@ inline CompareResult compare(const float* got, const float* want, std::size_t n,
     if (rel_err > r.max_rel_err) r.max_rel_err = rel_err;
 
     if (abs_err > abs_tol + rel_tol * std::fabs(w)) {
-      if (r.mismatches == 0 || abs_err >= r.max_abs_err) {
+      ++r.mismatches;
+      if (rel_err > worst_mismatch_rel) {
+        worst_mismatch_rel = rel_err;
         r.worst_index = i;
         r.worst_got = g;
         r.worst_want = w;
       }
-      ++r.mismatches;
     }
   }
   return r;
@@ -280,5 +293,38 @@ inline constexpr double kTolElementwise = 1e-6;   // one op: a few ulp
 inline constexpr double kTolReduce4096  = 1e-5;   // sqrt(4096) * f32 eps
 inline constexpr double kTolSoftmax     = 1e-5;   // as reduce, plus expf's own ulp
 inline constexpr double kTolGemmK256    = 1e-5;   // sqrt(256) * f32 eps, with headroom
+
+// -----------------------------------------------------------------------------
+// Absolute floors for two kernels where the DEFAULT abs_tol=1e-8 is the wrong
+// size -- found by running on real hardware, not derived in advance. Both are
+// instances of the same trap this file's own banner warns about (near-zero
+// "want" values are routine, not an edge case), just showing up in a form that
+// was not anticipated until measured:
+//
+// GELU: y = 0.5*x*(1+tanh(z)) has a genuine O(1) intermediate, (1+tanh(z)) or
+// (1+erf(z)). A normal few-ULP disagreement between device tanhf/erff and host
+// std::tanh/std::erf (measured: 4.77e-7 = exactly 4 ULP at magnitude ~2) shows
+// up as an ABSOLUTE error in y that does NOT scale down with y's own
+// magnitude -- and for x near the curve's knee, y itself is tiny (~1e-4), so a
+// routine libm disagreement reads as a huge RELATIVE error (measured: 8e-4
+// against a 1e-6 relative tolerance). Not a kernel bug.
+//
+// ROW-SUM over `cols` terms of O(1) magnitude: the rounding error is set by
+// the magnitude of the TERMS being summed, not by the magnitude of the final
+// result. For zero-mean random data, some rows nearly cancel by chance
+// (routine, not adversarial) -- measured worst case: want=0.2, abs error
+// 1.53e-5, at cols=4096 with data in [-1,1]. kMean is unaffected because both
+// the value and the tolerance floor shrink together by the same factor of
+// cols; kSum has nothing to shrink, so the same absolute error that passes
+// easily for kMean fails a rel_tol*|want| test for kSum's occasionally-tiny
+// sums.
+//
+// Both floors are sized from what was ACTUALLY MEASURED on a Tesla T4, with a
+// >= 2x safety margin -- deriving a tight theoretical bound for pairwise
+// float32 summation error is a genuine rabbit hole (see Higham, "The accuracy
+// of floating point summation"), and a measured-plus-margin floor is the
+// pragmatic answer for a fixed, known benchmark shape.
+inline constexpr double kAbsTolGeluCancellation = 1e-6;   // >= 2x the observed 4.77e-7
+inline constexpr double kAbsTolReduceSum4096    = 5e-5;   // >= 3x the observed 1.53e-5
 
 }  // namespace mcke::testing
