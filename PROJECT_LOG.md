@@ -607,3 +607,120 @@ run Nsight Compute for occupancy hand-calc vs. measured comparison, filling
 `RESULTS.md` §3d. `LEARNING_LOG.md` end-of-Phase-3 Q&A entries are also due
 once Phase 3 closes, per the owner's convention (not filled without being
 asked).
+
+## 2026-08-30 — Session 5: Phase 3d (3d stages 5-6) — the GEMM ladder, Colab trip 2
+
+**Hardware: Colab Tesla T4 (sm_75), driver 580.82.07, CUDA 13.0 runtime /
+nvcc 12.8.93.** Clocks not locked (no root on hosted Colab); idle at session
+start was 36°C / 9W (P8).
+
+### What was built (Mac-side, before this Colab session)
+
+- `include/mcke/kernels/gemm_tile.hpp`: `GemmTile`, the runtime-tile →
+  compile-time-instantiation dispatch, and a four-limiter occupancy calculator
+  (registers / shared memory / threads-per-SM / blocks-per-SM), all pure host
+  code, unit-tested exhaustively on macOS against hand-worked cases — including
+  the double-buffered k-loop's ping-pong schedule, checked for every tile count
+  0–200 (a dropped-tail bug at odd tile counts was confirmed live: forcing it
+  produced 103 failures).
+- `kernels/gemm.cu`: the 8-row ladder — `naive_uncoalesced`, `naive`,
+  `tiled_smem`, `tiled_regblock`, `warptile_nodbuf`, `warptile_dbuf`,
+  `warptile_vec4`, `cublas`. Rows 4–7 are one template differing by exactly one
+  argument each (`LaneMap`, `DBUF`, `VW`), enforcing the one-variable-per-row
+  rule via the type system rather than discipline.
+- `tools/gen_reference.py` + `tests/data/reference_vectors.txt`: an independent
+  Python oracle, bit-exact on 11 of 19 cases (exactly-representable inputs), so
+  a shared misunderstanding between `reference.hpp` and a kernel cannot validate
+  clean.
+- `bench/gemm_bench.cpp`: validates every variant against the CPU reference at
+  awkward shapes, then against cuBLAS (itself validated non-square first) as a
+  full-shape oracle at 4096³, plus a 1024-point random spot-check; brackets the
+  timed run with `cublas` first and last as a thermal-drift check; uses the
+  operation's compulsory bytes as the roofline denominator for all eight rows.
+- Design review (two independent passes) found six issues before any kernel
+  code ran: a described double-buffering scheme that was actually a race
+  (needs two *buffers*, not two barriers); warp tiling cannot remove the
+  B-fragment bank conflict, only cut it 5 phases → 3 (prediction revised down
+  from "comparable to double buffering" to +5–12%); the transposed-A store
+  needs a stride-**4** pad, not the reflexive stride-1 (stride-1 is still
+  4-way conflicting); sm_75's blocks-per-SM cap is 16, not 32 (Volta/Ampere);
+  `cublasSetStream` is mandatory given `cudaStreamNonBlocking` streams; the
+  fake cuBLAS header had to move out of `cuda_runtime_api.h` into its own file
+  to avoid a redeclaration error.
+
+Host suite: 58,856 checks, 0 failures. 20 translation units clean under
+`scripts/typecheck_cuda.sh`.
+
+### The Colab run
+
+`./build/bin/mcke_gemm_bench 4096` — correctness first (all awkward shapes,
+the β≠0 read-modify-write case, and the full 4096³ shape against the validated
+cuBLAS oracle plus a 1024-point spot-check) all passed with zero mismatches.
+Occupancy hand-calc agreed with `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+on every row, including both edge cases the design specifically predicted:
+`tiled_smem` landed at 43 regs/thread, a genuine **tie** between registers and
+the threads/SM cap (both give exactly 1 block); `warptile_dbuf` landed at
+**exactly** 128 registers, the boundary for staying at 2 blocks rather than
+falling to 1 — one register over and occupancy would have halved. Neither
+register-blocked kernel spilled. `tiled_regblock`'s measured shared-memory
+footprint (8320 B) matched the pad prediction exactly: 8192 + 128 B, where
+128 B is `kGemmAPad=4`'s modelled cost.
+
+**Every performance prediction missed, in the same direction, and one was
+contradicted outright:**
+
+| Row | Predicted | Actual | |
+|---|---|---|---|
+| naive_uncoalesced | 0.2–0.6% | 1.48% | miss, above range |
+| naive | 2–4% | 4.92% | miss, just above |
+| tiled_smem | 15–25% | 10.36% | miss, below range |
+| tiled_regblock | 45–65% | 40.39% | miss, below range |
+| warptile_nodbuf | +5–12% over regblock | **−1.8%** | **contradicted** |
+| warptile_dbuf | 60–80% | 40.28% | miss, well below |
+| warptile_vec4 | +10–20% over dbuf | +5.7% | miss, below range |
+| cuBLAS | 75–85% | 51.05% (first) / 45.61% (last) | miss, well below |
+
+A real, measured cause for part of this: `cublas` bracketed the run at 33.12 ms
+first and 37.07 ms last — **+11.9%**, past this project's 3% drift threshold.
+The ladder runs slow-rows-first, so the fast rows near the end were measured on
+a warmer chip than the frozen 8.130 TFLOP/s denominator (from a cool Phase-1
+session) assumes; `warptile_vec4` against the **hot** `cublas_last` figure
+gives 93.4%, not 42.6%. This does not explain `tiled_smem`'s miss (its own
+banner already flagged the risk: 1024 threads/block occupies the entire SM
+with one resident block, so there is no second block to hide the two
+`__syncthreads` stalls per k-tile — a third limiter the 15–25% roofline
+argument never modelled) or, most importantly, the `warptile_nodbuf`
+regression: the lane permutation's bank-conflict cut (4-way → 2-way) is
+verified as a pure integer property (`test_gemm_bank_conflict_math`), and
+register count, shared memory, and occupancy are all identical to
+`tiled_regblock` — so either the extra lane-index arithmetic costs more than
+the conflict reduction saves, or the kernel was never actually
+shared-memory-bandwidth-bound at this occupancy and cutting conflicts bought
+nothing. **Open, and the top thing to check with `ncu`'s stall-reason
+breakdown on Explorer or the 5060** (Colab does not expose profiling counters
+— confirmed this session, not just assumed from `docs/ENVIRONMENTS.md`).
+
+### Design decisions taken this session
+
+- Recorded every prediction *before* the run (`RESULTS.md` rule 6) rather than
+  writing the ladder's expected bands after seeing the numbers, specifically so
+  the systematic miss-in-one-direction pattern above would be visible rather
+  than rationalized row by row after the fact.
+- Kept the Colab numbers in `RESULTS.md` §3d despite the confirmed thermal
+  drift, rather than discarding the run — correctness and the occupancy
+  three-way comparison are unaffected by clock drift, and the drift itself
+  (measured, not assumed) is a legitimate finding. The performance figures are
+  explicitly marked Colab-indicative, not authoritative, per the project's
+  existing Colab-vs-Explorer convention.
+
+### What's next
+
+An `ncu` pass on Explorer or the RTX 5060 (not Colab — no profiling
+permissions) is now the single most valuable next step, specifically to
+resolve the `warptile_nodbuf` regression and to check whether `tiled_smem`'s
+shortfall is barrier stalls as hypothesized. `RESULTS.md` §5a is scaffolded and
+waiting for exactly these runs. `docs/ROADMAP.md`'s Phase-3 exit criterion (a
+written explanation of the remaining gap to cuBLAS) cannot be finished
+honestly until that pass happens — the current gap is real but its causes are
+only partially diagnosed. `LEARNING_LOG.md` end-of-Phase-3 Q&A remains due once
+Phase 3 actually closes.

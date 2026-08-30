@@ -607,15 +607,29 @@ Shape **M=N=K=4096**, `alpha=1, beta=0`, row-major. Command:
 
 | Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | spill B | occupancy (hand / API) | median ms | min ms | TFLOP/s | % of measured FMA peak | Machine |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| naive_uncoalesced | 4096 | — | | | | | | | | | |
-| naive | 4096 | — | | | | | | | | | |
-| tiled_smem | 4096 | 32,32,32,1,1 | | | | | | | | | |
-| tiled_regblock | 4096 | 128,128,8,8,8 | | | | | | | | | |
-| warptile_nodbuf | 4096 | 128,128,8,8,8 | | | | | | | | | |
-| warptile_dbuf | 4096 | 128,128,8,8,8 | | | | | | | | | |
-| warptile_vec4 | 4096 | 128,128,8,8,8 | | | | | | | | | |
-| cuBLAS | 4096 | — | — | — | — | — | | | | | |
-| cublas_drift_recheck | 4096 | — | — | — | — | — | | | | | |
+| naive_uncoalesced | 4096 | — | 32 | 0 | 0 | 4 / 4 (100%) | 1143.68 | 1140.86 | 0.120 | 1.48% | Colab T4 |
+| naive | 4096 | — | 32 | 0 | 0 | 4 / 4 (100%) | 343.44 | 341.76 | 0.400 | 4.92% | Colab T4 |
+| tiled_smem | 4096 | 32,32,32,1,1 | 43 | 8192 | 0 | 1 / 1 (100%, tied) | 163.19 | 160.49 | 0.842 | 10.36% | Colab T4 |
+| tiled_regblock | 4096 | 128,128,8,8,8 | 115 | 8320 | 0 | 2 / 2 (50%) | 41.85 | 41.51 | 3.284 | 40.39% | Colab T4 |
+| warptile_nodbuf | 4096 | 128,128,8,8,8 | 115 | 8320 | 0 | 2 / 2 (50%) | 42.62 | 42.00 | 3.224 | 39.66% | Colab T4 |
+| warptile_dbuf | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (50%) | 41.97 | 41.64 | 3.275 | 40.28% | Colab T4 |
+| warptile_vec4 | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (50%) | 39.70 | 39.36 | 3.462 | 42.58% | Colab T4 |
+| cuBLAS (first) | 4096 | — | — | — | — | — | 33.12 | 32.56 | 4.150 | 51.05% | Colab T4 |
+| cuBLAS (drift recheck, last) | 4096 | — | — | — | — | — | 37.07 | 36.06 | 3.708 | 45.61% | Colab T4 |
+
+**smem/block matches the pad prediction exactly.** `tiled_regblock`'s 8320 B is
+8192 + 128 = the `kGemmAPad=4` cost (`BK·4 floats·4 B = 128 B`) predicted in the
+design review. `warptile_dbuf`/`warptile_vec4` double that to 16640, confirming
+the padded footprint carries through both buffers.
+
+**Occupancy hand-calc agreed with the CUDA API on every row, including the two
+edge cases that were the actual test:** `tiled_smem` is a genuine **tie** between
+registers and the threads/SM cap at 43 regs/thread (both give exactly 1 block) —
+predicted in `gemm_tile.hpp`'s test suite before this ever ran on hardware.
+`warptile_dbuf` landed at **exactly** 128 registers, the boundary this project
+predicted for staying at 2 blocks rather than falling to 1 (25%) — one register
+over and occupancy would have halved. Neither kernel spilled (`spill B` = 0 on
+every row), so register blocking is doing what it is supposed to.
 
 Ideal cost: `flops = 2·M·N·K` = 1.374e11, `bytes = (M·K + K·N + M·N)·4` = 2.01e8,
 **AI ≈ 682.7** — deep in compute-bound territory, 20× past the ridge point. This is
@@ -640,16 +654,90 @@ compute-bound and the naive kernel simply fails to exploit that.
 originals are preserved in the third column; where they were revised, the reason
 is a design-review finding, not a measurement.
 
-| Row | Predicted % of FMA peak | Basis / change from the original |
-|---|---|---|
-| naive_uncoalesced | 0.2–0.6% | New row. ~32 sectors per request instead of 4; predicted 3–10× slower than `naive`. |
-| naive | 2–4% | Unchanged (2026-08-24). |
-| tiled_smem | 15–25% | Unchanged, but see the two-limiter note below. |
-| tiled_regblock | 45–65% | Unchanged. Scalar loads may put it at the low end. |
-| warptile_nodbuf | **+5–12% over regblock** | **REVISED DOWN.** The original said "comparable in size to double buffering". |
-| warptile_dbuf | 60–80% | Unchanged (was "warptile+double-buffer"). |
-| warptile_vec4 | +10–20% over dbuf | New row. 4× fewer global load instructions for identical bytes. |
-| cuBLAS | 75–85% | The ceiling. |
+| Row | Predicted % of FMA peak | Actual | Verdict |
+|---|---|---|---|
+| naive_uncoalesced | 0.2–0.6% | **1.48%** | miss — 2.5–7.4× above the predicted range |
+| naive | 2–4% | **4.92%** | miss — just above the range |
+| tiled_smem | 15–25% | **10.36%** | miss — below the range |
+| tiled_regblock | 45–65% | **40.39%** | miss — below the range |
+| warptile_nodbuf | +5–12% over regblock | **−1.8%** (0.98×) | **contradicted — regressed, did not improve** |
+| warptile_dbuf | 60–80% | **40.28%** | miss — well below the range |
+| warptile_vec4 | +10–20% over dbuf | **+5.7%** (1.057×) | miss — below the range |
+| cuBLAS | 75–85% | **51.05%** (first) / 45.61% (last) | miss — well below the range |
+
+**Every prediction missed, in the same direction, and one was contradicted
+outright.** Per rule 6, the predictions stay in the table above rather than
+being smoothed into the revised numbers, and the reasoning for each miss follows
+— separating what the run actually shows from what remains a hypothesis pending
+`ncu` on Explorer or the 5060 (Colab does not expose profiling counters).
+
+**1. Thermal drift is real, measured, and it explains part — but not
+most — of the shortfall.** `cublas` bracketed the run: 33.12 ms first, 37.07 ms
+last, **+11.9%**, past the 3% threshold this project treats as "the table is
+drifting." The run order is slow-to-fast (`naive_uncoalesced` through
+`warptile_vec4`, in that order, ~46 s of kernel time total), so the clock had
+already started dropping off boost by the time the fast rows ran — meaning
+`warptile_vec4`'s 42.58% and even `tiled_regblock`'s 40.39% are measured under a
+*warmer* chip than the frozen 8.130 TFLOP/s denominator (from a cool Phase-1
+session) assumes. Comparing `warptile_vec4` against the **hot** `cublas_last`
+figure instead of the cool `peak_tflops` denominator gives `3.462 / 3.708 =
+93.4%` — a very different, much more encouraging number. **This does not
+explain the tiled_smem or warptile_nodbuf misses**, which are large enough (and
+in tiled_smem's case, off by an entire predicted band) that an 11.9% clock
+effect cannot be the whole story.
+
+**2. `tiled_smem`'s "zero cross-block overlap" caveat, written into the kernel's
+own banner before the run, may be the dominant effect.** At 1024 threads/block
+this kernel occupies the *entire* SM with one resident block — 100% occupancy,
+but no second block to hide the two `__syncthreads` stalls per k-tile. The
+15–25% prediction modelled only two ceilings (shared bandwidth ≈25%, DRAM reuse
+≈23%); it did not model barrier-stall time, because that requires a third,
+occupancy-dependent term the two-roofline argument does not capture. The
+measured 10.36% is consistent with barrier stalls being the actual binding
+constraint rather than either roofline. `smsp__average_warps_issue_stalled_
+barrier_per_issue_active.ratio` on this kernel specifically (not just the
+nodbuf→dbuf transition it was originally proposed for) would confirm this.
+
+**3. `warptile_nodbuf` regressing instead of improving is the most interesting
+open result in this table, and it is not explained by anything measured here.**
+The lane permutation was verified, as an integer property, to cut the
+B-fragment's shared-bank conflict from 4-way to 2-way (5 phases → 3,
+`test_gemm_bank_conflict_math`) — that part of the design is not in question.
+Register count, shared memory, and occupancy are all identical to
+`tiled_regblock` (115 regs, 8320 B, 2 blocks/SM), so the regression is not an
+occupancy or spilling effect. Two live hypotheses, neither confirmed:
+  - the `kWarp4x8` lane-index arithmetic (`warp/2`, `lane/8`, etc.) costs more
+    integer ALU work than the row-major map's plain division, and at this
+    occupancy (16 of 32 warps/SM active) there may not be enough independent
+    work to hide that extra latency — i.e. the kernel was never actually
+    shared-memory-bandwidth-bound at 40% of peak, so cutting shared-load phases
+    bought nothing;
+  - some other resource (LSU issue rate, or a scheduling artifact of the warp
+    grid touching output tiles in a different order) is the true binding
+    constraint, and bank conflicts were a red herring at this occupancy level.
+  This is exactly the kind of finding `ncu`'s stall-reason breakdown
+  (`smsp__average_warps_issue_stalled_*`) is built to distinguish, and it is the
+  single most important thing to check on the next Explorer or 5060 session.
+
+**4. The naive rows landed slightly ABOVE their predicted range rather than
+below it**, the opposite direction of every other row. `naive_uncoalesced` at
+1.48% is 2.5–7.4× the predicted 0.2–0.6%, and it ran *first*, when the chip was
+coolest — so this one miss plausibly goes the other way from the thermal
+story: a cool, boosted clock outperforming a prediction calibrated loosely
+against "should be memory-bound and slow." The transpose's net effect (A and C
+worse, B better — see the banner) was always acknowledged as unmeasured by
+anything but sectors-per-request, which needs `ncu` to check directly.
+
+**Conclusion for this trip:** correctness is unambiguous (every variant agreed
+with the CPU reference at the awkward shapes, with cuBLAS as a validated
+full-shape oracle, and the beta≠0 path), and the occupancy hand-calculation
+matched the CUDA API on every row including both edge cases it was designed to
+catch. But the **performance numbers in this table are Colab-indicative, not
+authoritative** — the drift check itself says so, per this project's own rule.
+The step ladder up through `tiled_regblock` (3.33×, 2.10×, 3.90×) is the clean
+part of the story; everything from `warptile_nodbuf` onward needs an `ncu` pass
+on Explorer or the 5060 before the "remaining gap to cuBLAS" writeup this
+section owes can be more than a hypothesis.
 
 **Three corrections made before running, all recorded rather than quietly fixed:**
 
@@ -701,12 +789,15 @@ broadcast), so its slowdown is a net — which is why the attribution belongs to
 
 Only `dram__bytes_read.sum` settles which roof was hit. Predicted in advance.
 
-**The occupancy pair is the most valuable result in this table**, more than any
-TFLOP/s figure: `tiled_smem` runs at **100% occupancy** (1024 threads/block, one
-resident block, a genuine tie between the threads-per-SM cap and registers) and
-`tiled_regblock` at **50%** (2 blocks, register-bound) — yet the latter should be
-roughly 2–3× faster. That is the measured answer to the standing question in
-`LEARNING_LOG.md` about how a lower-occupancy kernel can be faster.
+**The occupancy pair is the most valuable result in this table, and it is now
+measured, not hypothetical:** `tiled_smem` runs at **100% occupancy** (1024
+threads/block, one resident block, a genuine tie between the threads-per-SM cap
+and registers, confirmed by the CUDA API) and `tiled_regblock` at **50%**
+(2 blocks, register-bound) — yet `tiled_regblock` measured **3.90× faster**
+(41.85 ms vs 163.19 ms), well past the "roughly 2–3×" this section originally
+guessed. That is the measured answer to the standing question in
+`LEARNING_LOG.md` about how a lower-occupancy kernel can be faster: occupancy
+governs latency hiding, and this kernel is not latency-bound.
 
 `occupancy` is reported as **hand-computed / CUDA-API**, two of three legs; the
 third is Nsight's measured `sm__warps_active.avg.pct_of_peak_sustained_active` in
