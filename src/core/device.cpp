@@ -31,6 +31,7 @@ std::string DeviceInfo::describe() const {
      << "  SMs                     : " << sm_count << '\n'
      << "  max threads / SM        : " << max_threads_per_sm
      << "  (" << warps_per_sm << " warps)\n"
+     << "  max blocks / SM         : " << max_blocks_per_sm << '\n'
      << "  regs / SM               : " << regs_per_sm << '\n'
      << "  shared mem / block      : " << shared_mem_per_block / 1024 << " KiB"
      << "  (opt-in max " << shared_mem_per_block_optin / 1024 << " KiB)\n"
@@ -81,6 +82,7 @@ StatusOr<DeviceInfo> query_device(int index) {
   d.warps_per_sm              = p.maxThreadsPerMultiProcessor / kWarpSize;
   d.regs_per_sm               = p.regsPerMultiprocessor;
   d.regs_per_block            = p.regsPerBlock;
+  d.max_blocks_per_sm         = p.maxBlocksPerMultiProcessor;
   d.global_mem_bytes          = p.totalGlobalMem;
   d.shared_mem_per_block      = p.sharedMemPerBlock;
   d.shared_mem_per_block_optin = p.sharedMemPerBlockOptin;

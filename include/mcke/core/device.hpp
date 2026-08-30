@@ -44,6 +44,18 @@ struct DeviceInfo {
   int regs_per_sm               = 0;   // register file per SM (in 32-bit regs)
   int regs_per_block            = 0;
 
+  // The FOURTH occupancy limiter, and the one people forget. Occupancy is the
+  // minimum of four independent caps -- registers, shared memory, the
+  // threads-per-SM cap, and this one -- not just whichever is easiest to compute.
+  //
+  // Its value is architecture-specific and NOT monotone with compute capability:
+  // sm_70 (Volta) allows 32 resident blocks, sm_75 (Turing) only 16, sm_80
+  // (Ampere) 32 again, sm_86/sm_89 16. Every authoritative number in this
+  // project comes from a T4, so hardcoding 32 -- as an earlier version of the
+  // comment in kernels/kernels.hpp did -- gets the binding limiter wrong on the
+  // exact hardware we measure on. Read it from the driver instead of assuming.
+  int max_blocks_per_sm         = 0;   // maxBlocksPerMultiProcessor
+
   // --- Memory hierarchy. `shared_mem_per_block_optin` is the one that matters:
   //     on sm_75+ the default limit is 48 KiB per block, but you can opt in to
   //     more (up to 64/100/164/228 KiB depending on arch) via

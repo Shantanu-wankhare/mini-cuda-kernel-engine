@@ -9,7 +9,8 @@ typedef enum {
   cudaSuccess = 0, cudaErrorNotReady = 600, cudaErrorMemoryAllocation = 2,
   cudaErrorInvalidValue = 1
 } cudaError_t;
-typedef enum { cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2 } cudaMemcpyKind;
+typedef enum { cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2,
+               cudaMemcpyDeviceToDevice = 3 } cudaMemcpyKind;
 enum { cudaStreamNonBlocking = 1, cudaEventDefault = 0, cudaEventDisableTiming = 2,
        cudaHostAllocMapped = 2 };
 struct cudaDeviceProp {
@@ -18,6 +19,10 @@ struct cudaDeviceProp {
   std::size_t totalGlobalMem, sharedMemPerBlock, sharedMemPerBlockOptin, sharedMemPerMultiprocessor;
   int l2CacheSize, memoryBusWidth, memoryClockRate, cooperativeLaunch;
   int memoryPoolsSupported, asyncEngineCount;
+  // The 4th occupancy limiter. Added for Phase 3d: sm_75 caps resident blocks at
+  // 16 (Volta was 32, Turing halved it), and an occupancy calculator that
+  // hardcodes either value is wrong on some target in CLAUDE.md's table.
+  int maxBlocksPerMultiProcessor;
 };
 const char* cudaGetErrorName(cudaError_t);
 const char* cudaGetErrorString(cudaError_t);
@@ -47,26 +52,17 @@ template <class T> cudaError_t cudaHostAlloc(T**, std::size_t, unsigned);
 template <class T> cudaError_t cudaHostGetDevicePointer(T**, void*, unsigned);
 cudaError_t cudaFreeHost(void*);
 
-// --- Added for Phase 3 (kernels). Signatures only; no behaviour. ---
-typedef struct cublasContext* cublasHandle_t;
-typedef enum { CUBLAS_STATUS_SUCCESS = 0 } cublasStatus_t;
-typedef enum { CUBLAS_OP_N = 0, CUBLAS_OP_T = 1 } cublasOperation_t;
-typedef enum { CUBLAS_PEDANTIC_MATH = 0, CUBLAS_DEFAULT_MATH = 1 } cublasMath_t;
-typedef enum { CUBLAS_POINTER_MODE_HOST = 0 } cublasPointerMode_t;
-cublasStatus_t cublasCreate_v2(cublasHandle_t*);
-cublasStatus_t cublasDestroy_v2(cublasHandle_t);
-cublasStatus_t cublasSetStream_v2(cublasHandle_t, cudaStream_t);
-cublasStatus_t cublasSetMathMode(cublasHandle_t, cublasMath_t);
-cublasStatus_t cublasSetPointerMode_v2(cublasHandle_t, cublasPointerMode_t);
-cublasStatus_t cublasSgemm_v2(cublasHandle_t, cublasOperation_t, cublasOperation_t,
-                              int m, int n, int k, const float* alpha,
-                              const float* A, int lda, const float* B, int ldb,
-                              const float* beta, float* C, int ldc);
-#define cublasCreate         cublasCreate_v2
-#define cublasDestroy        cublasDestroy_v2
-#define cublasSetStream      cublasSetStream_v2
-#define cublasSetPointerMode cublasSetPointerMode_v2
-#define cublasSgemm          cublasSgemm_v2
+// NOTE: the cuBLAS declarations used to live here. They moved to the sibling
+// `cublas_v2.h` in Phase 3d, because kernels/gemm.cu includes BOTH this header
+// (transitively, via runtime/cuda_check.hpp) and <cublas_v2.h>. Declaring
+// CUBLAS_STATUS_SUCCESS and CUBLAS_OP_N in two headers that meet in one TU is a
+// hard redeclaration error, so the surface has to live in exactly one place --
+// which is also how the real toolkit ships it.
+
+// Versions, for the RESULTS.md rule-1 environment banner.
+cudaError_t cudaDriverGetVersion(int*);
+cudaError_t cudaRuntimeGetVersion(int*);
+cudaError_t cudaGetDevice(int*);
 
 // cudaFuncAttributes: the bench reads regs/thread + smem/block from this rather
 // than parsing -Xptxas output, so the RESULTS.md occupancy columns self-populate.
@@ -76,6 +72,16 @@ struct cudaFuncAttributes {
   int maxDynamicSharedSizeBytes, preferredShmemCarveout;
 };
 template <class T> cudaError_t cudaFuncGetAttributes(cudaFuncAttributes*, T*);
-cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int*, const void*, int, std::size_t);
+
+// TEMPLATED ON THE KERNEL TYPE, deliberately -- an earlier version of this line
+// declared the first kernel parameter as `const void*`, matching the C API. That
+// does not compile at the call site: converting a __global__ function pointer
+// (`void(*)(const float*, ...)`) to `const void*` is ill-formed in standard C++.
+// The real toolkit resolves this with C++ template overloads in cuda_runtime.h,
+// which nvcc force-includes into every .cu but which this project never includes
+// directly. cudaFuncGetAttributes above already had the right shape.
+template <class T>
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int*, T*, int, std::size_t);
+
 cudaError_t cudaMemset(void*, int, std::size_t);
 cudaError_t cudaMemsetAsync(void*, int, std::size_t, cudaStream_t);

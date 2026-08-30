@@ -66,18 +66,41 @@ get anonymous kernel bars and cannot tell which graph node is which.
 
 ## 4. Nsight Compute — single-kernel deep dive
 
+**One variant per `ncu` invocation.** This is not a style preference — profiling
+the whole ladder in one process does not work:
+
 ```bash
 # Build with line info (default in RelWithDebInfo here) so SASS maps to source.
+# --only= isolates ONE variant; --skip-validation drops the correctness passes,
+# whose kernel launches would otherwise be profiled too.
 ncu --set full \
     --kernel-name-base function --kernel-name regex:gemm \
-    --launch-skip 5 --launch-count 3 \
-    --export reports/ncu_gemm_$(date +%Y%m%d_%H%M) \
-    ./build/bin/mcke_gemm_bench 4096
+    --launch-skip 1 --launch-count 3 \
+    --export reports/ncu_gemm_tiled_smem_$(date +%Y%m%d_%H%M) \
+    ./build/bin/mcke_gemm_bench 1024 \
+        --only=tiled_smem --skip-validation --warmup=1 --iters=3
 ```
 
-`--launch-skip 5` skips warmup launches; `--launch-count 3` limits the replay
-cost. Without these, `ncu` profiles every launch and a 50-iteration benchmark
-takes many minutes.
+Three things in that command are load-bearing, and an earlier version of this
+section got all three wrong (it read
+`ncu ... ./build/bin/mcke_gemm_bench 4096`, which was fiction — no bench parsed
+a shape argument at all until Phase 3d):
+
+- **`--only=<variant>`.** `--kernel-name regex:gemm` also matches cuBLAS's own
+  kernels, which are named `turing_sgemm_*` / `volta_sgemm_*` — "sgemm" contains
+  "gemm". With eight variants × 25 launches, `--launch-count 3` would profile
+  three launches of whichever kernel happened to come first out of ~200, and the
+  report would be labelled with whatever you assumed it was.
+- **A smaller shape.** `--set full` replays each kernel a dozen-plus times to
+  collect every counter. Replaying a 4096³ naive GEMM at ~3 s per launch is tens
+  of minutes; 1024³ is 64× less work and the *ratios* this table cares about
+  (sectors per request, bank conflicts, stall reasons) are shape-independent.
+- **`--warmup=1 --iters=3`.** Fewer launches to skip and replay. The bench prints
+  a loud `NON-COMPLIANT WITH RULE 3` banner in this mode, deliberately: these
+  timings must never be copied into `RESULTS.md`, only the counters.
+
+For the *timing* numbers that do go in `RESULTS.md`, run the bench without `ncu`
+at the pinned 4096³ shape and full iteration counts.
 
 ### Metrics that actually change decisions
 

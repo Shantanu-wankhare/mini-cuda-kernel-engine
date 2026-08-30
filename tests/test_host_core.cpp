@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -1889,6 +1890,559 @@ void test_freelist_reuse_policies() {
 
 #endif  // !MCKE_WITH_CUDA
 
+// ---------------------------------------------------------------------------
+// Phase 3d: the GEMM tile descriptor and the four-limiter occupancy calculator.
+//
+// These run on a machine with no GPU, which is the entire reason the logic was
+// hoisted into mcke/kernels/gemm_tile.hpp rather than left in kernels/gemm.cu.
+// docs/ROADMAP.md makes the hand-computed-vs-measured occupancy comparison the
+// learning objective of Phase 3d; a hand calculation that lives in a comment
+// cannot be wrong in any way a test notices.
+//
+// The assertions below are written to catch REAL errors rather than to restate
+// the implementation. Concretely: smem figures are hard-coded byte counts, not
+// `== (bm*bk + bk*bn)*4` (which would just re-run the code under test), and
+// every rejection is asserted individually rather than as "returns false for
+// garbage".
+// ---------------------------------------------------------------------------
+mcke::DeviceInfo t4_device_info() {
+  // Hand-constructed rather than queried. query_device() errors out in a
+  // host-only build (src/core/device.cpp), so tests MUST fabricate one -- which
+  // is exactly the portability DeviceInfo was made a POD to enable.
+  mcke::DeviceInfo d;
+  d.name = "Tesla T4 (synthetic)";
+  d.cc_major = 7; d.cc_minor = 5;
+  d.sm_count = 40;
+  d.max_threads_per_sm = 1024;      // Turing: 1024, NOT Volta's 2048
+  d.max_threads_per_block = 1024;
+  d.warps_per_sm = 32;
+  d.regs_per_sm = 65536;
+  d.regs_per_block = 65536;
+  d.max_blocks_per_sm = 16;         // Turing: 16, NOT Volta/Ampere's 32
+  d.shared_mem_per_block = 48 * 1024;
+  d.shared_mem_per_block_optin = 64 * 1024;
+  d.shared_mem_per_sm = 64 * 1024;
+  return d;
+}
+
+void test_gemm_tile_geometry() {
+  std::printf("test_gemm_tile_geometry\n");
+  using namespace mcke::kernels;
+
+  // Hard-coded expectations. Deriving them from the same formula the code uses
+  // would make these tests pass for any consistent-but-wrong implementation.
+  CHECK_EQ(threads_per_block(GemmTile{}), 256);              // (128/8)*(128/8)
+  CHECK_EQ(threads_per_block(GemmTile{32, 32, 32, 1, 1}), 1024);
+  CHECK_EQ(smem_bytes(GemmTile{}, false), 8192u);            // (128*8 + 8*128)*4
+  CHECK_EQ(smem_bytes(GemmTile{}, true), 16384u);            // double-buffered
+  CHECK_EQ(smem_bytes(GemmTile{32, 32, 32, 1, 1}, false), 8192u);
+
+  // The DEFAULT tile must map to a compiled instantiation. Every caller that
+  // omits a tile gets GemmTile{}, so if the default and the dispatch table ever
+  // drift, the whole bench silently runs an unsupported configuration.
+  CHECK(select_tile_config(GemmTile{}) == GemmTileConfig::k128x128x8_8x8);
+  CHECK(select_tile_config(GemmTile{32, 32, 32, 1, 1}) == GemmTileConfig::k32x32x32_1x1);
+
+  // The one that catches silent-fallback-to-nearest-tile: a tile that is
+  // perfectly self-consistent and simply was never instantiated. There is no
+  // compile error for this case, so only an explicit test finds it.
+  const GemmTile plausible{64, 64, 16, 4, 4};
+  CHECK(tile_is_self_consistent(plausible));
+  CHECK(select_tile_config(plausible) == GemmTileConfig::kUnsupported);
+
+  // Self-consistency: each rejection reason individually.
+  CHECK(tile_is_self_consistent(GemmTile{}));
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 8, 7, 8}));   // bm % tm != 0
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 8, 8, 7}));   // bn % tn != 0
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 0, 8, 8}));   // bk == 0
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 8, 1, 1}));   // 16384 threads
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 8, 8, 128})); // 16 threads, not
+                                                                 // warp-aligned...
+  // ...and warp alignment specifically: 8x8 output tile with 4x4 threads = 4
+  // threads/block. A partial warp per block wastes issue slots silently and
+  // skews every occupancy figure computed from it.
+  CHECK(!tile_is_self_consistent(GemmTile{8, 8, 8, 4, 4}));
+  // The staging loop must tile evenly across threads, or the tail of the shared
+  // tile is never written and the inner loop multiplies garbage.
+  CHECK(!tile_is_self_consistent(GemmTile{128, 128, 3, 8, 8}));   // 128*3 % 256 != 0
+
+  for (const GemmTile& t : {GemmTile{}, GemmTile{32, 32, 32, 1, 1}}) {
+    CHECK(threads_per_block(t) % 32 == 0);
+    CHECK(threads_per_block(t) <= 1024);
+  }
+}
+
+void test_gemm_occupancy_limiters() {
+  std::printf("test_gemm_occupancy_limiters\n");
+  using namespace mcke::kernels;
+  const mcke::DeviceInfo d = t4_device_info();
+
+  // --- Each of the four limiters must bind in at least one case. This is the
+  //     only way to prove the "which limiter" answer is computed rather than
+  //     guessed, and it is why the function returns a limiter at all.
+
+  // 1. REGISTERS. 256 threads at 128 regs/thread: 65536 / (128*32 rounded to a
+  //    256-register warp granule = 4096) = 16 warps -> 2 blocks of 8 warps.
+  //    Shared memory would allow 8, the threads cap 4, the blocks cap 16.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 256, 128, 8192);
+    CHECK_EQ(e.blocks_per_sm, 2);
+    CHECK(e.limiter == OccupancyLimiter::kRegisters);
+    CHECK(!e.tied);
+    CHECK(e.occupancy > 0.499 && e.occupancy < 0.501);        // 2*256/1024 = 50%
+    CHECK_EQ(e.by_smem, 8);
+    CHECK_EQ(e.by_threads, 4);
+  }
+
+  // 2. SHARED MEMORY, uniquely binding: 128-thread blocks using 32 KiB each.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 128, 32, 32 * 1024);
+    CHECK_EQ(e.blocks_per_sm, 2);                              // 64 KiB / 32 KiB
+    CHECK(e.limiter == OccupancyLimiter::kSharedMemory);
+    CHECK(!e.tied);
+  }
+
+  // 3. THREADS-PER-SM cap, uniquely binding.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 256, 32, 1024);
+    CHECK_EQ(e.blocks_per_sm, 4);                              // 1024 / 256
+    CHECK(e.limiter == OccupancyLimiter::kThreadsPerSm);
+  }
+
+  // 4. BLOCKS-PER-SM cap. This is the case that fails loudly if 32 (the Volta /
+  //    Ampere figure) was hardcoded instead of read from DeviceInfo -- and every
+  //    authoritative number in this project comes from a Turing T4, where it
+  //    is 16.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 32, 16, 0);
+    CHECK_EQ(e.blocks_per_sm, 16);
+    CHECK(e.limiter == OccupancyLimiter::kBlocksPerSm);
+  }
+
+  // --- Pins the claim documented on GemmTile in gemm_tile.hpp: the register-
+  //     blocked tile is REGISTER-bound at 2 blocks / 50%, and shared memory --
+  //     the obvious-looking constraint -- is not binding. If someone edits the
+  //     formula, this doc-claim test fails.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 256, 128, 16384);   // double-buffered
+    CHECK_EQ(e.blocks_per_sm, 2);
+    CHECK(e.limiter == OccupancyLimiter::kRegisters);
+    CHECK_EQ(e.by_smem, 4);            // smem allows 4; registers allow 2
+  }
+
+  // --- tiled_smem: 1024 threads/block. Registers and the threads cap BOTH give
+  //     1 block, so this is a genuine tie -- and the tie must be reported,
+  //     because "registers" alone would invite cutting register pressure, which
+  //     cannot possibly help: two 1024-thread blocks would need 2048 threads on
+  //     a 1024-thread SM. Ties resolve toward the architectural cap for exactly
+  //     this reason.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 1024, 64, 8192);
+    CHECK_EQ(e.blocks_per_sm, 1);
+    CHECK(e.tied);
+    CHECK(e.limiter == OccupancyLimiter::kThreadsPerSm);
+    CHECK(e.occupancy > 0.999);        // 1 block x 1024 threads = 100% occupancy
+  }
+
+  // --- THE REGISTER CLIFF, and it is a launch failure rather than a slowdown.
+  //     At 1024 threads, 32 warps x ceil(R*32/256) x 256 <= 65536 forces R <= 64.
+  //     R = 65 does not run slowly; it returns cudaErrorLaunchOutOfResources.
+  //     __launch_bounds__(1024, 1) on gemm_tiled_smem_kernel exists to make
+  //     ptxas responsible for staying under it.
+  {
+    CHECK_EQ(occupancy_blocks_per_sm(d, 1024, 64, 8192).blocks_per_sm, 1);
+    const auto over = occupancy_blocks_per_sm(d, 1024, 65, 8192);
+    CHECK_EQ(over.blocks_per_sm, 0);
+    CHECK(over.limiter == OccupancyLimiter::kInvalid);
+  }
+  // Same cliff one tile up: the register-blocked variants need R <= 128 for two
+  // blocks. Double buffering adds ~8 registers of staged operands, so this
+  // boundary is the reason __launch_bounds__(256, 2) is not optional there.
+  CHECK_EQ(occupancy_blocks_per_sm(d, 256, 128, 8192).blocks_per_sm, 2);
+  CHECK_EQ(occupancy_blocks_per_sm(d, 256, 129, 8192).blocks_per_sm, 1);
+
+  // --- Register allocation granularity actually applied. A naive
+  //     regs_per_sm / (R * threads) would give 7 here; the per-warp 256-register
+  //     granule plus the 4-warp rounding gives 5. If this ever reads 7, the
+  //     granularity modelling was dropped and the whole three-way comparison in
+  //     the bench becomes uninformative.
+  {
+    const auto e = occupancy_blocks_per_sm(d, 512, 17, 0);
+    CHECK_EQ(e.by_registers, 5);
+    CHECK(65536 / (17 * 512) == 7);    // what the naive formula would have said
+  }
+
+  // --- Degenerate inputs return "will not launch" rather than crashing or
+  //     inventing a 1. A default-constructed DeviceInfo is all zeros and is
+  //     reachable in a host-only build, so this is a normal path.
+  {
+    const mcke::DeviceInfo empty;
+    CHECK_EQ(occupancy_blocks_per_sm(empty, 256, 32, 1024).blocks_per_sm, 0);
+    CHECK_EQ(occupancy_blocks_per_sm(d, 0, 32, 1024).blocks_per_sm, 0);
+    CHECK_EQ(occupancy_blocks_per_sm(d, 2048, 32, 1024).blocks_per_sm, 0);   // > 1024
+    CHECK_EQ(occupancy_blocks_per_sm(d, 256, 256, 1024).blocks_per_sm, 0);   // > 255 regs
+    CHECK_EQ(occupancy_blocks_per_sm(d, 256, 32, 128 * 1024).blocks_per_sm, 0);
+  }
+
+  // --- Invariants that must hold everywhere. Monotonicity is the useful one:
+  //     asking for more registers can never buy more resident blocks, and a
+  //     violation would mean a rounding bug in the granularity arithmetic.
+  {
+    int prev = 1 << 30;
+    for (int r = 1; r <= 255; ++r) {
+      const auto e = occupancy_blocks_per_sm(d, 256, r, 8192);
+      CHECK(e.blocks_per_sm <= prev);
+      prev = e.blocks_per_sm;
+      CHECK(e.blocks_per_sm <= d.max_blocks_per_sm);
+      if (e.blocks_per_sm > 0) {
+        CHECK(e.occupancy > 0.0 && e.occupancy <= 1.0);
+        CHECK_EQ(e.warps_per_sm, e.blocks_per_sm * 8);
+      }
+    }
+  }
+}
+
+void test_gemm_dbuf_schedule() {
+  std::printf("test_gemm_dbuf_schedule\n");
+  using namespace mcke::kernels;
+
+  // Replays the double-buffered k-loop from kernels/gemm.cu against a model of
+  // shared memory, for every tile count from 0 to 200, and asserts the two
+  // properties the kernel's correctness rests on:
+  //
+  //   (a) EVERY k-tile is computed EXACTLY ONCE. A dropped tile means the last
+  //       BK columns of K silently contribute nothing -- a ~0.2% error at
+  //       K=4096 that no tolerance would flag as a bug and that the K=256
+  //       validation shape (32 tiles, even) would never expose at all.
+  //   (b) Each compute reads the buffer that was last PUBLISHED with that tile.
+  //       This is the ping-pong parity, and getting it wrong reads a stale tile
+  //       rather than no tile -- a wrong answer that still looks plausible.
+  //
+  // The loop below mirrors gemm.cu line for line. It shares dbuf_schedule() with
+  // the kernel, so the parity and the tail cannot drift; what it re-states is
+  // only the publish/compute ordering around them.
+  for (std::int64_t kt = 0; kt <= 200; ++kt) {
+    const DbufSchedule sch = dbuf_schedule(kt);
+
+    std::vector<int> computed(static_cast<std::size_t>(kt > 0 ? kt : 1), 0);
+    // buf[i] = which tile that shared buffer currently holds (-1 = none/OOB).
+    std::int64_t buf[2] = {-1, -1};
+    bool parity_ok = true;
+
+    auto publish = [&](int b, std::int64_t tile) { buf[b] = (tile < kt) ? tile : -1; };
+    auto compute = [&](int b) {
+      if (buf[b] < 0 || buf[b] >= kt) { parity_ok = false; return; }
+      ++computed[static_cast<std::size_t>(buf[b])];
+    };
+
+    publish(0, 0);                                    // pre-loop publish
+    for (std::int64_t it = 0; it < sch.pair_iters; ++it) {
+      const std::int64_t t = it * 2;
+      compute(0); publish(1, t + 1);
+      compute(1); publish(0, t + 2);
+    }
+    if (sch.has_tail) compute(0);
+
+    CHECK(parity_ok);
+    // Exactly once, for every tile.
+    for (std::int64_t t = 0; t < kt; ++t)
+      CHECK_EQ(computed[static_cast<std::size_t>(t)], 1);
+  }
+
+  // The specific boundaries, spelled out so a regression names itself.
+  CHECK_EQ(dbuf_schedule(0).pair_iters, 0);  CHECK(!dbuf_schedule(0).has_tail);
+  CHECK_EQ(dbuf_schedule(1).pair_iters, 0);  CHECK(dbuf_schedule(1).has_tail);
+  CHECK_EQ(dbuf_schedule(2).pair_iters, 1);  CHECK(!dbuf_schedule(2).has_tail);
+  CHECK_EQ(dbuf_schedule(3).pair_iters, 1);  CHECK(dbuf_schedule(3).has_tail);
+  // K=4096 with BK=8 is 512 tiles -- EVEN, so the benchmark shape never
+  // exercises the tail. K=257 (a validation shape) gives 33 tiles, which does.
+  CHECK_EQ(dbuf_schedule(512).pair_iters, 256);  CHECK(!dbuf_schedule(512).has_tail);
+  CHECK_EQ(dbuf_schedule(33).pair_iters, 16);    CHECK(dbuf_schedule(33).has_tail);
+}
+
+void test_gemm_bank_conflict_math() {
+  std::printf("test_gemm_bank_conflict_math\n");
+  // The bank arithmetic that decides kGemmAPad, checked rather than asserted in
+  // a comment. 32 banks of 4 B, so bank(addr_in_floats) = addr % 32, and a warp
+  // pays one phase per DISTINCT ADDRESS per bank (equal addresses broadcast).
+  //
+  // This is a pure integer property of the layout, so it is fully checkable
+  // without a GPU -- and it is the difference between an 8-way conflict paid
+  // K/BK = 512 times per block and no conflict at all.
+  constexpr int kBM = 128, kBK = 8;
+
+  // Distinct addresses landing in the same bank, over the 32 lanes of a warp,
+  // for the SCALAR A-store decomposition: arow = tid/BK, acol = tid%BK.
+  auto scalar_store_conflict = [](int pad) {
+    std::map<int, std::set<int>> per_bank;   // bank -> distinct addresses
+    for (int tid = 0; tid < 32; ++tid) {
+      const int arow = tid / kBK, acol = tid % kBK;
+      const int addr = acol * (kBM + pad) + arow;
+      per_bank[addr % 32].insert(addr);
+    }
+    std::size_t worst = 0;
+    for (const auto& kv : per_bank) worst = std::max(worst, kv.second.size());
+    return worst;
+  };
+
+  CHECK_EQ(scalar_store_conflict(0), 8u);   // the bug: lanes 0-7 all in bank 0
+  CHECK_EQ(scalar_store_conflict(1), 4u);   // the reflexive "+1" fix: still 4-way
+  CHECK_EQ(scalar_store_conflict(4), 1u);   // kGemmAPad: conflict-free
+  // Why 4 works: stride 132 % 32 == 4, so bank = (4*acol + arow) % 32 walks
+  // 0,4,8,...,28 with a 0..3 offset and covers all 32 banks exactly once.
+  CHECK_EQ((kBM + 4) % 32, 4);
+
+  // The VECTORIZED A-store decomposition (arow = tid/2, acol = 4*(tid%2)) must
+  // ALSO be conflict-free under the same pad -- otherwise warptile_vec4 would
+  // improve the conflict degree as a side effect and its row would carry two
+  // causes instead of one.
+  for (int i = 0; i < 4; ++i) {
+    std::map<int, std::set<int>> per_bank;
+    for (int tid = 0; tid < 32; ++tid) {
+      const int arow = tid / 2, acol = (tid % 2) * 4 + i;
+      const int addr = acol * (kBM + 4) + arow;
+      per_bank[addr % 32].insert(addr);
+    }
+    std::size_t worst = 0;
+    for (const auto& kv : per_bank) worst = std::max(worst, kv.second.size());
+    CHECK_EQ(worst, 1u);
+  }
+
+  // The B-FRAGMENT READ is the conflict warp tiling addresses, and the point is
+  // that it CANNOT be eliminated by any lane permutation -- only reduced.
+  // bank = (TN*thread_col + i) % 32 has period 4 in thread_col when TN = 8, so
+  // at most 4 distinct banks are reachable however lanes are assigned.
+  auto b_read_conflict = [](bool warp_tile) {
+    std::map<int, std::set<int>> per_bank;
+    for (int tid = 0; tid < 32; ++tid) {
+      int thread_col;
+      if (!warp_tile) {
+        thread_col = tid % 16;                          // kRowMajor: 2x16 lanes
+      } else {
+        const int lane = tid % 32;
+        thread_col = (0 /*warpCol*/) * 8 + (lane % 8);   // kWarp4x8: 4x8 lanes
+      }
+      const int addr = thread_col * 8;                   // i = 0
+      per_bank[addr % 32].insert(addr);
+    }
+    std::size_t worst = 0;
+    for (const auto& kv : per_bank) worst = std::max(worst, kv.second.size());
+    return worst;
+  };
+  CHECK_EQ(b_read_conflict(false), 4u);   // 4-way -> 4 phases (+1 for A) = 5
+  CHECK_EQ(b_read_conflict(true),  2u);   // 2-way -> 2 phases (+1 for A) = 3
+  // 5 -> 3 phases is a 1.67x cut, NOT elimination. The Phase-0 header claimed
+  // the conflict was "removed"; RESULTS.md sec 3d records the retraction and the
+  // revised 5-12% prediction. This assertion is what stops the claim coming back.
+
+  // The A-fragment read is conflict-free under BOTH lane maps, and by BROADCAST
+  // (few distinct addresses), not by the transpose. Conflating those two is how
+  // the wrong intuition gets carried into the next kernel.
+  for (bool warp_tile : {false, true}) {
+    std::set<int> distinct_rows;
+    for (int tid = 0; tid < 32; ++tid) {
+      const int thread_row = warp_tile ? (0 * 4 + (tid % 32) / 8) : (tid / 16);
+      distinct_rows.insert(thread_row);
+    }
+    CHECK(distinct_rows.size() <= 4u);   // <=4 distinct addresses, all broadcast
+  }
+}
+
+void test_gemm_tolerances() {
+  std::printf("test_gemm_tolerances\n");
+  using namespace mcke::testing;
+
+  // The tolerance must SCALE WITH K. A single constant is wrong at both ends:
+  // at K=1 a GEMM is one multiply, at K=4096 the accumulation is 64x deeper.
+  CHECK(tol_gemm(1) < tol_gemm(256));
+  CHECK(tol_gemm(256) < tol_gemm(4096));
+  // Recovers the previously hand-picked kTolGemmK256 = 1e-5 at K=256, so the new
+  // function is consistent with the old constant rather than contradicting it.
+  CHECK(tol_gemm(256) < 1e-5 && tol_gemm(256) > 1e-6);
+  // A K=1 GEMM is a single multiply: near machine epsilon, not 1e-5.
+  CHECK(tol_gemm(1) < 1e-6);
+  // Guard against a zero/negative K dividing or sqrt-ing into nonsense.
+  CHECK(tol_gemm(0) > 0.0);
+
+  // The absolute floor scales with K and with the input magnitude, because the
+  // rounding error is set by the size of the TERMS being summed, not by the size
+  // of the result -- the same trap that produced kAbsTolReduceSum4096.
+  CHECK(abs_tol_gemm(4096, 1.0) > abs_tol_gemm(256, 1.0));
+  CHECK(abs_tol_gemm(4096, 2.0) > abs_tol_gemm(4096, 1.0));
+  CHECK(abs_tol_gemm(4096, 1.0) > 1e-5);   // big enough to cover near-zero outputs
+  CHECK(abs_tol_gemm(1, 1.0) < 1e-6);      // but not so big it hides a K=1 bug
+
+  // spot_check_gemm must agree with reference_gemm where they overlap -- it is a
+  // cheap oracle for the benchmark shape, so it had better be the SAME oracle.
+  {
+    const std::int64_t m = 17, n = 13, k = 29;
+    std::vector<float> a(m * k), b(k * n), c(m * n, 0.0f);
+    fill_random(a.data(), a.size(), 0x11AAull, -1.0f, 1.0f);
+    fill_random(b.data(), b.size(), 0x22BBull, -1.0f, 1.0f);
+    reference_gemm(a.data(), b.data(), c.data(), m, n, k, 1.0f, 0.0f);
+    const auto ok = spot_check_gemm(a.data(), b.data(), c.data(), m, n, k, 1.0f,
+                                    200, 0x33CCull, tol_gemm(k), abs_tol_gemm(k, 1.0));
+    CHECK_EQ(ok.mismatches, 0u);
+    CHECK_EQ(ok.checked, 200u);
+
+    // And it must actually FAIL on corrupted output -- a spot check that never
+    // fires is worse than none, because it reads as evidence.
+    c[(m / 2) * n + (n / 2)] += 1.0f;
+    const auto bad = spot_check_gemm(a.data(), b.data(), c.data(), m, n, k, 1.0f,
+                                     4000, 0x33CCull, tol_gemm(k), abs_tol_gemm(k, 1.0));
+    CHECK(bad.mismatches > 0u);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The independent-oracle cross-check.
+//
+// Reads tests/data/reference_vectors.txt (generated by tools/gen_reference.py,
+// committed, never a build step) and replays every case through
+// tests/reference.hpp.
+//
+// WHAT THIS CATCHES THAT NOTHING ELSE CAN. reference.hpp is the oracle every
+// CUDA kernel is judged against, so nothing in the project judges IT. If the C++
+// reference and a kernel share a misunderstanding -- both treating B as
+// column-major, say -- they agree perfectly and validation passes while the
+// answer is wrong. Only an oracle derived from a different source breaks that,
+// which is why the Python side re-derives each operation from its definition
+// instead of porting the C++.
+//
+// For `exact` cases the inputs are multiples of 0.25, so every product and
+// partial sum is exact in f32 and agreement must be BIT-FOR-BIT -- no tolerance,
+// no room to explain a mismatch away as rounding.
+// ---------------------------------------------------------------------------
+struct RefCase {
+  std::string name, kind, mode;
+  std::map<std::string, long long> ints;
+  std::map<std::string, float> floats;
+  std::map<std::string, std::vector<float>> arrays;
+};
+
+float bits_to_f32(const std::string& hex) {
+  const std::uint32_t u = static_cast<std::uint32_t>(std::strtoul(hex.c_str(), nullptr, 16));
+  float f;
+  std::memcpy(&f, &u, sizeof(f));   // memcpy, not a union or a reinterpret_cast:
+  return f;                         // the only strictly-conforming type pun
+}
+
+std::vector<RefCase> load_reference_vectors(std::string* where) {
+  // Tests may run from the repo root (the documented one-command clang++ line)
+  // or from a build directory (ctest), so try both rather than assuming.
+  const char* candidates[] = {"tests/data/reference_vectors.txt",
+                              "../tests/data/reference_vectors.txt",
+                              "../../tests/data/reference_vectors.txt"};
+  std::ifstream in;
+  for (const char* p : candidates) {
+    in.open(p);
+    if (in.is_open()) { *where = p; break; }
+    in.clear();
+  }
+  std::vector<RefCase> cases;
+  if (!in.is_open()) return cases;
+
+  std::string tok;
+  while (in >> tok) {
+    if (tok == "#") { std::getline(in, tok); continue; }
+    if (tok[0] == '#') { std::getline(in, tok); continue; }
+    if (tok != "case") continue;
+    RefCase c;
+    in >> c.name;
+    while (in >> tok && tok != "end") {
+      if (tok == "kind") in >> c.kind;
+      else if (tok == "mode") in >> c.mode;
+      else if (tok == "int") { std::string k; long long v; in >> k >> v; c.ints[k] = v; }
+      else if (tok == "float") { std::string k, h; in >> k >> h; c.floats[k] = bits_to_f32(h); }
+      else if (tok == "array") {
+        std::string k; std::size_t n; in >> k >> n;
+        std::vector<float> v(n);
+        for (std::size_t i = 0; i < n; ++i) { std::string h; in >> h; v[i] = bits_to_f32(h); }
+        c.arrays[k] = std::move(v);
+      }
+    }
+    cases.push_back(std::move(c));
+  }
+  return cases;
+}
+
+void test_reference_vectors() {
+  std::printf("test_reference_vectors\n");
+  std::string path;
+  const std::vector<RefCase> cases = load_reference_vectors(&path);
+
+  // FAIL, do not skip. A silently-skipped oracle check reads exactly like a
+  // passing one in the summary line, which is the worst of both worlds.
+  CHECK(!cases.empty());
+  if (cases.empty()) {
+    std::printf("  FAIL could not open tests/data/reference_vectors.txt "
+                "(regenerate: python3 tools/gen_reference.py > tests/data/reference_vectors.txt)\n");
+    return;
+  }
+  std::printf("  loaded %zu cases from %s\n", cases.size(), path.c_str());
+
+  std::size_t exact_cases = 0;
+  for (const RefCase& c : cases) {
+    const auto exp_it = c.arrays.find("expect");
+    CHECK(exp_it != c.arrays.end());
+    if (exp_it == c.arrays.end()) continue;
+    const std::vector<float>& want = exp_it->second;
+    std::vector<float> got(want.size(), 0.0f);
+
+    if (c.kind == "gemm") {
+      const auto m = c.ints.at("m"), n = c.ints.at("n"), k = c.ints.at("k");
+      got = c.arrays.at("c");     // reference_gemm reads C for the beta term
+      mcke::testing::reference_gemm(c.arrays.at("a").data(), c.arrays.at("b").data(),
+                                    got.data(), m, n, k,
+                                    c.floats.at("alpha"), c.floats.at("beta"));
+    } else if (c.kind == "bias_act") {
+      const auto rows = c.ints.at("rows"), cols = c.ints.at("cols");
+      mcke::testing::reference_bias_act(
+          c.arrays.at("x").data(), c.arrays.at("bias").data(), got.data(), rows, cols,
+          static_cast<mcke::kernels::Activation>(c.ints.at("act")));
+    } else if (c.kind == "row_reduce") {
+      const auto rows = c.ints.at("rows"), cols = c.ints.at("cols");
+      mcke::testing::reference_row_reduce(
+          c.arrays.at("x").data(), got.data(), rows, cols,
+          static_cast<mcke::kernels::ReduceKind>(c.ints.at("kind")));
+    } else if (c.kind == "row_softmax") {
+      const auto rows = c.ints.at("rows"), cols = c.ints.at("cols");
+      mcke::testing::reference_row_softmax(c.arrays.at("x").data(), got.data(), rows, cols);
+    } else {
+      CHECK(false);   // an unknown kind means the generator and reader drifted
+      continue;
+    }
+
+    if (c.mode == "exact") {
+      ++exact_cases;
+      // Bit-for-bit. Comparing the bit patterns rather than the values also
+      // catches a -0.0 / +0.0 disagreement, which `==` would call equal.
+      std::size_t bad = 0;
+      for (std::size_t i = 0; i < want.size(); ++i) {
+        std::uint32_t g, w;
+        std::memcpy(&g, &got[i], 4);
+        std::memcpy(&w, &want[i], 4);
+        if (g != w) ++bad;
+      }
+      CHECK_EQ(bad, 0u);
+      if (bad) std::printf("  FAIL %s (%s): %zu/%zu elements not bit-exact\n",
+                           c.name.c_str(), c.kind.c_str(), bad, want.size());
+    } else {
+      // exp/erf/tanh cases: the formula is under test, not libm. A few ULP of
+      // libm disagreement between Python and libc++ is expected and uninteresting.
+      const auto r = mcke::testing::compare(got.data(), want.data(), want.size(),
+                                            1e-6, 1e-7);
+      CHECK(r.ok());
+      if (!r.ok()) std::printf("  FAIL %s (%s): %s\n", c.name.c_str(), c.kind.c_str(),
+                               r.to_string().c_str());
+    }
+  }
+  // If the exact cases ever vanish, the file has been regenerated by something
+  // that dropped the quarter-integer inputs, and the strongest check in this
+  // test silently became a tolerance check.
+  CHECK(exact_cases >= 10);
+}
+
 }  // namespace
 
 int main() {
@@ -1920,6 +2474,12 @@ int main() {
   test_reference_compare();
   test_reference_kernels();
   test_online_softmax_recurrence();
+  test_gemm_tile_geometry();
+  test_gemm_occupancy_limiters();
+  test_gemm_dbuf_schedule();
+  test_gemm_bank_conflict_math();
+  test_gemm_tolerances();
+  test_reference_vectors();
 #if !MCKE_WITH_CUDA
   // Stream-ordered reuse: needs fake stream handles, which are only safe to
   // fabricate when no driver will ever see them.

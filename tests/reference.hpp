@@ -327,4 +327,102 @@ inline constexpr double kTolGemmK256    = 1e-5;   // sqrt(256) * f32 eps, with h
 inline constexpr double kAbsTolGeluCancellation = 1e-6;   // >= 2x the observed 4.77e-7
 inline constexpr double kAbsTolReduceSum4096    = 5e-5;   // >= 3x the observed 1.53e-5
 
+// -----------------------------------------------------------------------------
+// GEMM tolerances as FUNCTIONS OF K, because a single constant cannot be right.
+//
+// kTolGemmK256 above is derived for K=256 and is the only GEMM tolerance the
+// file had. But Phase 3d validates at K in {1, 3, 257} and BENCHMARKS at
+// K=4096, and one constant is wrong at both ends: at K=1 a GEMM is a single
+// multiply, so 1e-5 is ~100x too loose and a real bug would sail through; at
+// K=4096 it is too tight. The tolerance must scale with the depth of the
+// accumulation, which is exactly what this file's own banner says and what a
+// fixed constant cannot do.
+//
+//   rel: 4 * sqrt(k) * eps -- the mixed-sign random-walk growth from the banner,
+//        with a 4x engineering margin. Recovers ~1e-5 at k=256 by construction,
+//        so kTolGemmK256 stays consistent with it rather than contradicting it.
+[[nodiscard]] inline double tol_gemm(std::int64_t k) {
+  const double eps = 1.1920929e-7;                    // FLT_EPSILON
+  return 4.0 * std::sqrt(static_cast<double>(k < 1 ? 1 : k)) * eps;
+}
+
+// The ABSOLUTE floor, and the reason it has to exist is a bug class this file
+// already found once and did not generalise.
+//
+// Our GEMM accumulates SERIALLY in k inside each thread (`acc += a*b`, one
+// BK-chunk at a time), so its rounding error grows like ~0.5*k*eps*|term|, NOT
+// like the result's own magnitude. With A,B ~ U(-amax, amax) the typical product
+// is amax^2/3, giving an absolute error of roughly
+//
+//     0.5 * k * eps * amax^2 / 3        (k=4096, amax=1  ->  ~8.1e-5)
+//
+// while the RESULT is ~N(0, k/3) in magnitude, i.e. ~37. So a typical element
+// has a perfectly healthy relative error of ~2e-6 -- but over 16.8M outputs at
+// M=N=4096, several hundred land at |want| < 1e-3 purely by chance, and for
+// those the same absolute error reads as a relative error near 0.1. They would
+// fail any pure relative test, and they are not bugs.
+//
+// This is VERBATIM the trap documented above for kSum ("the rounding error is
+// set by the magnitude of the TERMS being summed, not by the magnitude of the
+// final result"), which was found on hardware for row reduction and is being
+// applied to GEMM in advance this time rather than after a failed Colab run.
+// 3x margin over the derivation, same convention as kAbsTolReduceSum4096.
+[[nodiscard]] inline double abs_tol_gemm(std::int64_t k, double amax = 1.0) {
+  const double eps = 1.1920929e-7;
+  const double derived = 0.5 * static_cast<double>(k < 1 ? 1 : k) * eps * amax * amax / 3.0;
+  return 3.0 * derived;
+}
+
+// -----------------------------------------------------------------------------
+// Spot-check: validate a GEMM at a shape whose full CPU reference is unaffordable.
+//
+// WHY THIS EXISTS. reference_gemm is O(m*n*k), so a 4096-cubed reference is
+// minutes and the bench validates at small shapes instead. But bias_act_bench.cpp
+// states the project standard plainly: validation happens AT THE BENCHMARK SHAPE,
+// "not at a smaller proxy shape -- at the exact shape that produces the published
+// number." Validating only at K=256 and publishing K=4096 numbers means any bug
+// that needs a long k-loop or a deep grid to manifest ships silently.
+//
+// Recomputing a random SAMPLE of output elements costs O(samples * k) instead of
+// O(m*n*k): 1024 samples at k=4096 is ~4e6 double ops, i.e. milliseconds. That is
+// full statistical coverage of the published shape for no meaningful time.
+//
+// beta is assumed 0 -- the benchmark times beta=0 (see gemm_bench.cpp for why a
+// nonzero beta compounds C across timed iterations), and beta != 0 is exercised
+// separately at small shapes where the full reference is affordable.
+struct SpotCheckResult {
+  std::size_t checked     = 0;
+  std::size_t mismatches  = 0;
+  double      max_abs_err = 0.0;
+  double      max_rel_err = 0.0;
+  [[nodiscard]] bool ok() const { return mismatches == 0; }
+};
+
+inline SpotCheckResult spot_check_gemm(const float* a, const float* b, const float* got,
+                                       std::int64_t m, std::int64_t n, std::int64_t k,
+                                       float alpha, std::size_t samples, std::uint64_t seed,
+                                       double rel_tol, double abs_tol) {
+  SpotCheckResult r;
+  if (m <= 0 || n <= 0 || k <= 0) return r;
+  std::mt19937_64 rng(seed);
+  for (std::size_t s = 0; s < samples; ++s) {
+    const std::int64_t i = static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(m));
+    const std::int64_t j = static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(n));
+    double acc = 0.0;   // double, for the same reason reference_gemm uses double:
+                        // the oracle must be more accurate than what it judges
+    for (std::int64_t p = 0; p < k; ++p)
+      acc += static_cast<double>(a[i * k + p]) * static_cast<double>(b[p * n + j]);
+    const double want = static_cast<double>(alpha) * acc;
+    const double g    = static_cast<double>(got[i * n + j]);
+    ++r.checked;
+    if (std::isnan(g) || std::isinf(g)) { ++r.mismatches; continue; }
+    const double abs_err = std::fabs(g - want);
+    const double rel_err = std::fabs(want) > 0.0 ? abs_err / std::fabs(want) : 0.0;
+    if (abs_err > r.max_abs_err) r.max_abs_err = abs_err;
+    if (rel_err > r.max_rel_err) r.max_rel_err = rel_err;
+    if (abs_err > abs_tol + rel_tol * std::fabs(want)) ++r.mismatches;
+  }
+  return r;
+}
+
 }  // namespace mcke::testing

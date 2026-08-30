@@ -47,6 +47,7 @@
 #include <cstdint>
 
 #include "mcke/core/status.hpp"
+#include "mcke/kernels/gemm_tile.hpp"   // GemmTile + the pure-host tile/occupancy math
 #include "mcke/runtime/stream.hpp"
 
 namespace mcke::kernels {
@@ -242,49 +243,98 @@ enum class SoftmaxVariant : std::uint8_t { kThreePass, kOnlineOnePass };
 //   kCublasRef     : cuBLAS, as the ceiling. Not cheating — knowing the gap is
 //                    the only way to know whether 65% is good.
 // ---------------------------------------------------------------------------
-// kWarpTileNoDbuf is APPENDED, after kCublasRef, deliberately: appending leaves
-// every existing enumerator's std::uint8_t value unchanged, so nothing that has
-// already been recorded or serialised shifts meaning.
+// ---------------------------------------------------------------------------
+// APPEND-ONLY ENUM. Every addition goes at the END, so no existing enumerator's
+// std::uint8_t value shifts and nothing already recorded or serialised changes
+// meaning. The consequence is that NUMERIC ORDER IS NOT PRESENTATION ORDER --
+// the ladder reads naive_uncoalesced, naive, tiled_smem, tiled_regblock,
+// warptile_nodbuf, warptile_dbuf, warptile_vec4, cublas, and the enum does not.
+// bench/gemm_bench.cpp owns the presentation order; do not infer it from here.
 //
-// It exists because kWarpTile bundles TWO independent changes -- a warp-level
-// tile layer AND double-buffered shared memory -- which would give its results
-// row two attributable causes and break the one-variable-per-step rule the whole
-// table depends on. The two effects are separable and predicted to be comparable
-// in size: warp tiling removes a bank conflict on the B-fragment load, double
-// buffering halves the barriers and hides DRAM latency behind the next tile's
-// load. Measuring their sum and calling it one number would hide which one
-// mattered.
+// kWarpTileNoDbuf exists because kWarpTile bundles TWO independent changes -- a
+// warp-level tile layer AND double-buffered shared memory -- which would give
+// its row two attributable causes. kWarpTileVec4 exists for the same reason
+// applied to vectorized loads. kNaiveUncoalesced exists so the coalesced naive
+// baseline is a MEASURED choice rather than an asserted one.
+//
+// ---------------------------------------------------------------------------
+// TWO CORRECTIONS TO THE PHASE-0 DESCRIPTION ABOVE, both found in design review
+// before any of this ran, and both recorded rather than quietly edited:
+//
+// 1. The earlier text said warp tiling "removes a bank conflict on the
+//    B-fragment load". It CANNOT remove it. With Bs[BK][BN] and TN=8 a lane's
+//    bank is (c*8 + i) % 32, which has PERIOD 4 in the column group c -- at most
+//    4 distinct banks are reachable by any set of 8-aligned column groups, no
+//    matter how lanes are assigned. A pure lane remap can only go from a 2x16
+//    lane layout (A 1-way, B 4-way = 5 phases) to 4x8 (A 1-way, B 2-way =
+//    3 phases). That is a 1.67x cut in shared-load cycles, not elimination.
+//    Padding does not help either: the period comes from the intra-row stride
+//    TN=8, not from the row stride, so widening the row stride leaves it intact.
+//
+// 2. The earlier text said the two effects were "predicted to be comparable in
+//    size". They are not. Warp tiling moves the shared-memory roofline from
+//    ~6.5 to ~9-10.9 TFLOP/s, but the kernel runs at ~3.5-4, so that ceiling was
+//    only marginally binding to begin with. Revised prediction: kWarpTileNoDbuf
+//    buys 5-12%, materially less than double buffering. Recorded here BEFORE the
+//    run, per RESULTS.md rule 6 -- the point is to be judged, not to be right.
+// ---------------------------------------------------------------------------
 enum class GemmVariant : std::uint8_t {
   kNaive, kTiledSmem, kTiledRegBlock, kWarpTile, kCublasRef,
   kWarpTileNoDbuf,      // warp tiling WITHOUT double buffering -- the isolator
+  kWarpTileVec4,        // kWarpTile + float4 global->smem loads, nothing else
+  kNaiveUncoalesced,    // kNaive with threadIdx.x mapped to the C ROW, not column
 };
 
-struct GemmTile {
-  int bm = 128, bn = 128, bk = 8;   // block tile
-  int tm = 8,   tn = 8;             // per-thread (register) micro-tile
-  // threads per block = (bm/tm) * (bn/tn); with the defaults, 16*16 = 256.
-  // Shared memory per block = (bm*bk + bk*bn) * 4 B * (2 if double-buffered).
-  // With the defaults: (128*8 + 8*128)*4 = 8 KiB, x2 = 16 KiB.
-  //
-  // An earlier version of this comment then said "leaves room for 3 concurrent
-  // blocks per SM" and called these "the entire occupancy calculation". Both
-  // claims are wrong, and the second one is wrong in the way this whole phase
-  // exists to correct:
-  //   * 64 KiB / 16 KiB = 4 blocks, not 3.
-  //   * Occupancy has FOUR limiters, not one: shared memory, registers, the
-  //     1024-threads-per-SM cap (=> 4 blocks at 256 threads), and the 32-resident
-  //     -block cap. The answer is the MINIMUM of all four.
-  //   * On this kernel shared memory is NOT the binding one. A register-blocked
-  //     GEMM holding float acc[8][8] needs ~128+ registers/thread; the 65536
-  //     registers per SM then cap it at 2 blocks -- half what smem allows.
-  // Identifying the obvious constraint and finding it is not the binding one is
-  // the actual lesson; see LEARNING_LOG.md.
-};
+// `GemmTile` itself, the runtime-tile -> compile-time-instantiation dispatch,
+// and the four-limiter occupancy calculator all live in mcke/kernels/gemm_tile.hpp
+// (included at the top of this file). They moved there because every one of them
+// is pure host arithmetic over integers and a DeviceInfo POD, and this header
+// transitively includes the CUDA boundary via runtime/stream.hpp -- so anything
+// that wants to be unit-tested on a machine with no GPU cannot live here.
+//
+// The occupancy note that used to sit on the struct said the defaults "leave
+// room for 3 concurrent blocks per SM" and called them "the entire occupancy
+// calculation". Both were wrong -- 64 KiB / 16 KiB is 4, not 3, and occupancy has
+// four limiters of which shared memory is not the binding one here. The corrected
+// version, with the argument, is in gemm_tile.hpp.
 
 [[nodiscard]] Status launch_gemm_f32(const float* a, const float* b, float* c,
                                     std::int64_t m, std::int64_t n, std::int64_t k,
                                     float alpha, float beta,
                                     GemmVariant variant, GemmTile tile,
                                     rt::StreamHandle stream);
+
+// ---------------------------------------------------------------------------
+// What ptxas actually produced, for the occupancy columns of RESULTS.md sec 3d.
+//
+// ADDITIVE, like row_reduce_workspace_bytes() before it: a new query, no change
+// to any existing signature.
+//
+// WHY A QUERY RATHER THAN READING -Xptxas -v: because the bench is a .cpp and
+// cudaFuncGetAttributes needs a kernel FUNCTION POINTER, which only exists
+// inside the .cu. Routing it through here means the regs/thread and smem/block
+// columns are read from the very binary that produced the timings, so they
+// cannot describe a stale build -- which log-scraping cannot promise.
+//
+// `local_bytes` is the one people omit and the one that matters most: non-zero
+// means REGISTER SPILLING, i.e. the accumulator did not stay in registers and is
+// living in DRAM. That is the single most likely failure mode of kTiledRegBlock
+// and it is completely invisible in a TFLOP/s number.
+//
+// `max_blocks_per_sm_api` is cudaOccupancyMaxActiveBlocksPerMultiprocessor's
+// answer, kept alongside our own hand calculation deliberately. Three legs --
+// hand calc / CUDA API / Nsight measured -- rather than the two the roadmap
+// asks for, because the API leg is free and separates "my arithmetic is wrong"
+// from "the hardware is not achieving theoretical". Those are different bugs.
+struct GemmKernelAttrs {
+  int         regs_per_thread       = 0;
+  std::size_t static_smem_bytes     = 0;
+  std::size_t local_bytes           = 0;   // > 0 means spilling
+  int         threads_per_block     = 0;
+  int         max_blocks_per_sm_api = 0;
+};
+
+[[nodiscard]] StatusOr<GemmKernelAttrs> gemm_kernel_attrs(GemmVariant variant,
+                                                          GemmTile tile);
 
 }  // namespace mcke::kernels

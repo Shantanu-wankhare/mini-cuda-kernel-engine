@@ -91,7 +91,11 @@ class NvtxRange {
 // -----------------------------------------------------------------------------
 struct KernelRecord {
   std::string   name;
-  std::string   variant;          // e.g. "tiled_128x128x8_regblock_4x4"
+  std::string   variant;          // e.g. "tiled_regblock", "warptile_dbuf".
+                                  // summary_table pads this to 30 chars and never
+                                  // truncates, so a longer name shears the table
+                                  // against its own header. Keep tile geometry in
+                                  // its own RESULTS.md column, not in the name.
   // Both are populated by Profiler::time_op from the SAME set of timed
   // iterations. `median_ms` is what every derived metric below (tflops(),
   // gb_per_s()) is computed from -- see the "MEASUREMENT DISCIPLINE" note

@@ -45,6 +45,14 @@ The owner is learning GPU systems engineering from first principles. Therefore:
 - Prefer honest negative results over impressive-sounding ones. "Overlap bought
   nothing because each kernel already saturated the SMs" is a better outcome
   than an unexplained 1.4x.
+- **Log every `AskUserQuestion` to `DECISIONS.md` at the repo root, live, in
+  every session.** Each time you ask one, append (don't wait until session
+  end): the question text, every option offered with its description, which
+  one the owner picked, and a one-line reason for the recommendation. Newest
+  at the bottom, one entry per question, dated. This is a running decision
+  log the owner re-opens in fresh chats once they understand a topic better —
+  keep it in the repo root (not `docs/`) so it's easy to find and paste into
+  a new session.
 
 ## 3. Hardware environments
 

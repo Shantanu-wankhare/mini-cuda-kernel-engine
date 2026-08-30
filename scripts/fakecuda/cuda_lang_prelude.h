@@ -62,12 +62,30 @@ inline unsigned atomicAnd(unsigned* p, unsigned v) { unsigned o = *p; *p &= v; r
 inline float    atomicMax(float* p, float v)       { float o = *p; if (v > *p) *p = v; return o; }
 
 // Vector types (Phase 3a: the float2/float4 load-width sweep).
-struct float2 { float x, y; };
-struct float4 { float x, y, z, w; };
+//
+// alignas MATTERS and is not decoration. Real float4 is __align__(16), and a
+// vectorized load is only legal -- and only becomes a single LDG.128 -- when the
+// address is 16-byte aligned. Phase 3d's warptile_vec4 reinterpret_casts float*
+// to float4*, and without the alignment on this struct the harness would accept
+// code that the hardware would fault on. Same reasoning for float2 at 8.
+struct alignas(8)  float2 { float x, y; };
+struct alignas(16) float4 { float x, y, z, w; };
 inline float2 make_float2(float x, float y) { return float2{x, y}; }
 inline float4 make_float4(float x, float y, float z, float w) { return float4{x, y, z, w}; }
+
+// Vector __ldg overloads (Phase 3d: warptile_vec4).
+inline float2 __ldg(const float2* p) { return *p; }
+inline float4 __ldg(const float4* p) { return *p; }
 
 // Fast-math device intrinsics used by the activations and softmax.
 inline float __expf(float x)   { return std::exp(x); }
 inline float __fdividef(float a, float b) { return a / b; }
 inline float __frcp_rn(float x) { return 1.0f / x; }
+inline float __fmaf_rn(float a, float b, float c) { return a * b + c; }
+
+// nvcc puts integer min/max in scope for device code implicitly; clang does not,
+// and `min(a, b)` on ints is the idiomatic way to clamp a tile against a matrix
+// edge. Without these, every bounds-guarded load in gemm.cu fails to type-check
+// for a reason that has nothing to do with the code being wrong.
+inline int min(int a, int b) { return a < b ? a : b; }
+inline int max(int a, int b) { return a > b ? a : b; }

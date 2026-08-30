@@ -57,15 +57,22 @@ double theoretical_peak_f32_tflops(const DeviceInfo& d) {
 
 std::string Profiler::summary_table(const Roofline& rl) const {
   std::ostringstream os;
-  os << std::left << std::setw(22) << "kernel" << std::setw(26) << "variant"
+  // Variant column is 30 wide, not 26. `setw` pads but never truncates, so a
+  // longer name shifts every numeric column on that row only, shearing the table
+  // against its own header. 26 was already too narrow for this file's own
+  // documented example in profiler.hpp ("tiled_128x128x8_regblock_4x4", 28
+  // chars), and Phase 3d's variant names plus Phase 4's policy names both push
+  // past it. The separator is 117 to match the header's actual width
+  // (22+30+10+10+10+10+8+10+7); it was 110 against a 113-wide header before.
+  os << std::left << std::setw(22) << "kernel" << std::setw(30) << "variant"
      << std::right << std::setw(10) << "med_ms" << std::setw(10) << "min_ms"
      << std::setw(10) << "GB/s" << std::setw(10) << "TFLOP/s" << std::setw(8) << "AI"
      << std::setw(10) << "%peak" << "  bound\n";
-  os << std::string(110, '-') << '\n';
+  os << std::string(117, '-') << '\n';
   os << std::fixed << std::setprecision(3);
   for (const auto& r : records_) {
     const double ai = r.arithmetic_intensity();
-    os << std::left << std::setw(22) << r.name << std::setw(26) << r.variant
+    os << std::left << std::setw(22) << r.name << std::setw(30) << r.variant
        << std::right << std::setw(10) << r.median_ms
        << std::setw(10) << r.min_ms
        << std::setw(10) << std::setprecision(1) << r.gb_per_s()

@@ -123,8 +123,20 @@ if(MCKE_ENABLE_CUDA)
     kernels/bias_act.cu
     kernels/reduce.cu
     kernels/softmax.cu
+    kernels/gemm.cu
   )
   target_link_libraries(mcke_kernels PUBLIC mcke_core)
+  # cuBLAS, for the kCublasRef ceiling variant in kernels/gemm.cu.
+  #
+  # PRIVATE, not PUBLIC, and the distinction matters. On a STATIC library PRIVATE
+  # still propagates the LINK requirement transitively (CMake emits it under
+  # $<LINK_ONLY:>), so every consumer still links cuBLAS correctly. What PRIVATE
+  # does NOT propagate is cuBLAS's INTERFACE_INCLUDE_DIRECTORIES -- which with
+  # PUBLIC would flow through the `mcke` umbrella onto mcke_smoke and all four
+  # benches, making <cublas_v2.h> reachable from translation units that have no
+  # business seeing it. mcke/runtime/cublas_check.hpp exists specifically to
+  # confine that header to one TU; PUBLIC here would quietly undo it.
+  target_link_libraries(mcke_kernels PRIVATE CUDA::cublas)
   target_compile_options(mcke_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>   # let __device__ code call constexpr host fns
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${MCKE_CUDA_LINEINFO}>>:-lineinfo>
@@ -185,7 +197,7 @@ set(MCKE_TESTS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # an undefined symbol at link time, and there is nothing useful for these to do
 # without a GPU anyway.
 if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
-  foreach(_b bias_act reduce softmax)
+  foreach(_b bias_act reduce softmax gemm)
     add_executable(mcke_${_b}_bench bench/${_b}_bench.cpp)
     target_link_libraries(mcke_${_b}_bench PRIVATE mcke)
     # tests/ for reference.hpp (the CPU reference each bench validates against

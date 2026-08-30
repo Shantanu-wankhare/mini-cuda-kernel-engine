@@ -390,7 +390,10 @@ here while §3 was still empty and the fix was free.)
 **Denominators for every "% of peak" in this section** (RESULTS.md rule 5),
 both measured on the Colab T4, never spec-sheet figures:
 `peak_gb_s = 235.4` (from `bench/stream_triad`), `peak_tflops = 8.130` (from
-`bench/fma_peak`), ridge point **34.2 FLOP/byte**. Re-measured on the Colab
+`bench/fma_peak`), ridge point **34.5 FLOP/byte**. (Written as 34.2 until
+2026-08-29; `Roofline::ridge_point_ai()` computes 8.130e12 / 235.4e9 = 34.54 from
+the two frozen denominators, so the prose was simply inconsistent with the code
+that produces every `%peak` in this file. The code was right.) Re-measured on the Colab
 session that produced §3a–§3c below (2026-08-29): `stream_triad` 240.9 GB/s,
 `fma_peak` 8.184 TFLOP/s — both within ~2.3% of the Phase-1/2 baseline, so
 this is the same class of machine and the frozen denominators above are kept
@@ -599,28 +602,188 @@ footnote.
 
 ### 3d. GEMM, f32, square M=N=K
 
-| Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | occupancy | median ms | min ms | TFLOP/s | % of measured FMA peak | Machine |
-|---|---|---|---|---|---|---|---|---|---|---|
-| naive | 4096 | — | | | | | | | | |
-| tiled_smem | 4096 | 32,32,32,1,1 | | | | | | | | |
-| tiled_regblock | 4096 | 128,128,8,8,8 | | | | | | | | |
-| warptile_nodbuf | 4096 | 128,128,8,8,8 | | | | | | | | |
-| warptile_dbuf | 4096 | 128,128,8,8,8 | | | | | | | | |
-| cuBLAS | 4096 | — | — | — | — | | | | | |
+Shape **M=N=K=4096**, `alpha=1, beta=0`, row-major. Command:
+`./build/bin/mcke_gemm_bench 4096` (the bench echoes its own argv, per rule 2).
 
-Ideal cost: `flops = 2·M·N·K` = 1.37e11, `bytes = (M·K + K·N + M·N)·4` = 2.01e8,
-**AI ≈ 682** — deep in compute-bound territory, 20× past the ridge point.
+| Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | spill B | occupancy (hand / API) | median ms | min ms | TFLOP/s | % of measured FMA peak | Machine |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| naive_uncoalesced | 4096 | — | | | | | | | | | |
+| naive | 4096 | — | | | | | | | | | |
+| tiled_smem | 4096 | 32,32,32,1,1 | | | | | | | | | |
+| tiled_regblock | 4096 | 128,128,8,8,8 | | | | | | | | | |
+| warptile_nodbuf | 4096 | 128,128,8,8,8 | | | | | | | | | |
+| warptile_dbuf | 4096 | 128,128,8,8,8 | | | | | | | | | |
+| warptile_vec4 | 4096 | 128,128,8,8,8 | | | | | | | | | |
+| cuBLAS | 4096 | — | — | — | — | — | | | | | |
+| cublas_drift_recheck | 4096 | — | — | — | — | — | | | | | |
 
-**Predictions (2026-08-24, kept verbatim):** naive 2–4% of peak (AI = 0.25 for
-the *naive access pattern*, memory-bound); tiled_smem 15–25%; tiled_regblock
-45–65%; warptile+double-buffer 60–80%; cuBLAS is the ceiling. Each row must
-attribute its gain to *one* change — which is why `warptile_nodbuf` was added to
-the variant enum, so warp tiling and double buffering get separate rows instead
-of one row with two causes.
+Ideal cost: `flops = 2·M·N·K` = 1.374e11, `bytes = (M·K + K·N + M·N)·4` = 2.01e8,
+**AI ≈ 682.7** — deep in compute-bound territory, 20× past the ridge point. This is
+the only section in the document that reports TFLOP/s.
 
-`occupancy` is the **hand-computed** figure from regs/thread and smem/block, to
-be compared against Nsight's measured `achieved_occupancy` in §5. Per the
-roadmap, that three-way comparison is the learning; the TFLOP/s is just the score.
+**Two columns deliberately absent, and one deliberately ignored.** There is no
+GB/s column: `bytes` here is the *operation's* compulsory traffic, so GB/s would
+be compulsory-bytes-over-time, which for the naive row is ~0.35 — neither
+achieved bandwidth nor anything else. The console `summary_table` still prints
+it (it is generic); ignore it for this section. Likewise its `bound` column reads
+`compute` for the naive rows, which is **correct**: the operation is
+compute-bound and the naive kernel simply fails to exploit that.
+
+> **Why all eight rows use the same `bytes`.** AI is a property of the operation,
+> not of an implementation. The naive kernel's often-quoted "AI = 0.25" is its
+> *access-pattern* intensity, a different quantity. Substituting it gives
+> `attainable_tflops(0.25) = 0.0589`, so a naive kernel at the predicted 2–4% of
+> peak would report **`%peak = 550%`**. Uniform compulsory bytes is what keeps
+> the rows comparable to each other.
+
+**Predictions — recorded 2026-08-29, before the run, per rule 6.** The 2026-08-24
+originals are preserved in the third column; where they were revised, the reason
+is a design-review finding, not a measurement.
+
+| Row | Predicted % of FMA peak | Basis / change from the original |
+|---|---|---|
+| naive_uncoalesced | 0.2–0.6% | New row. ~32 sectors per request instead of 4; predicted 3–10× slower than `naive`. |
+| naive | 2–4% | Unchanged (2026-08-24). |
+| tiled_smem | 15–25% | Unchanged, but see the two-limiter note below. |
+| tiled_regblock | 45–65% | Unchanged. Scalar loads may put it at the low end. |
+| warptile_nodbuf | **+5–12% over regblock** | **REVISED DOWN.** The original said "comparable in size to double buffering". |
+| warptile_dbuf | 60–80% | Unchanged (was "warptile+double-buffer"). |
+| warptile_vec4 | +10–20% over dbuf | New row. 4× fewer global load instructions for identical bytes. |
+| cuBLAS | 75–85% | The ceiling. |
+
+**Three corrections made before running, all recorded rather than quietly fixed:**
+
+1. **Warp tiling cannot remove the B-fragment bank conflict.** With `Bs[BK][BN]`
+   and `TN=8` a lane's bank is `(c·8 + i) mod 32`, which has **period 4** in the
+   column group — at most 4 distinct banks are reachable by *any* assignment of
+   lanes. The best a pure remap achieves is 2×16 lanes (A 1-way, B 4-way = 5
+   phases) → 4×8 lanes (A 1-way, B 2-way = 3 phases): a **1.67× cut, not
+   elimination**. Padding does not help, because the period comes from the
+   intra-row stride `TN`, not the row stride. Hence the revised prediction.
+2. **The transposed-A shared store is an 8-way conflict** in the obvious layout
+   (bank = `arow mod 32`; lanes 0–7 all hit bank 0 at 8 distinct addresses, paid
+   `K/BK = 512×` per block). **The fix is pad = 4, not the reflexive pad = 1.**
+   With stride `BM+p` the bank is `(p·acol + arow) mod 32`, which must be
+   injective over `acol ∈ 0..7, arow ∈ 0..3`; `p=1` gives `acol+arow`, where
+   (0,1) and (1,0) collide — **still 4-way**. `p=4` walks 0,4,…,28 with a 0..3
+   offset and covers all 32 banks exactly once. Verified as an integer property
+   in `test_gemm_bank_conflict_math` (8-way → 4-way → conflict-free for p = 0, 1,
+   4). Cost: 128 B per buffer, occupancy unchanged.
+
+   Together with `tiled_smem` needing *no* padding, this is one lesson with two
+   halves — what matters is the **leading dimension mod 32**, and "always pad"
+   and "never pad" are equally wrong.
+
+   The pad is also what makes row 7 single-variable: the `float4` loader must
+   decompose differently (`arow = tid/2, acol = 4·(tid%2)`), and under stride 132
+   *that* store is conflict-free too. Had the 8-way conflict been left in place,
+   vectorizing would have improved it to 2-way as a **side effect** and the row
+   would have carried two causes. One fix, two problems.
+3. **The blocks-per-SM cap is 16 on sm_75, not 32.** Volta is 32, Turing halved
+   it. Every authoritative number here comes from a T4, so the previous comment
+   in `kernels.hpp` had the fourth occupancy limiter wrong on the exact hardware
+   being measured. `DeviceInfo::max_blocks_per_sm` now reads it from the driver.
+
+**Two rows have disclosed multiple causes** — stated rather than papered over:
+`warptile_dbuf` changes both the barrier count (2→1) and the global-load issue
+point (~512 FFMAs earlier, overlapping DRAM latency with compute), and the
+second is probably the larger half; isolating them would need a third row.
+`naive_uncoalesced` makes A reads and C writes worse but B reads *better* (a
+broadcast), so its slowdown is a net — which is why the attribution belongs to
+`sectors_per_request`, not the wall clock.
+
+**`tiled_smem` has two independent limiters landing two points apart**, and the
+15–25% prediction cannot distinguish them:
+- *Shared bandwidth*: 2 shared loads per FMA = 0.25 FLOP/B; at 32 banks × 4 B ×
+  1.59 GHz × 40 SM = 8.14 TB/s that ceilings at **2.03 TFLOP/s = 25%**.
+- *DRAM*: A and B each re-read 4096/32 = 128× = 17.2 GB; at 235.4 GB/s that is
+  73 ms = **1.88 TFLOP/s = 23%**.
+
+Only `dram__bytes_read.sum` settles which roof was hit. Predicted in advance.
+
+**The occupancy pair is the most valuable result in this table**, more than any
+TFLOP/s figure: `tiled_smem` runs at **100% occupancy** (1024 threads/block, one
+resident block, a genuine tie between the threads-per-SM cap and registers) and
+`tiled_regblock` at **50%** (2 blocks, register-bound) — yet the latter should be
+roughly 2–3× faster. That is the measured answer to the standing question in
+`LEARNING_LOG.md` about how a lower-occupancy kernel can be faster.
+
+`occupancy` is reported as **hand-computed / CUDA-API**, two of three legs; the
+third is Nsight's measured `sm__warps_active.avg.pct_of_peak_sustained_active` in
+§5. The middle leg is free and separates *"my arithmetic is wrong"* from *"the
+hardware is not achieving theoretical"* — different bugs, different fixes. The
+hand calculation models sm_75's per-warp 256-register allocation granule and
+4-warp rounding; a naive `regs_per_sm / (R · threads)` diverges from the API
+(e.g. 7 vs 5 at R=17, 512 threads) and would make the comparison uninformative.
+
+**Pre-registered ncu metric per transition** (rule 6 works better when the
+prediction is specific enough to be wrong):
+
+| Transition | Metric | Prediction |
+|---|---|---|
+| naive_uncoalesced → naive | `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio` | 32 → 4 |
+| naive → tiled_smem | `dram__bytes_read.sum` | falls ~32× |
+| tiled_smem → tiled_regblock | shared-load instructions per FFMA | 2.0 → 0.25 |
+| tiled_regblock → warptile_nodbuf | `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` | falls ~1.67× |
+| warptile_nodbuf → warptile_dbuf | `smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio` | roughly halves |
+| warptile_dbuf → warptile_vec4 | `smsp__inst_executed_op_global_ld.sum` | falls 4×, DRAM bytes unchanged |
+
+**Modelled DRAM traffic** (a *model*, printed by the bench; the measurement is
+`dram__bytes_read.sum`). This is the reuse story `docs/PROFILING.md` calls the
+single most instructive number in the project:
+
+| Variant | Model read bytes | Amplification vs compulsory |
+|---|---|---|
+| naive (either) | `2·M·N·K·4` = 5.5e11 | ~2731× |
+| tiled_smem | `(M·K·N/32 + K·N·M/32)·4` | ~85× |
+| regblock / warptile | `(M·K·N/128 + K·N·M/128)·4` | ~21× |
+| cuBLAS | unknown — measure | ~1×? |
+
+> Predicted in advance: the naive model implies 5.5e11 bytes in ~570 ms = **965
+> GB/s, four times the T4's DRAM peak**. That is physically impossible, so L1/L2
+> must already be absorbing most of it. The impossibility *is* the prediction
+> being tested.
+
+**Validation.** A 4096³ CPU reference is minutes, so the published shape is
+covered two other ways rather than left unverified (`bias_act_bench` sets the
+project standard: validate at the shape that produces the number). cuBLAS is
+first validated against the double-accumulating CPU reference at **129×65×257 —
+deliberately non-square**, because the row-major/column-major operand swap
+produces a transposed result that still passes at M=N for a wide class of inputs;
+having earned trust there it becomes the full-shape oracle for the other seven
+rows. On top of that, 1024 random output elements are recomputed in `double` at
+O(K) each. `beta ≠ 0` is validated at small shapes only and **never timed** —
+across 20 timed iterations C would compound to `inf`.
+
+**What was verified on the Mac before the trip**, since none of it needs a GPU:
+
+- **The double-buffered k-loop schedule**, exhaustively for every tile count 0–200:
+  every k-tile computed exactly once, from the buffer last published with it.
+  This is the bug the trip could not have caught — K=4096 with BK=8 is **512
+  tiles, an even count, so the benchmark shape never exercises the odd tail**,
+  and a dropped final tile is a ~0.2% error that no tolerance would flag. (K=257
+  → 33 tiles, which does exercise it.) Confirmed live: forcing `has_tail = false`
+  produces 103 failures.
+- **The bank arithmetic** above, as an integer property.
+- **`sizeof(As) + sizeof(Bs)` against the host-side `smem_bytes()`** via
+  `static_assert` inside each kernel — so the RESULTS.md smem column and the
+  occupancy calculator cannot describe an allocation that does not exist. Works
+  on the Mac because the fake-CUDA harness maps `__shared__`→`static`, which
+  preserves `sizeof`. Confirmed live.
+- **`reference_gemm` itself**, bit-for-bit against an independent Python oracle
+  at 11 shapes including a non-square one.
+
+**Rows 4–7 are one kernel template differing by one argument each**
+(`LaneMap`, `DBUF`, `VW`), so the one-variable rule is enforced by the type
+system rather than by discipline — there is no way for two changes to enter one
+row when the rows share every line of code.
+
+**Deliberately not built:** an **L2 block swizzle** (grouping `blockIdx` into 8×8
+super-tiles). It is a grid-index remap only — provably one variable, no change to
+the kernel body — and typically worth 5–10% on a 4 MiB L2. It is the cleanest
+remaining rung between `warptile_vec4` and cuBLAS, and is named here with that
+estimate as part of the required "remaining gap to cuBLAS" explanation rather
+than measured.
 
 ---
 
@@ -653,4 +816,30 @@ One subsection per kernel actually profiled. Required fields:
 (→ sectors per request, the coalescing measure), and
 `dram__bytes_read.sum` compared to our ideal bytes.
 
-_(none yet)_
+Note on names: `achieved_occupancy` is the legacy metric spelling; the modern
+counter is `sm__warps_active.avg.pct_of_peak_sustained_active`, which is what
+`docs/PROFILING.md` §3 lists and what to actually pass to `ncu --metrics`.
+
+### 5a. GEMM ladder (Phase 3d) — skeleton, awaiting Colab trip 2
+
+One `ncu` run per variant via `mcke_gemm_bench --only=<variant>`. Profiling all
+eight in one process does not work: `--kernel-name regex:gemm` also matches
+cuBLAS's own `turing_sgemm_*`, so `--launch-count 3` would profile three launches
+of whichever kernel happened to come first out of ~200.
+
+| Variant | sm__throughput % | dram__throughput % | occupancy (hand / API / ncu) | top stall reason | sectors/request | dram_bytes_read vs compulsory |
+|---|---|---|---|---|---|---|
+| naive_uncoalesced | | | | | | |
+| naive | | | | | | |
+| tiled_smem | | | | | | |
+| tiled_regblock | | | | | | |
+| warptile_nodbuf | | | | | | |
+| warptile_dbuf | | | | | | |
+| warptile_vec4 | | | | | | |
+| cuBLAS | | | — | | | |
+
+The two comparisons this table exists for, both pinned in `docs/PROFILING.md` §4
+and predicted in §3d above: hand-computed occupancy vs measured, and modelled
+bytes vs `dram__bytes_read.sum`.
+
+_(no other kernels profiled yet)_
