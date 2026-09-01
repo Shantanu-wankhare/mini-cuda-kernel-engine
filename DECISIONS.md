@@ -112,3 +112,33 @@ cleanup.
 **Picked:** Option 1 (Rewrite + force-push).
 
 **Why recommended:** Sole contributor on this repo, so force-push carries no collaborator risk, and it fully removes the attribution from GitHub as requested rather than leaving it partially done.
+
+---
+
+## 2026-08-31 — Explorer V100 session (fork chat)
+
+### Q. How to proceed on ncu stall-reason data after Explorer confirmed `ERR_NVGPUCTRPERM`
+
+**Question:** `ncu` on the `gpu-interactive` allocation failed with
+`ERR_NVGPUCTRPERM` — a driver-level permission restriction, not fixable from
+inside the job. How do you want to proceed?
+
+**Options offered:**
+1. **File an RC ticket now (Recommended).** Email `rchelp@northeastern.edu` (or
+   the ServiceNow link from Explorer's own login banner) asking for GPU
+   performance-counter permission on `gpu-interactive`, citing
+   `ERR_NVGPUCTRPERM`. Routine request at HPC centers; Explorer is the
+   authoritative environment regardless, so worth having working here.
+2. **Try the RTX 5060 laptop instead.** Own hardware, likely admin rights to set
+   `NVreg_RestrictProfilingToAdminUsers=0` directly — no ticket wait. Tradeoff:
+   thermal throttling means laptop numbers are correctness/stall-reason data
+   only, never headline timing, per `CLAUDE.md`'s existing rule for that
+   machine.
+3. **Hold on ncu, move to writeup.** Bank what Colab and Explorer already gave —
+   correctness, occupancy hand-calc vs. the CUDA API on two architectures, the
+   drift comparison, the `warptile_nodbuf` non-reproduction — and write the
+   Phase-3 exit criterion's honest current state: the remaining gap to cuBLAS
+   is measured but only partially diagnosed, pending profiling access. Revisit
+   `ncu` later without blocking on it now.
+
+**Picked:** Option 3 (hold on `ncu`, move to writeup).

@@ -999,12 +999,35 @@ Note on names: `achieved_occupancy` is the legacy metric spelling; the modern
 counter is `sm__warps_active.avg.pct_of_peak_sustained_active`, which is what
 `docs/PROFILING.md` §3 lists and what to actually pass to `ncu --metrics`.
 
-### 5a. GEMM ladder (Phase 3d) — skeleton, awaiting Colab trip 2
+### 5a. GEMM ladder (Phase 3d) — blocked on ncu access, 2026-08-31
 
 One `ncu` run per variant via `mcke_gemm_bench --only=<variant>`. Profiling all
 eight in one process does not work: `--kernel-name regex:gemm` also matches
 cuBLAS's own `turing_sgemm_*`, so `--launch-count 3` would profile three launches
 of whichever kernel happened to come first out of ~200.
+
+**Attempted on Explorer (Tesla V100-SXM2, `gpu-interactive` partition,
+`ncu` 2023.3.0.0 shipped with the `cuda/12.3.0` module) and blocked:**
+
+```
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access
+NVIDIA GPU Performance Counters on the target device 0.
+```
+
+A driver-level restriction (`NVreg_RestrictProfilingToAdminUsers`), not fixable
+from inside a job — Explorer's own documentation does not mention Nsight
+Compute at all (only Nsight *Systems*), and does not address this permission
+model either. Fixing it needs an RC ticket (`rchelp@northeastern.edu`), which
+has not been filed yet — deliberately deferred (see `DECISIONS.md`,
+2026-08-31) rather than blocking Phase 3's writeup on it. **Not attempted on
+Colab** — `docs/ENVIRONMENTS.md` already documents that Colab's container
+lacks the profiling permissions this needs. **Not yet attempted on the RTX
+5060.**
+
+Everything in this table below the header remains unmeasured. The rest of the
+Phase-3d exit writeup (immediately below) works from what §3d's non-`ncu`
+methodology already established, and marks each remaining question as open
+rather than guessed at.
 
 | Variant | sm__throughput % | dram__throughput % | occupancy (hand / API / ncu) | top stall reason | sectors/request | dram_bytes_read vs compulsory |
 |---|---|---|---|---|---|---|
@@ -1021,4 +1044,63 @@ The two comparisons this table exists for, both pinned in `docs/PROFILING.md` §
 and predicted in §3d above: hand-computed occupancy vs measured, and modelled
 bytes vs `dram__bytes_read.sum`.
 
-_(no other kernels profiled yet)_
+_(no kernels profiled yet — blocked, see above)_
+
+### 5b. Phase 3 exit writeup: the remaining gap to cuBLAS
+
+`docs/ROADMAP.md`'s Phase-3 exit criterion is "a written explanation of the
+remaining gap to cuBLAS." Written honestly given the current evidence: some of
+this gap is measured and explained; the rest is a narrowed set of open
+questions, not a guess dressed up as an answer.
+
+**What is confirmed, from two independent architectures and no `ncu`
+required:**
+
+- The attribution order is portable across generations: the same seven
+  transitions (coalescing → shared staging → register blocking → lane
+  permutation → double buffer → vectorized loads → cuBLAS) hold on both the
+  T4 and the V100, with register blocking the single largest jump on both
+  chips (T4: 4.17×/10.4%→40.4%; V100: 4.17×/18.0%→75.2% — the SAME ratio,
+  independently).
+- `warptile_nodbuf`'s regression is very likely **not a bug**: identical
+  registers/smem/occupancy to `tiled_regblock` on both chips, a verified
+  architecture-independent bank-conflict reduction
+  (`test_gemm_bank_conflict_math`), and a result that goes from a confirmed
+  −0.73pp regression on the T4 to flat (−0.10pp, noise-level) on the V100.
+  A real bug in the permutation would not selectively vanish on a different
+  chip while every other row's relative ordering holds.
+- Double buffering and vectorized loads trade off in the *opposite* direction
+  on the two chips (dbuf: +0.6pp T4 vs. +5.9pp V100; vec4: +2.3pp T4 vs.
+  +0.7pp V100) in a way that is consistent with occupancy-dependent latency
+  hiding mattering more on the V100 (25% occupancy, same absolute warp count
+  as the T4's 50%) and instruction-issue rate mattering more on the T4. This
+  is a plausible, internally consistent story — not yet a confirmed one,
+  since confirming it needs `smsp__average_warps_issue_stalled_*` from `ncu`
+  on both chips.
+- The gap that remains is smaller in relative terms on the more capable,
+  stably-clocked chip: `warptile_vec4` sits at 1.20× cuBLAS's time on the T4
+  and 1.10× on the V100, at 89.6% cuBLAS efficiency with essentially zero
+  thermal drift — the most trustworthy ceiling measurement this project has
+  produced.
+
+**What is still open, and requires `ncu` (or a future attempt on the RTX
+5060) specifically:**
+
+- Whether `tiled_smem`'s shortfall against its own 15–25% prediction (10.4%
+  T4, 18.0% V100 — both below the modelled shared-bandwidth/DRAM-reuse
+  ceilings) is barrier-stall time from the single-resident-block occupancy,
+  as hypothesized in §3d, or something else. `smsp__average_warps_issue_
+  stalled_barrier_per_issue_active.ratio` on this kernel specifically would
+  settle it.
+- The actual mechanism behind the dbuf/vec4 trade-off above — plausible, not
+  measured.
+- The final, quantified piece of `warptile_vec4`'s gap to cuBLAS: an **L2
+  block swizzle** was named in §3d as the cleanest remaining, unbuilt lever
+  (grid-index remap only, provably one variable, typically 5–10% on a
+  resident-L2 GEMM) but was never measured, so it cannot yet be credited with
+  any specific fraction of the remaining 1.10×–1.20×.
+
+**Conclusion:** the exit criterion is partially met. The *shape* of the
+remaining gap is explained and cross-validated on two architectures; its exact
+*cause*, and how much of it an L2 swizzle would close, are not — and are not
+being guessed at here rather than measured.

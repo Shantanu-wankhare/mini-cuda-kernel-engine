@@ -831,10 +831,43 @@ versus the T4's 1.20×) with tile sizes never tuned for this architecture.
   and coding against an unconfirmed guess risks tuning against noise. `ncu` is
   next.
 
+### `ncu` attempted, blocked — an honest negative result, not a dead end
+
+`ncu` is present (`/shared/EL9/explorer/cuda/12.3.0/bin/ncu`, version
+2023.3.0.0, ships inside the `cuda/12.3.0` module — no separate Nsight Compute
+module exists on this cluster). Running it against a single trivial launch
+(`--set basic --launch-count 1`) failed:
+
+```
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access
+NVIDIA GPU Performance Counters on the target device 0.
+```
+
+A driver-level restriction, not a job-configuration mistake — Explorer's own
+documentation (`HPC docs/source/`) never mentions Nsight Compute or this
+permission model at all, only Nsight Systems, so this was genuinely unverified
+until tried rather than something the docs should have warned about. Fixing it
+needs `rchelp@northeastern.edu` or the ServiceNow ticket link from Explorer's
+own login banner, to either grant the account counter access or have RC set
+`NVreg_RestrictProfilingToAdminUsers=0` cluster-wide.
+
+**Decision (logged in `DECISIONS.md`): hold on `ncu`, write up what two
+architectures' worth of correctness/occupancy/timing data already supports,
+rather than block Phase 3's exit criterion on a ticket with unknown turnaround.**
+`RESULTS.md` §5a now records the block explicitly rather than sitting as an
+unexplained empty table, and §5b is a new section: the Phase-3 exit writeup
+("remaining gap to cuBLAS") done honestly from the evidence in hand — most of
+the story is confirmed and cross-validated across the T4 and V100 (the
+attribution order, the `warptile_nodbuf` non-bug conclusion, the trend in
+dbuf-vs-vec4 importance), with the specific *mechanism* behind that trend and
+the exact size of an L2-swizzle's contribution left as open questions rather
+than guesses.
+
 ### What's next
 
-Test whether `ncu` actually runs on this allocation (Explorer's own docs do not
-mention Nsight Compute specifically, only Nsight Systems, so this is unverified
-until tried) and, if it works, walk the pre-registered metric list in
-`RESULTS.md` §3d against `tiled_smem` (barrier-stall hypothesis) and
-`warptile_nodbuf` (the now-narrowed regression question) first.
+Either an RC ticket for `ncu` access on Explorer, or a future attempt on the
+RTX 5060 (own hardware, likely no permission barrier, but restricted to
+correctness/stall-reason data given that machine's thermal throttling — never
+headline timing). Neither is blocking further Phase 3/4 work. `LEARNING_LOG.md`
+end-of-Phase-3 Q&A remains due once Phase 3 actually closes, per the owner's
+convention.
