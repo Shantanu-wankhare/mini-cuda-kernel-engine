@@ -98,3 +98,17 @@ numbers come from 4096³: cuBLAS is validated at the non-square `129×65×257`
 first and then used as a full-shape oracle, and 1024 random output elements are
 recomputed in `double`. The standalone ctest remains deferred to Phase 3
 cleanup.
+
+---
+
+**Date:** 2026-08-31
+
+**Question:** Rewriting these 6 commits requires changing their SHAs and force-pushing to origin/main. How do you want to proceed?
+
+**Options offered:**
+1. Rewrite + force-push — Strip the Co-Authored-By trailer from all 6 commit messages via git filter-branch/rebase, then force-push main to origin. Rewrites SHAs from a8dcbb5 onward, including the PR #1 merge commit. Safe here since Shantanu is the only contributor, but any other clone of this repo would need to be re-fetched/reset.
+2. Leave history as-is — Keep the existing commits (with the trailer) on GitHub untouched. Only new commits going forward will omit it, thanks to the settings change already made.
+
+**Picked:** Option 1 (Rewrite + force-push).
+
+**Why recommended:** Sole contributor on this repo, so force-push carries no collaborator risk, and it fully removes the attribution from GitHub as requested rather than leaving it partially done.

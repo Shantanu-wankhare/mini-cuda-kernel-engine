@@ -4,7 +4,23 @@
       "Read(//Users/shantanuwankhare/.claude/projects/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime--/memory/**)",
       "Bash(python3)",
       "Bash(cd \"/Users/shantanuwankhare/Downloads/Projects/Mini CUDA Kernel Engine \\(GPU Compute Runtime\\)\" && sed -n '/^namespace mcke {$/,/^}  \\\\/\\\\/ namespace mcke$/p' tests/test_host_core.cpp | head -60)",
-      "Bash(clang++ -std=c++20 -Wall -Wextra -Wpedantic -fsyntax-only -I include -I __TRACKED_VAR__/fakecuda -DMCKE_WITH_CUDA=1 bench/alloc_bench.cpp)"
+      "Bash(clang++ -std=c++20 -Wall -Wextra -Wpedantic -fsyntax-only -I include -I __TRACKED_VAR__/fakecuda -DMCKE_WITH_CUDA=1 bench/alloc_bench.cpp)",
+      "Bash(./scripts/typecheck_cuda.sh kernels/gemm.cu)",
+      "Bash(cp kernels/gemm.cu /tmp/gemm.cu.bak)",
+      "Bash(sed -i '' 's|/\\\\*double_buffered=\\\\*/false\\),\\\\n                \"shared-memory|XXX|' kernels/gemm.cu)",
+      "Bash(perl -0pi -e 's/smem_bytes\\\\\\(GemmTile\\\\{BS, BS, BS, 1, 1\\\\}, \\\\/\\\\*double_buffered=\\\\*\\\\/false\\\\\\)/smem_bytes\\(GemmTile{BS, BS, BS, 1, 1}, \\\\/*double_buffered=*\\\\/true\\)/' kernels/gemm.cu)",
+      "Bash(sed -i '' 's/0x5P0Tull/0x5A11Eull/g' bench/gemm_bench.cpp)",
+      "Bash(sed -i '' 's|#include <cstdint>\\\\n#include <cstdio>|X|' bench/gemm_bench.cpp)",
+      "Bash(perl -0pi -e 's/#include <cstdint>\\\\n#include <cstdio>/#include <algorithm>\\\\n#include <cstdint>\\\\n#include <cstdio>/' bench/gemm_bench.cpp)",
+      "Bash(./scripts/typecheck_cuda.sh bench/gemm_bench.cpp)",
+      "Bash(clang++ -std=c++20 -Wall -Wextra -I include -I tests -DMCKE_WITH_CUDA=0 tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp src/core/host_timer.cpp src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp -o /private/tmp/claude-501/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime-/5f63729f-61dc-49b4-9767-a647d4951957/scratchpad/mcke_tests)",
+      "Bash(/private/tmp/claude-501/-Users-shantanuwankhare-Downloads-Projects-Mini-CUDA-Kernel-Engine--GPU-Compute-Runtime-/5f63729f-61dc-49b4-9767-a647d4951957/scratchpad/mcke_tests)",
+      "Bash(python3 tools/gen_reference.py)",
+      "Bash(python3 -c \"print\\('8.130e12/235.4e9 =', 8.130e12/235.4e9\\)\")",
+      "Bash(python3 -c \"print\\(2*4096**3/\\(3*4096**2*4\\)\\)\")",
+      "Bash(sed -i '' 's/\\\\*\\\\*AI ≈ 683\\\\*\\\\*/**AI ≈ 682.7**/' RESULTS.md)",
+      "Bash(sed -i '' 's/every row, and `%peak` is uniformly/every row \\(682.7\\), and `%peak` is uniformly/' bench/gemm_bench.cpp)",
+      "Bash(sed -i '' 's|// every row, and `%peak`|// every row \\(682.7\\), and `%peak`|' bench/gemm_bench.cpp)"
     ]
   }
 }
