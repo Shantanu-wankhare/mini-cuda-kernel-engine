@@ -28,7 +28,14 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 | MacBook Air (M-series) | — | — | — | — | — | — | — | host-only build |
 | Colab | Tesla T4 | 7.5 | 40 | 64 KiB | 320.1 GB/s | 235.4 GB/s | 8.130 TFLOP/s | driver 580.82.07 / nvcc 12.8.93 |
 | RTX 5060 laptop | _TBD_ | 12.0 | | | | | | needs CUDA ≥ 12.8 |
-| Explorer | _TBD_ | | | | | | | |
+| Explorer | Tesla V100-SXM2-32GB | 7.0 | 80 | 96 KiB | 898.0 GB/s | 636.3 GB/s | 15.601 TFLOP/s | driver 545.23.08 / nvcc 12.3 |
+
+> Explorer's clocks are effectively locked for the purposes of this project:
+> the GEMM ladder's cuBLAS first-vs-last check (§3d) measured **+0.03% drift**
+> across the full run, versus the Colab T4's +11.9% — the difference between an
+> indicative number and an authoritative one. `gpu-interactive` partition,
+> `--gres=gpu:v100-sxm2:1`, no thermal-throttling caveat needed on anything in
+> this row.
 
 > Colab clocks were **not locked** (no root access in the hosted notebook); the
 > T4 was idle and cool at session start (51 degC), so throttling is unlikely for
@@ -616,6 +623,87 @@ Shape **M=N=K=4096**, `alpha=1, beta=0`, row-major. Command:
 | warptile_vec4 | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (50%) | 39.70 | 39.36 | 3.462 | 42.58% | Colab T4 |
 | cuBLAS (first) | 4096 | — | — | — | — | — | 33.12 | 32.56 | 4.150 | 51.05% | Colab T4 |
 | cuBLAS (drift recheck, last) | 4096 | — | — | — | — | — | 37.07 | 36.06 | 3.708 | 45.61% | Colab T4 |
+| naive_uncoalesced | 4096 | — | 32 | 0 | 0 | 8 / 8 (100%, tied) | 302.9 | 302.8 | 0.454 | 2.90% | Explorer V100 |
+| naive | 4096 | — | 32 | 0 | 0 | 8 / 8 (100%, tied) | 78.9 | 78.9 | 1.741 | 11.16% | Explorer V100 |
+| tiled_smem | 4096 | 32,32,32,1,1 | 42 | 8192 | 0 | 1 / 1 (50%) | 48.9 | 48.8 | 2.812 | 18.02% | Explorer V100 |
+| tiled_regblock | 4096 | 128,128,8,8,8 | 120 | 8320 | 0 | 2 / 2 (25%) | 11.7 | 11.7 | 11.732 | 75.20% | Explorer V100 |
+| warptile_nodbuf | 4096 | 128,128,8,8,8 | 121 | 8320 | 0 | 2 / 2 (25%) | 11.7 | 11.7 | 11.710 | 75.06% | Explorer V100 |
+| warptile_dbuf | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (25%) | 10.9 | 10.7 | 12.631 | 80.96% | Explorer V100 |
+| warptile_vec4 | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (25%) | 10.8 | 10.7 | 12.739 | 81.66% | Explorer V100 |
+| cuBLAS (first) | 4096 | — | — | — | — | — | 9.831 | 9.554 | 13.980 | 89.60% | Explorer V100 |
+| cuBLAS (drift recheck, last) | 4096 | — | — | — | — | — | 9.834 | 9.804 | 13.975 | 89.57% | Explorer V100 |
+
+**The Explorer run is the clean baseline the Colab run couldn't be**: cuBLAS
+first-vs-last drift was **+0.03%** — clocks held throughout, no caveat needed on
+any number in this block. Driver 545.23.08, CUDA 12.3, Tesla V100-SXM2-32GB
+(sm_70), on the `gpu-interactive` partition. Measured denominators for this
+chip: `peak_gb_s = 636.3` (`stream_triad`), `peak_tflops = 15.601` (`fma_peak`),
+ridge point **24.5 FLOP/byte** — a different roofline entirely from the T4's
+34.5, so these numbers are never mixed into a single "%peak" comparison with the
+T4 rows above; they sit in the same table only because the `Machine` column
+already exists to keep architectures distinguishable, per this file's own
+"don't mix V100 and A100 in one comparison" rule in §0.
+
+**Same source code, same tile sizes (untuned for this chip), a different
+occupancy story on almost every row** — and the differences are all explained
+by the architecture, not by anything wrong with the kernels:
+
+- **`naive`/`naive_uncoalesced` are a genuine tie here (8/8) where they were not
+  tied on the T4 (4/4, uniquely threads-cap-bound).** These kernels use exactly
+  32 registers/thread — which `mcke_device_query` printed as this chip's own
+  "regs per thread at 100% occupancy: 32" *before* any kernel ran. The T4 has
+  64 regs/thread of headroom at 100% occupancy for the same 65536-register file,
+  because it has half as many threads/SM to spread them across; the V100 has
+  exactly none left at 32. Same kernel, same register count, different binding
+  story purely from the SM's own thread-to-register ratio.
+- **`tiled_smem` flips from a 100%-occupancy tie on the T4 to 50%,
+  uniquely register-bound, here.** The V100's 2048 threads/SM means one
+  1024-thread block only fills half the SM's thread capacity — so where the T4's
+  1024-thread cap made *itself* the tie-breaker, here the thread cap is not even
+  close to binding, and 42 registers/thread turns out to allow exactly one
+  resident block, not two.
+- **`tiled_regblock`'s 2 blocks is 50% occupancy on the T4 and 25% here** — the
+  same absolute number of active warps (16) reads as a smaller fraction of a
+  bigger SM. And despite that *lower* occupancy percentage, this row hits
+  **75.2%** of the V100's own peak versus the T4's 40.4% of its own — occupancy
+  percentage alone predicts none of this; what matters is whether 16 warps is
+  enough to keep this specific, ALU-heavy kernel fed, and on this chip it clearly
+  is.
+
+**`warptile_nodbuf`'s regression did not reproduce.** On the T4 it measured
+**−0.73 pp** relative to `tiled_regblock` (a contradiction of the +5–12%
+prediction, per §3d above). Here it is **−0.10 pp** — flat, indistinguishable
+from run-to-run noise at this iteration count. Registers, shared memory, tile,
+and occupancy are all identical to `tiled_regblock` on both chips, and the
+verified bank-conflict cut (`test_gemm_bank_conflict_math`) is an
+architecture-independent integer property — so this is evidence *against* a bug
+in the lane permutation itself, and evidence *for* the T4-specific hypothesis
+already on record: the extra lane-index arithmetic cost and the bank-conflict
+saving were roughly cancelling on Turing. Whether they cancel for the same
+reason here, or the saving and the cost are both just smaller on Volta, is
+still an `ncu` question — but "the kernel is subtly broken" is no longer a live
+hypothesis for this regression.
+
+**Double buffering buys far more here than on the T4**: **+5.9 pp**
+(`tiled_regblock`→`warptile_nodbuf`→`warptile_dbuf`, 75.1%→81.0%) versus the
+T4's **+0.6 pp**. Consistent with the mechanism this row was always supposed to
+demonstrate — hiding DRAM latency behind compute — mattering more when there
+are fewer resident warps already doing that job: 25% occupancy here (2 blocks)
+versus 50% there, for the exact same block count, on a chip with proportionally
+more thread-slots per SM.
+
+**`warptile_vec4` buys less here** (+0.7 pp vs. the T4's +2.3 pp): cutting
+global load instruction count from 4-per-thread to 1 matters most when
+instruction issue rate is the binding constraint, and at 81% of a 15.6 TFLOP/s
+peak this kernel is evidently not issue-bound on this chip the way it may have
+been on the T4.
+
+**cuBLAS's own efficiency is the headline number of this whole run: 89.6% of
+measured peak, both before and after the ladder**, versus the T4's throttled
+51.0%/45.6%. This is the number to treat as authoritative for "how close does
+hand-written CUDA get to a vendor library" — and at 81.7%, `warptile_vec4` sits
+within **8 percentage points** of it (a 1.10× gap) versus the T4's 1.20× gap,
+even before any Explorer-side tuning of tile sizes for this architecture.
 
 **smem/block matches the pad prediction exactly.** `tiled_regblock`'s 8320 B is
 8192 + 128 = the `kGemmAPad=4` cost (`BK·4 floats·4 B = 128 B`) predicted in the

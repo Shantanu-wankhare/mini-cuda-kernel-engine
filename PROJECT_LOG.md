@@ -724,3 +724,117 @@ written explanation of the remaining gap to cuBLAS) cannot be finished
 honestly until that pass happens — the current gap is real but its causes are
 only partially diagnosed. `LEARNING_LOG.md` end-of-Phase-3 Q&A remains due once
 Phase 3 actually closes.
+
+## 2026-08-31 — Session 6: Phase 3d cross-architecture run on Explorer (Tesla V100)
+
+**Hardware: Northeastern Explorer, Tesla V100-SXM2-32GB (sm_70), `gpu-interactive`
+partition (`--gres=gpu:v100-sxm2:1`), driver 545.23.08, nvcc 12.3** (downgraded
+from the initially-loaded `cuda/12.8.0` module after `nvidia-smi` reported the
+driver's max supported CUDA version as 12.3 — mismatched toolkit/driver versions
+risk a `CUDA driver version is insufficient` failure at run time rather than at
+compile time, so matched them before building). Home directory confirmed shared
+across login and compute nodes (the shell's cwd carried over into the `srun`
+allocation unchanged), so no re-clone was needed.
+
+Ahead of any GEMM numbers, re-ran `stream_triad`/`fma_peak` on this chip per
+this project's own rule (never reuse another machine's denominators): measured
+`peak_gb_s = 636.3`, `peak_tflops = 15.601`, ridge point 24.5 FLOP/byte — a
+different roofline from the T4's 34.5, recorded in `RESULTS.md` §0.
+
+### The GEMM ladder, same binary, same source, different architecture
+
+`./build/bin/mcke_gemm_bench 4096 --peak-gb-s=636.3 --peak-tflops=15.601`.
+Correctness: identical outcome to Colab — every variant OK against the CPU
+reference at the awkward shapes, the β≠0 case, and cuBLAS at 4096³. One
+diagnostic worth recording so it isn't mistaken for a regression later: the
+printed `max_rel_err` against cuBLAS at the benchmark shape was **0 on the T4**
+and **~4.15 on the V100**, for every kernel, uniformly. Not a bug — `compare()`
+tracks the worst relative error over every element regardless of pass/fail, and
+a single near-zero-true output (routine with K=4096 random ±1 data) can show a
+large relative error while still passing the absolute floor. The uniformity
+across all seven structurally different kernels, and the fact that it was
+exactly 0 on the T4, points at cuBLAS choosing a different reduction kernel per
+architecture (Volta vs. Turing) rather than at anything in our own code —
+bit-exact agreement with cuBLAS on the T4 run was luck, not a guarantee.
+
+**Timing is a much cleaner dataset than Colab's**: the cuBLAS first-vs-last
+drift check measured **+0.03%**, against the Colab run's confirmed +11.9%. This
+is the first run in Phase 3d with no thermal caveat attached to any number.
+
+**Every architecture-comparable finding, T4 vs. V100 (both %-of-that-chip's-own-
+measured-peak):**
+
+| Row | T4 | V100 |
+|---|---|---|
+| naive_uncoalesced | 1.48% | 2.90% |
+| naive | 4.92% | 11.16% |
+| tiled_smem | 10.36% | 18.02% |
+| tiled_regblock | 40.39% | 75.20% |
+| warptile_nodbuf | 39.66% (**−0.73pp**, contradicted the prediction) | 75.06% (−0.10pp, flat/noise) |
+| warptile_dbuf | 40.28% (+0.62pp) | 80.96% (**+5.90pp**) |
+| warptile_vec4 | 42.58% (+2.30pp) | 81.66% (+0.70pp) |
+| cuBLAS | 51.05% / 45.61% (drifting) | 89.60% / 89.57% (stable) |
+
+**The `warptile_nodbuf` regression from the Colab trip did not reproduce.**
+Registers, shared memory, tile shape, and occupancy are identical to
+`tiled_regblock` on both chips, and the lane permutation's bank-conflict cut is
+a verified, architecture-independent integer property
+(`test_gemm_bank_conflict_math`). Flat-not-negative on the V100 is evidence
+*against* a bug in the kernel and evidence *for* the standing hypothesis that
+the extra lane-index arithmetic cost and the conflict saving were roughly
+cancelling specifically on Turing — still an open question for `ncu`, but "the
+kernel is subtly broken" is no longer a live explanation.
+
+**Occupancy told a genuinely different story per architecture from identical
+source code and identical launch configs** — not a discrepancy, an expected
+consequence of a different SM shape:
+- `naive`/`naive_uncoalesced` (32 regs/thread): a threads-cap-unique bind on the
+  T4 (4/4) became a registers/threads **tie** on the V100 (8/8), because 32
+  regs/thread is *exactly* this chip's own "regs per thread at 100% occupancy"
+  figure (`mcke_device_query` prints this before any kernel runs) — the V100
+  has half the register headroom per thread that the T4 has, for the same
+  65536-register file, because it has twice the threads/SM to spread across.
+- `tiled_smem`: a 100%-occupancy tie on the T4 became a uniquely
+  register-bound 50% on the V100 — the V100's 2048 threads/SM means one
+  1024-thread block fills only half the SM, so the thread cap stops being
+  competitive with the register limit at all.
+- `tiled_regblock`: 50% on the T4, 25% on the V100 — same absolute 16 active
+  warps, smaller fraction of a bigger SM — and yet 75.2% of peak here versus
+  40.4% there. Occupancy *percentage* explained none of that gap; whether 16
+  warps is enough to keep an ALU-heavy kernel fed evidently depends on more
+  than the fraction of the SM's cap it represents.
+
+**Double buffering is a real, substantial win here (+5.9pp) where it was
+marginal on the T4 (+0.6pp)** — consistent with hiding DRAM latency behind
+compute mattering more at lower relative occupancy (25% vs. 50%, same absolute
+warp count). **`warptile_vec4` buys less here** (+0.7pp vs. +2.3pp) — cutting
+global-load instruction count matters most when issue rate is the binding
+constraint, and this kernel is evidently not issue-bound on the V100 the way it
+may have been on the T4.
+
+**cuBLAS's own efficiency, at rock-stable clocks, is the headline number of
+this session: 89.6%**, against the T4's throttled 51.0%/45.6% — the number to
+treat as authoritative for "how close does hand-written CUDA get to a vendor
+library." `warptile_vec4` sits within 8 percentage points of it (1.10× gap,
+versus the T4's 1.20×) with tile sizes never tuned for this architecture.
+
+### Design decisions taken this session
+
+- Kept both architectures' rows in the same `RESULTS.md` §3d table (the
+  `Machine` column already exists for this) rather than a separate section per
+  chip, since the side-by-side comparison IS the finding — but never computed a
+  cross-architecture ratio or "%peak" against the wrong chip's denominator, per
+  this file's own "don't mix V100 and A100 in one comparison" rule.
+- Did not chase the `warptile_nodbuf` or `tiled_smem` shortfalls with a code
+  change this session, per the explicit reasoning from the pre-trip discussion:
+  two unconfirmed causes (thermal drift, the regression itself) are still live,
+  and coding against an unconfirmed guess risks tuning against noise. `ncu` is
+  next.
+
+### What's next
+
+Test whether `ncu` actually runs on this allocation (Explorer's own docs do not
+mention Nsight Compute specifically, only Nsight Systems, so this is unverified
+until tried) and, if it works, walk the pre-registered metric list in
+`RESULTS.md` §3d against `tiled_smem` (barrier-stall hypothesis) and
+`warptile_nodbuf` (the now-narrowed regression question) first.
