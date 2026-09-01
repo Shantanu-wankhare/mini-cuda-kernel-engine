@@ -142,3 +142,9 @@ inside the job. How do you want to proceed?
    `ncu` later without blocking on it now.
 
 **Picked:** Option 3 (hold on `ncu`, move to writeup).
+
+**Revisited 2026-08-31, later the same day:** owner now has time and wants to
+pursue `ncu` access rather than continue holding. No code or cluster state
+changed in between — this supersedes the pick above by resuming toward
+**Option 1** (file an RC ticket), which was the original recommendation.
+Ticket text drafted; owner to submit via `rchelp@northeastern.edu`.
