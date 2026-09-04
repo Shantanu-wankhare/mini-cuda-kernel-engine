@@ -863,11 +863,36 @@ dbuf-vs-vec4 importance), with the specific *mechanism* behind that trend and
 the exact size of an L2-swizzle's contribution left as open questions rather
 than guesses.
 
+### RC ticket filed, and Phase 3 is closed
+
+An email was sent to `rchelp@northeastern.edu` requesting GPU performance-counter
+access on the `gpu-interactive` partition (account `wankhare.s`), citing the
+exact `ERR_NVGPUCTRPERM` error, job details (V100 node `d1007`,
+`--gres=gpu:v100-sxm2:1`, `cuda/12.3.0`, `ncu` 2023.3.0.0), and asking for
+either per-account counter access or `NVreg_RestrictProfilingToAdminUsers=0`
+cluster-wide, per RC's standard practice. Open, no reply yet — not blocking
+further work per the decision above.
+
+**Phase 3 is closed** on that basis: `RESULTS.md` §3a–§3d are filled with real
+measured numbers across three sessions and two GPU architectures; every
+speedup is attributed to one change (two disclosed multi-cause exceptions,
+stated rather than hidden); §5b gives the honest current state of "the
+remaining gap to cuBLAS" exit criterion — mostly explained, with the exact
+stall-reason mechanism and the L2-swizzle's specific contribution left open
+pending `ncu`. `CLAUDE.md` §8 updated to reflect Phases 0–3 complete (previously
+five phases stale, still reading "Phase 0 complete"). `LEARNING_LOG.md`
+end-of-Phase-3 Q&A remains available whenever asked for, per the owner's
+standing convention — not written unprompted.
+
 ### What's next
 
-Either an RC ticket for `ncu` access on Explorer, or a future attempt on the
-RTX 5060 (own hardware, likely no permission barrier, but restricted to
-correctness/stall-reason data given that machine's thermal throttling — never
-headline timing). Neither is blocking further Phase 3/4 work. `LEARNING_LOG.md`
-end-of-Phase-3 Q&A remains due once Phase 3 actually closes, per the owner's
-convention.
+**Phase 4: the computation graph engine and async scheduling**
+(`docs/ROADMAP.md`) — `src/graph/graph.cpp` (Kahn sort, levels, live ranges),
+`src/graph/executor.cpp` (three schedule policies, event insertion, the
+liveness-based memory planner), the four `Op` subclasses wired to Phase 3's
+kernels, and `bench/graph_bench.cpp`. Design work (topology, scheduling
+policy semantics, the memory planner) is Mac-side and host-testable; the
+overlap numbers and `nsys` timelines need Explorer. The numerics gate
+(`kLevelParallel`/`kChainGreedy` must be bit-identical to `kSequential`, any
+difference is a race not rounding) should be automated from the start, not
+added after a bug is found.

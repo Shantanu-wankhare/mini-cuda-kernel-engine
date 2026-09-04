@@ -183,16 +183,25 @@ personal learning notes in `PROJECT_LOG.md`.
 
 ## 8. Current status
 
-**Phase 0 complete (planning + scaffold).** See `PROJECT_LOG.md` for detail and
-`docs/ROADMAP.md` for the phase plan.
+**Phases 0–3 complete.** See `PROJECT_LOG.md` for full session-by-session
+detail and `docs/ROADMAP.md` for the phase plan. Now starting **Phase 4**
+(graph engine and async scheduling).
 
-- Host-only build verified on macOS: 4410 checks passing in `test_host_core`.
-- CUDA path (`kernels/elementwise.cu`, `mcke_smoke`) is **written but never
-  compiled** — no GPU has touched this repo yet. First GPU session must build it
-  and fix whatever falls out before trusting any of it.
-- Implemented: `Status`/`StatusOr`, `DType`, `DeviceInfo`, `rt::Stream`/`Event`,
-  buddy index math (fully tested), `RawDeviceAllocator` baseline, `Shape`,
-  `Profiler::time_op`, roofline math, vector-add kernel.
-- Declared but **not yet implemented**: `BuddyAllocator`, `FreeListAllocator`,
-  `Storage`/`Tensor` methods, all four `Op` subclasses, `Graph`,
-  `GraphExecutor`, all kernels except vector add.
+- Host-only build verified on macOS: 58,856 checks passing in `test_host_core`.
+- CUDA path built and verified on three real GPUs: Colab Tesla T4 (sm_75),
+  Northeastern Explorer Tesla V100-SXM2 (sm_70), plus the allocator race tests.
+  RTX 5060 (sm_120) not yet touched.
+- Implemented and measured: `Status`/`StatusOr`, `DType`, `DeviceInfo`,
+  `rt::Stream`/`Event`, buddy allocator + free-list allocator (both with all
+  three cross-stream reuse policies), `RawDeviceAllocator`, `Shape`,
+  `Profiler::time_op`, roofline math, and every Phase 3 kernel: fused
+  bias+activation, row reduction (tree/shuffle/two-pass), row softmax
+  (three-pass/online), and the 8-row GEMM ladder (naive through cuBLAS) with
+  its own tile-dispatch and occupancy-calculator header
+  (`kernels/gemm_tile.hpp`).
+- `RESULTS.md` §0–§3d filled with real measured numbers on two architectures.
+  §5 (Nsight Compute deep dives) is blocked on `ncu` permissions on Explorer
+  (`ERR_NVGPUCTRPERM`) — an RC ticket is filed and open; not blocking further
+  project work.
+- Declared but **not yet implemented**: `Storage`/`Tensor` methods, all four
+  `Op` subclasses, `Graph`, `GraphExecutor` — this is Phase 4.
