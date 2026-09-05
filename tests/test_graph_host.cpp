@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -335,6 +336,32 @@ class FakeOp final : public mcke::Op {
         if (i.data_ptr() && i.data_ptr() == o.data_ptr())
           return mcke::InternalError("FakeOp::launch: output aliases an input");
     (void)ctx;
+#if !MCKE_WITH_CUDA
+    // A REAL HOST COMPUTATION, and it is what makes the numerics gate testable
+    // without a device. In a host-only build raw_device_malloc returns host
+    // memory, so data_ptr() is dereferenceable and a graph can actually be
+    // executed end to end on the MacBook.
+    //
+    // It must (a) fully write every output -- an op that leaves bytes untouched
+    // would legitimately fail a bit-identity gate under buffer reuse, because
+    // the leftovers differ per layout, and that failure would be about the OP,
+    // not the scheduler -- and (b) be deterministic, order-independent, and a
+    // function of its inputs only.
+    ++calls_;
+    for (const auto& o : outputs) {
+      float* dst = o.data_as<float>();
+      if (!dst) return mcke::InternalError("FakeOp::launch: output is not f32");
+      const mcke::dim_t n = o.numel();
+      for (mcke::dim_t i = 0; i < n; ++i) {
+        float acc = 1.0f;
+        for (const auto& in : inputs) {
+          const float* src = in.data_as<float>();
+          if (src && i < in.numel()) acc += src[i];
+        }
+        dst[i] = acc * 0.5f + (nondet_ ? static_cast<float>(calls_) : 0.0f);
+      }
+    }
+#endif
     return mcke::OkStatus();
   }
   [[nodiscard]] mcke::StatusOr<std::vector<Shape>> infer_shapes(
@@ -351,11 +378,16 @@ class FakeOp final : public mcke::Op {
     return c;
   }
   void set_fail(bool f) { fail_ = f; }
+  // Makes launch() return a different answer on every call -- the simplest
+  // stand-in for a race, and the only way to prove the gate is not vacuous.
+  void set_nondeterministic(bool v) { nondet_ = v; }
 
  private:
   Shape out_;
   int   n_out_ = 1;
   bool  fail_  = false;
+  mutable bool nondet_ = false;
+  mutable int  calls_  = 0;
 };
 
 mcke::OpPtr fake(Shape s = Shape{4, 4}, int n_out = 1) {
@@ -1459,6 +1491,119 @@ void test_executor_poison_and_arena_alignment() {
       CHECK_EQ(mp.offset_of[t] % mcke::kDeviceAlignment, 0u);
 }
 
+
+// =============================================================================
+//  The numerics gate
+// =============================================================================
+
+void test_bit_mismatch_helper() {
+  std::printf("test_bit_mismatch_helper\n");
+  // The two cases that quietly ruin a bit-identity gate compared as float.
+  float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  float b[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  CHECK_EQ(mcke::first_bit_mismatch(a, b, sizeof(a)), sizeof(a));   // identical
+
+  // NaN vs the same NaN: a float compare says "different" (NaN != NaN) and would
+  // report a FALSE FAILURE. Bitwise says identical, which is the truth.
+  const std::uint32_t qnan = 0x7FC00000u;
+  std::memcpy(&a[1], &qnan, 4);
+  std::memcpy(&b[1], &qnan, 4);
+  CHECK_EQ(mcke::first_bit_mismatch(a, b, sizeof(a)), sizeof(a));
+
+  // -0.0 vs +0.0: a float compare says "equal" and would report a FALSE PASS.
+  // They differ in the sign bit, and under a race that difference is real signal.
+  a[2] = 0.0f;
+  b[2] = -0.0f;
+  CHECK(a[2] == b[2]);                                    // ...as floats, equal
+  CHECK_EQ(mcke::first_bit_mismatch(a, b, sizeof(a)), 8u); // ...bitwise, word 2
+}
+
+void test_numerics_gate_on_host() {
+  std::printf("test_numerics_gate_on_host\n");
+#if !MCKE_WITH_CUDA
+  // The full {3 schedules} x {3 memory policies} matrix, executed for real on
+  // the laptop because FakeOp has a host compute path. This is the gate's own
+  // logic under test -- the plumbing, the re-planning, the input replay, the
+  // bitwise compare -- so that a Colab session debugs KERNELS, not the harness.
+  Graph g = build_fanout(3, 3);
+  const TensorId in_id = 0;
+
+  mcke::RawDeviceAllocator alloc;
+  mcke::ExecutorOptions opts;
+  opts.validate_numerics = true;      // also switches on input caching
+  opts.num_streams = 3;
+  mcke::GraphExecutor ex(std::move(g), alloc, host_device(), opts);
+  CHECK(ex.plan().ok());
+
+  std::vector<float> host(64 * 64);
+  for (std::size_t i = 0; i < host.size(); ++i) host[i] = static_cast<float>(i % 97) * 0.25f;
+  CHECK(ex.set_input(in_id, host.data(), host.size() * sizeof(float)).ok());
+
+  auto res = ex.validate_numerics(/*repeats=*/4);
+  CHECK(res.ok());
+  if (res.ok()) {
+    CHECK(res->passed);
+    CHECK_EQ(res->configs_compared, 9);      // 3 schedules x 3 memory policies
+    CHECK(res->elements_compared > 0);
+    std::printf("  gate: %s, %d configs x %d repeats, %zu elements compared\n",
+                res->passed ? "PASS" : "FAIL", res->configs_compared, res->repeats,
+                res->elements_compared);
+    if (!res->passed) std::printf("    %s\n", res->detail.c_str());
+  }
+#else
+  std::printf("  (skipped: needs the host compute backend, MCKE_WITH_CUDA=0)\n");
+#endif
+}
+
+void test_numerics_gate_catches_nondeterminism() {
+  std::printf("test_numerics_gate_catches_nondeterminism\n");
+#if !MCKE_WITH_CUDA
+  // A GATE THAT NEVER FIRES IS NOT A GATE. One op is made to return a different
+  // answer on every call -- the cheapest possible stand-in for a race -- and the
+  // gate must report it rather than pass.
+  Graph g;
+  auto x = g.add_input(Shape{32, 32}, DType::kF32, "x"); x.status().throw_if_error();
+  auto op = std::make_unique<FakeOp>(Shape{32, 32});
+  op->set_nondeterministic(true);
+  auto n = g.add_node(std::move(op), {*x}, "flaky"); n.status().throw_if_error();
+  g.mark_output((*n)[0]).throw_if_error();
+  g.finalize().throw_if_error();
+
+  mcke::RawDeviceAllocator alloc;
+  mcke::ExecutorOptions opts;
+  opts.validate_numerics = true;
+  mcke::GraphExecutor ex(std::move(g), alloc, host_device(), opts);
+  CHECK(ex.plan().ok());
+  std::vector<float> host(32 * 32, 2.0f);
+  CHECK(ex.set_input(0, host.data(), host.size() * sizeof(float)).ok());
+
+  auto res = ex.validate_numerics(/*repeats=*/3);
+  CHECK(res.ok());
+  if (res.ok()) {
+    CHECK(!res->passed);
+    std::printf("  gate correctly FAILED: %s\n", res->detail.c_str());
+    // It must be caught as run-to-run variance WITHIN a configuration, which is
+    // how a real race presents -- not as a disagreement between policies.
+    CHECK(res->detail.find("run-to-run") != std::string::npos ||
+          res->detail.find("NONDETERMINISTIC") != std::string::npos);
+  }
+#else
+  std::printf("  (skipped: needs the host compute backend)\n");
+#endif
+}
+
+void test_numerics_gate_preconditions() {
+  std::printf("test_numerics_gate_preconditions\n");
+  Graph g = build_diamond();
+  mcke::RawDeviceAllocator alloc;
+  mcke::ExecutorOptions opts;                 // validate_numerics defaults to false
+  mcke::GraphExecutor ex(std::move(g), alloc, host_device(), opts);
+  CHECK(ex.plan().ok());
+  // Refuses without the option, because set_input only caches host bytes in that
+  // mode and the gate must re-feed identical inputs after re-planning.
+  CHECK(!ex.validate_numerics(2).ok());
+}
+
 }  // namespace
 
 int main() {
@@ -1491,6 +1636,10 @@ int main() {
   test_executor_end_to_end();
   test_executor_preconditions();
   test_executor_poison_and_arena_alignment();
+  test_bit_mismatch_helper();
+  test_numerics_gate_on_host();
+  test_numerics_gate_catches_nondeterminism();
+  test_numerics_gate_preconditions();
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

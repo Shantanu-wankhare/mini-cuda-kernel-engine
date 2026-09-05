@@ -241,7 +241,7 @@ set(MCKE_TESTS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # an undefined symbol at link time, and there is nothing useful for these to do
 # without a GPU anyway.
 if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA)
-  foreach(_b bias_act reduce softmax gemm)
+  foreach(_b bias_act reduce softmax gemm graph)
     add_executable(mcke_${_b}_bench bench/${_b}_bench.cpp)
     target_link_libraries(mcke_${_b}_bench PRIVATE mcke)
     # tests/ for reference.hpp (the CPU reference each bench validates against

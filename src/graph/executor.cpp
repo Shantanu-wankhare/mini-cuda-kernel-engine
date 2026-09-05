@@ -169,6 +169,15 @@ Status GraphExecutor::set_input(TensorId t, const void* host_data, std::size_t b
   // AFTER these copies and every other stream waits on it.
   const rt::StreamHandle s0 = plan_.streams_.empty() ? rt::StreamHandle{}
                                                      : plan_.streams_[0].native();
+  if (opts_.validate_numerics) {
+    // The gate re-plans between configurations, which rebinds every tensor, so
+    // it must be able to re-feed byte-identical inputs afterwards.
+    const auto* p = static_cast<const char*>(host_data);
+    std::vector<char> copy(p, p + bytes);
+    for (auto& kv : input_cache_)
+      if (kv.first == t) { kv.second = std::move(copy); copy.clear(); break; }
+    if (!copy.empty()) input_cache_.emplace_back(t, std::move(copy));
+  }
   return plan_.bound_[t].copy_from_host(host_data, bytes, s0);
 }
 
@@ -298,6 +307,144 @@ Status GraphExecutor::collect_timings() {
     node_timings_.push_back(std::move(nt));
   }
   return OkStatus();
+}
+
+std::size_t first_bit_mismatch(const void* a, const void* b, std::size_t bytes) {
+  const auto* x = static_cast<const std::uint32_t*>(a);
+  const auto* y = static_cast<const std::uint32_t*>(b);
+  const std::size_t n = bytes / sizeof(std::uint32_t);
+  for (std::size_t i = 0; i < n; ++i)
+    if (x[i] != y[i]) return i * sizeof(std::uint32_t);
+  // Any trailing bytes that do not fill a word (there are none for f32, but the
+  // helper should not silently ignore them if a narrower dtype arrives).
+  const auto* bx = static_cast<const unsigned char*>(a);
+  const auto* by = static_cast<const unsigned char*>(b);
+  for (std::size_t i = n * sizeof(std::uint32_t); i < bytes; ++i)
+    if (bx[i] != by[i]) return i;
+  return bytes;
+}
+
+StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
+  if (!opts_.validate_numerics)
+    return FailedPreconditionError("validate_numerics: set "
+                                   "ExecutorOptions::validate_numerics before plan()");
+  if (input_cache_.empty())
+    return FailedPreconditionError("validate_numerics: no inputs were set");
+  if (repeats < 1) repeats = 1;
+
+  // Every graph output, and how many bytes each carries.
+  std::vector<TensorId> outs;
+  for (std::size_t t = 0; t < graph_.num_tensors(); ++t)
+    if (graph_.tensor(static_cast<TensorId>(t)).is_graph_output)
+      outs.push_back(static_cast<TensorId>(t));
+  if (outs.empty()) return InvalidArgumentError("validate_numerics: graph has no outputs");
+
+  const ExecutorOptions saved = opts_;
+
+  // Runs one configuration `repeats` times, returning the outputs of the FIRST
+  // run and failing if any later run disagrees with it.
+  auto run_config = [&](SchedulePolicy sp, MemoryPolicy mp, int n,
+                        std::vector<std::vector<char>>* first,
+                        std::string* err) -> Status {
+    opts_.schedule = sp;
+    opts_.memory   = mp;
+    opts_.num_streams = (sp == SchedulePolicy::kSequential) ? 1 : saved.num_streams;
+    MCKE_RETURN_IF_ERROR(plan());
+    for (const auto& kv : input_cache_)
+      MCKE_RETURN_IF_ERROR(set_input(kv.first, kv.second.data(), kv.second.size()));
+
+    for (int r = 0; r < n; ++r) {
+      MCKE_RETURN_IF_ERROR(run_async());
+      MCKE_RETURN_IF_ERROR(synchronize());
+      std::vector<std::vector<char>> got(outs.size());
+      for (std::size_t k = 0; k < outs.size(); ++k) {
+        MCKE_ASSIGN_OR_RETURN(Tensor t, output(outs[k]));
+        got[k].resize(t.nbytes());
+        MCKE_RETURN_IF_ERROR(t.copy_to_host(got[k].data(), got[k].size(),
+                                            plan_.streams_[0].native()));
+      }
+      MCKE_RETURN_IF_ERROR(synchronize());
+      if (r == 0) { *first = std::move(got); continue; }
+      for (std::size_t k = 0; k < outs.size(); ++k) {
+        const std::size_t off = first_bit_mismatch((*first)[k].data(), got[k].data(),
+                                                   got[k].size());
+        if (off < got[k].size()) {
+          std::uint32_t wa = 0, wb = 0;
+          std::memcpy(&wa, (*first)[k].data() + off, 4);
+          std::memcpy(&wb, got[k].data() + off, 4);
+          std::ostringstream os;
+          os << "run-to-run variance within one configuration at repeat " << r
+             << ", tensor " << outs[k] << " word " << (off / 4) << ": 0x" << std::hex
+             << wa << " vs 0x" << wb << std::dec;
+          *err = os.str();
+          return OkStatus();   // reported through err, not as a Status failure
+        }
+      }
+    }
+    return OkStatus();
+  };
+
+  NumericsResult res;
+  res.repeats = repeats;
+
+  std::vector<std::vector<char>> golden;
+  std::string err;
+  const Status g = run_config(SchedulePolicy::kSequential, MemoryPolicy::kAllocPerTensor,
+                              repeats, &golden, &err);
+  if (!g.ok()) { opts_ = saved; return g; }
+  if (!err.empty()) {
+    opts_ = saved;
+    res.detail = "GOLDEN CONFIG IS ITSELF NONDETERMINISTIC: " + err;
+    return res;
+  }
+  for (const auto& b : golden) res.elements_compared += b.size() / 4;
+
+  for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                  SchedulePolicy::kChainGreedy}) {
+    for (auto mp : {MemoryPolicy::kAllocPerTensor, MemoryPolicy::kReuseSameStream,
+                    MemoryPolicy::kReuseHappensBefore}) {
+      std::vector<std::vector<char>> got;
+      err.clear();
+      const Status s = run_config(sp, mp, repeats, &got, &err);
+      if (!s.ok()) { opts_ = saved; return s; }
+      ++res.configs_compared;
+      const char* spn = (sp == SchedulePolicy::kSequential) ? "sequential"
+                      : (sp == SchedulePolicy::kLevelParallel) ? "level_parallel"
+                                                               : "chain_greedy";
+      const char* mpn = (mp == MemoryPolicy::kAllocPerTensor) ? "alloc_per_tensor"
+                      : (mp == MemoryPolicy::kReuseSameStream) ? "reuse_same_stream"
+                                                               : "reuse_happens_before";
+      if (!err.empty()) {
+        opts_ = saved;
+        res.detail = std::string(spn) + " x " + mpn + ": " + err;
+        return res;
+      }
+      for (std::size_t k = 0; k < outs.size(); ++k) {
+        const std::size_t off = first_bit_mismatch(golden[k].data(), got[k].data(),
+                                                   got[k].size());
+        if (off < got[k].size()) {
+          std::uint32_t wa = 0, wb = 0;
+          float fa = 0, fb = 0;
+          std::memcpy(&wa, golden[k].data() + off, 4);
+          std::memcpy(&wb, got[k].data() + off, 4);
+          std::memcpy(&fa, &wa, 4);
+          std::memcpy(&fb, &wb, 4);
+          std::ostringstream os;
+          os << spn << " x " << mpn << " differs from golden at tensor " << outs[k]
+             << " word " << (off / 4) << ": golden 0x" << std::hex << wa << " (" << std::dec
+             << fa << ") vs 0x" << std::hex << wb << " (" << std::dec << fb << ")";
+          opts_ = saved;
+          res.detail = os.str();
+          return res;
+        }
+      }
+    }
+  }
+
+  opts_ = saved;
+  MCKE_RETURN_IF_ERROR(plan());   // leave the executor on the caller's options
+  res.passed = true;
+  return res;
 }
 
 std::string ExecutionPlan::describe() const {

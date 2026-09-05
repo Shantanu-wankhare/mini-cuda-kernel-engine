@@ -87,6 +87,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mcke/core/status.hpp"
@@ -130,6 +131,27 @@ struct ExecutorOptions {
                                                  // a NaN can be swallowed by a
                                                  // max() and mask the very read
                                                  // this is meant to expose
+};
+
+// Index of the first differing 32-bit word, or `bytes` when identical.
+//
+// COMPARED AS uint32_t, NEVER AS float, and this is the detail that quietly
+// ruins a bit-identity gate if you get it wrong:
+//   * a float compare reports a false FAIL on any NaN, since NaN != NaN;
+//   * a float compare reports a false PASS on -0.0f vs +0.0f, which are equal
+//     as floats and differ in the sign bit.
+// Bit-identity means bit-identity. The roadmap's rule -- "any difference is a
+// race, not a rounding artefact" -- only holds if the comparison is exact.
+[[nodiscard]] std::size_t first_bit_mismatch(const void* a, const void* b,
+                                             std::size_t bytes);
+
+// Outcome of the numerics gate.
+struct NumericsResult {
+  bool        passed = false;
+  int         configs_compared = 0;
+  int         repeats = 0;
+  std::size_t elements_compared = 0;
+  std::string detail;      // on failure: config, tensor, index, both words in hex
 };
 
 // Per-node timing, filled by collect_timings() after synchronize().
@@ -284,6 +306,25 @@ class GraphExecutor {
 
   // Read the probe ring. Call after synchronize(); opts.profile only.
   [[nodiscard]] Status collect_timings();
+
+  // THE NUMERICS GATE. Runs the full {schedule} x {memory policy} matrix and
+  // compares every graph output, bitwise, against a golden run of
+  // (kSequential, kAllocPerTensor).
+  //
+  // WHY THE FULL MATRIX rather than the three runs the roadmap literally asks
+  // for: a failure in the (kSequential, kReuseHappensBefore) cell isolates a
+  // PLANNER bug, while a failure only in parallel cells isolates a SCHEDULING
+  // bug. Three runs cannot tell those apart, and they need different fixes.
+  //
+  // AND WHY REPEATS: a race usually shows up as run-to-run variance WITHIN one
+  // configuration, not as a disagreement between configurations. Comparing
+  // policies pairwise once would miss a race that happened to agree by luck --
+  // the same lesson tests/test_stream_safety.cu learned when it needed 160
+  // trials. Each config is therefore also compared against its own first run.
+  //
+  // Requires opts.validate_numerics, because set_input caches the host bytes
+  // only in that mode (the gate must re-feed identical inputs after re-planning).
+  [[nodiscard]] StatusOr<NumericsResult> validate_numerics(int repeats = 20);
   [[nodiscard]] const std::vector<NodeTiming>& node_timings() const noexcept {
     return node_timings_;
   }
@@ -312,6 +353,10 @@ class GraphExecutor {
   ExecutionPlan    plan_;
   Profiler         profiler_;
   std::vector<NodeTiming> node_timings_;
+  // Host copies of every set_input(), kept only when validate_numerics is on:
+  // the gate re-plans between configurations, which rebinds every tensor, so it
+  // must re-feed byte-identical inputs afterwards.
+  std::vector<std::pair<TensorId, std::vector<char>>> input_cache_;
   bool             planned_ = false;
 };
 
