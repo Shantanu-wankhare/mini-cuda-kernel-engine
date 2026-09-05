@@ -135,10 +135,18 @@ enum class MemoryPolicy : std::uint8_t {
   // asserted in a host test -- one planner, not two code paths.
   kReuseHappensBefore,
 
-  // Adds synchronisation edges to CREATE the happens-before relations that make
-  // more reuse legal, trading wall-clock for peak bytes. The explicit
-  // memory-vs-parallelism knob.
-  kReuseWithSyncEdges,
+  // NOT AN ARM, and worth recording why rather than shipping a stub that always
+  // errors. The design review proposed a kReuseWithSyncEdges policy that ADDS
+  // synchronisation edges to create the happens-before relations that would make
+  // more reuse legal -- trading wall-clock for peak bytes.
+  //
+  // It cannot be a post-pass over a fixed schedule. Adding a sync edge changes
+  // the schedule, which changes happens-before, which changes what reuse is
+  // legal, which changes which edges you would want to add. Scheduling and
+  // allocation become a FIXPOINT, and doing it properly means co-designing them
+  // (the register-allocator/instruction-scheduler problem, where buffer sharing
+  // creates anti-dependences the scheduler must then honour). That is a real
+  // piece of work and it is out of scope for Phase 4; see DECISIONS.md.
 };
 
 struct ExecutorOptions {

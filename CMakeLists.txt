@@ -97,6 +97,7 @@ add_library(mcke_core STATIC
   src/memory/freelist_allocator.cpp
   src/graph/graph.cpp
   src/graph/happens_before.cpp
+  src/graph/memory_plan.cpp
   src/graph/schedule.cpp
   src/graph/ops_gemm.cpp
   src/graph/ops_bias_act.cpp

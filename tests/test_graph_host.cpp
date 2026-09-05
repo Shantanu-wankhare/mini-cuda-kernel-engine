@@ -38,6 +38,7 @@
 #include "mcke/graph/cost_model.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
+#include "mcke/graph/memory_plan.hpp"
 #include "mcke/graph/schedule.hpp"
 
 namespace {
@@ -1088,6 +1089,222 @@ void test_schedule_ordering_property() {
   std::printf("  %d schedules verified (3 policies x 4 stream counts x 250 DAGs)\n", planned);
 }
 
+
+// =============================================================================
+//  The memory planner: interference, packing, and the unsafe arm
+// =============================================================================
+
+using mcke::MemoryPlan;
+using mcke::MemoryPolicy;
+
+MemoryPlan plan_mem(const Graph& g, const StreamAssignment& sa, MemoryPolicy pol) {
+  auto hb = sa.happens_before();
+  hb.status().throw_if_error();
+  auto mp = mcke::plan_memory(g, sa, *hb, pol);
+  mp.status().throw_if_error();
+  return std::move(*mp);
+}
+
+// The 5-node graph from happens_before.hpp's banner, as a real Graph:
+//   X -> {N0 -> N1, N2 -> N3} -> N4
+// Two chains of unequal reach joined at the end. By TOPOLOGICAL POSITION,
+// tensor `a` (def by N0, last read by N1) and tensor `d` (def by N3) have
+// disjoint live ranges, so a naive planner shares their buffer. Whether that is
+// safe depends entirely on the schedule.
+Graph build_two_chain_join() {
+  Graph g;
+  auto x  = g.add_input(Shape{64, 64}, DType::kF32, "X"); x.status().throw_if_error();
+  auto n0 = g.add_node(fake(), {*x}, "N0_a");        n0.status().throw_if_error();
+  auto n2 = g.add_node(fake(), {*x}, "N2_b");        n2.status().throw_if_error();
+  auto n1 = g.add_node(fake(), {(*n0)[0]}, "N1_c");  n1.status().throw_if_error();
+  auto n3 = g.add_node(fake(), {(*n2)[0]}, "N3_d");  n3.status().throw_if_error();
+  auto n4 = g.add_node(fake(), {(*n1)[0], (*n3)[0]}, "N4_out"); n4.status().throw_if_error();
+  g.mark_output((*n4)[0]).throw_if_error();
+  g.finalize().throw_if_error();
+  return g;
+}
+
+void test_memory_chain16_exact_bytes() {
+  std::printf("test_memory_chain16_exact_bytes\n");
+  // chain x16 at 4096x4096 f32: every tensor is exactly 64 MiB, so the whole
+  // table is hand-computable and asserted as exact integers.
+  Graph g;
+  auto x = g.add_input(Shape{4096, 4096}, DType::kF32, "x"); x.status().throw_if_error();
+  TensorId cur = *x;
+  for (int i = 0; i < 16; ++i) {
+    auto r = g.add_node(fake(Shape{4096, 4096}), {cur}, "n" + std::to_string(i));
+    r.status().throw_if_error();
+    cur = (*r)[0];
+  }
+  g.mark_output(cur).throw_if_error();
+  g.finalize().throw_if_error();
+
+  const std::size_t MiB64 = 64ull * 1024 * 1024;
+  const StreamAssignment sa = plan(g, SchedulePolicy::kSequential, 1);
+
+  const MemoryPlan naive = plan_mem(g, sa, MemoryPolicy::kAllocPerTensor);
+  CHECK_EQ(naive.naive_bytes, 17ull * MiB64);   // 1 input + 16 produced
+  CHECK_EQ(naive.arena_bytes, 17ull * MiB64);   // no reuse: arena == naive
+  CHECK_EQ(naive.buffers_used, 17u);
+
+  const MemoryPlan reuse = plan_mem(g, sa, MemoryPolicy::kReuseHappensBefore);
+  // FOUR buffers, and each one is there for a stated reason:
+  //   the graph INPUT  -- never dies (async H2D the planner does not track)
+  //   the graph OUTPUT -- must outlive execution
+  //   two ping-pong buffers for the 15 intermediates, because consecutive
+  //   intermediates overlap (t_i is live [i, i+1], t_{i+1} is [i+1, i+2]) while
+  //   t_i and t_{i+2} do not.
+  CHECK_EQ(reuse.buffers_used, 4u);
+  CHECK_EQ(reuse.arena_bytes, 4ull * MiB64);
+  CHECK_EQ(reuse.naive_bytes, 17ull * MiB64);
+  std::printf("  chain16 @4096^2: naive %zu MiB -> arena %zu MiB (%.2fx, %zu buffers)\n",
+              reuse.naive_bytes / (1024 * 1024), reuse.arena_bytes / (1024 * 1024),
+              double(reuse.naive_bytes) / double(reuse.arena_bytes), reuse.buffers_used);
+
+  // Every offset must be device-aligned, or a Tensor::slice() view breaks the
+  // coalescing assumption every Phase 3 kernel was tuned under -- silently,
+  // with no error, just quietly worse GEMM numbers.
+  for (std::size_t t = 0; t < g.num_tensors(); ++t)
+    if (reuse.offset_of[t] != mcke::kNoOffset)
+      CHECK_EQ(reuse.offset_of[t] % mcke::kDeviceAlignment, 0u);
+}
+
+// THE HEADLINE DEMONSTRATION: the unsafe arm is caught on a laptop.
+void test_memory_unsafe_arm_is_flagged() {
+  std::printf("test_memory_unsafe_arm_is_flagged\n");
+  const Graph g = build_two_chain_join();
+
+  auto check = [&](SchedulePolicy sp, const char* spn, MemoryPolicy mp, const char* mpn) {
+    const StreamAssignment sa = plan(g, sp, 2);
+    auto hb = sa.happens_before(); hb.status().throw_if_error();
+    const MemoryPlan m = plan_mem(g, sa, mp);
+    const Status race = mcke::verify_no_buffer_races(g, sa, *hb, m);
+    std::printf("  %-13s x %-24s -> %s\n", spn, mpn, race.ok() ? "clean" : "RACE DETECTED");
+    if (!race.ok()) std::printf("      %s\n", race.message().c_str());
+    return race.ok();
+  };
+
+  // The naive planner is SAFE under one stream -- happens-before is total there,
+  // so it degenerates to the interval test and agrees with it exactly.
+  CHECK(check(SchedulePolicy::kSequential, "sequential", MemoryPolicy::kReuseTopoNaive,
+              "reuse_topo_naive"));
+  // ...and UNSAFE under both parallel policies, including kLevelParallel, whose
+  // inter-level barrier is intuitively supposed to prevent exactly this.
+  CHECK(!check(SchedulePolicy::kChainGreedy, "chain_greedy", MemoryPolicy::kReuseTopoNaive,
+               "reuse_topo_naive"));
+  CHECK(!check(SchedulePolicy::kLevelParallel, "level_par", MemoryPolicy::kReuseTopoNaive,
+               "reuse_topo_naive"));
+
+  // The correct policy is clean everywhere, which is the whole point.
+  for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                  SchedulePolicy::kChainGreedy})
+    CHECK(check(sp, "any", MemoryPolicy::kReuseHappensBefore, "reuse_happens_before"));
+  // And so is the conservative one.
+  for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                  SchedulePolicy::kChainGreedy})
+    CHECK(check(sp, "any", MemoryPolicy::kReuseSameStream, "reuse_same_stream"));
+
+  std::printf("  ^ found with no GPU, deterministically. The runtime numerics gate\n"
+              "    would catch this too -- but only probabilistically, only under\n"
+              "    load, and only on hardware.\n");
+}
+
+void test_memory_single_stream_degeneracy() {
+  std::printf("test_memory_single_stream_degeneracy\n");
+  // Under one stream happens-before is TOTAL, so the sound planner and the naive
+  // one must produce byte-identical layouts. That equivalence is why there is one
+  // planner rather than a fast-unsafe path and a slow-safe one.
+  for (int trial = 0; trial < 40; ++trial) {
+    const Graph g = (trial % 2) ? build_diamond() : build_fanout(3, 3);
+    const StreamAssignment sa = plan(g, SchedulePolicy::kSequential, 1);
+    const MemoryPlan a = plan_mem(g, sa, MemoryPolicy::kReuseTopoNaive);
+    const MemoryPlan b = plan_mem(g, sa, MemoryPolicy::kReuseHappensBefore);
+    CHECK_EQ(a.arena_bytes, b.arena_bytes);
+    CHECK_EQ(a.buffers_used, b.buffers_used);
+    for (std::size_t t = 0; t < g.num_tensors(); ++t)
+      CHECK_EQ(a.offset_of[t], b.offset_of[t]);
+  }
+}
+
+void test_memory_peak_rises_with_streams() {
+  std::printf("test_memory_peak_rises_with_streams\n");
+  // THE PREDICTION, now measurable with no GPU: parallelism and memory reuse are
+  // in direct tension. More concurrent streams means fewer pairs of tensors are
+  // ordered, which means fewer reuse opportunities, which means a bigger arena.
+  const Graph g = build_fanout(4, 4);
+  std::size_t prev = 0;
+  std::printf("  fanout4x4, chain_greedy + reuse_happens_before:\n");
+  for (int k : {1, 2, 4}) {
+    const StreamAssignment sa = plan(g, SchedulePolicy::kChainGreedy, k);
+    const MemoryPlan m = plan_mem(g, sa, MemoryPolicy::kReuseHappensBefore);
+    std::printf("    K=%d -> %zu streams, arena %zu B, %zu buffers\n",
+                k, sa.num_streams_used, m.arena_bytes, m.buffers_used);
+    CHECK(m.arena_bytes >= prev);          // monotone non-decreasing
+    CHECK(m.arena_bytes <= m.naive_bytes); // reuse never costs more than none
+    prev = m.arena_bytes;
+  }
+  std::printf("  ^ peak memory is a function of (graph, SCHEDULE, memory policy,\n"
+              "    NUM_STREAMS) -- not of (graph, memory policy). A RESULTS row that\n"
+              "    omits the last two coordinates is uninterpretable.\n");
+}
+
+// The fuzz loop: the sound policies must NEVER race, and the unsafe one must
+// sometimes race -- a demonstration that never fires is not a demonstration.
+void test_memory_race_fuzz() {
+  std::printf("test_memory_race_fuzz\n");
+  std::uint64_t rng = 0x2545F4914F6CDD1Dull;
+  auto next = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                      return static_cast<std::uint32_t>(rng >> 33); };
+
+  int checked = 0, naive_races = 0;
+  for (int trial = 0; trial < 150; ++trial) {
+    const int n = 2 + static_cast<int>(next() % 10);
+    Graph g;
+    auto in = g.add_input(Shape{32, 32}, DType::kF32, "in"); in.status().throw_if_error();
+    std::vector<TensorId> avail{*in}, outs;
+    for (int i = 0; i < n; ++i) {
+      std::vector<TensorId> ins;
+      const int want = 1 + static_cast<int>(next() % 2);
+      for (int k = 0; k < want; ++k) ins.push_back(avail[next() % avail.size()]);
+      std::sort(ins.begin(), ins.end());
+      ins.erase(std::unique(ins.begin(), ins.end()), ins.end());
+      auto r = g.add_node(fake(Shape{32, 32}), ins, "n" + std::to_string(i));
+      r.status().throw_if_error();
+      avail.push_back((*r)[0]);
+      outs.push_back((*r)[0]);
+    }
+    g.mark_output(outs.back()).throw_if_error();
+    g.finalize().throw_if_error();
+
+    for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                    SchedulePolicy::kChainGreedy}) {
+      for (int k : {1, 2, 4}) {
+        const StreamAssignment sa = plan(g, sp, k);
+        auto hb = sa.happens_before(); hb.status().throw_if_error();
+        for (auto mp : {MemoryPolicy::kAllocPerTensor, MemoryPolicy::kReuseSameStream,
+                        MemoryPolicy::kReuseHappensBefore}) {
+          const MemoryPlan m = plan_mem(g, sa, mp);
+          const Status race = mcke::verify_no_buffer_races(g, sa, *hb, m);
+          CHECK(race.ok());
+          if (!race.ok()) std::printf("    %s\n", race.message().c_str());
+          // Alignment is not optional: an unaligned slice silently degrades
+          // every Phase 3 kernel's coalescing.
+          for (std::size_t t = 0; t < g.num_tensors(); ++t)
+            if (m.offset_of[t] != mcke::kNoOffset)
+              CHECK_EQ(m.offset_of[t] % mcke::kDeviceAlignment, 0u);
+          ++checked;
+        }
+        const MemoryPlan bad = plan_mem(g, sa, MemoryPolicy::kReuseTopoNaive);
+        if (!mcke::verify_no_buffer_races(g, sa, *hb, bad).ok()) ++naive_races;
+      }
+    }
+  }
+  std::printf("  %d sound plans verified race-free; the naive arm raced in %d cases\n",
+              checked, naive_races);
+  // A demonstration that never fires is not a demonstration.
+  CHECK(naive_races > 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1112,6 +1329,11 @@ int main() {
   test_schedule_wait_dedup();
   test_schedule_record_elision();
   test_schedule_ordering_property();
+  test_memory_chain16_exact_bytes();
+  test_memory_unsafe_arm_is_flagged();
+  test_memory_single_stream_degeneracy();
+  test_memory_peak_rises_with_streams();
+  test_memory_race_fuzz();
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }
