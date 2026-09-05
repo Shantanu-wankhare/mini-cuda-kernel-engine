@@ -131,7 +131,11 @@ using OpPtr = std::unique_ptr<Op>;
 // ---- 1. GEMM: C = alpha * op(A) @ op(B) + beta * C -------------------------
 struct GemmParams {
   float alpha = 1.f;
-  // beta != 0 is REJECTED in Phase 4, by GemmOp's constructor. Not laziness:
+  // beta != 0 is REJECTED in Phase 4, by GemmOp::infer_shapes -- which runs
+  // inside Graph::add_node, so the error surfaces at GRAPH-BUILD TIME naming the
+  // node, not at launch time on a metered GPU. (The constructor would be the
+  // tidier place, but it is inline and returns no Status; infer_shapes is the
+  // first point in the lifecycle that can actually report.) Not laziness:
   // a beta != 0 GEMM reads C before writing it, so C is a third INPUT that the
   // graph does not model. Under any buffer-reuse policy C is recycled bytes
   // whose contents depend on the schedule, which (a) violates the SSA
@@ -162,8 +166,9 @@ struct GemmParams {
   // struct's own defaults are (128,128,8,8,8), while kTiledSmem is only
   // instantiated for (32,32,32,1,1) and hard-rejects anything else. So the
   // natural-looking GemmParams{.variant = kTiledSmem} is an InvalidArgumentError
-  // discovered at launch time -- the worst possible place. GemmOp's constructor
-  // validates the (variant, tile) pair at graph-build time instead.
+  // discovered at launch time -- the worst possible place. GemmOp::infer_shapes
+  // validates the pair via kernels::gemm_tile_is_supported() at graph-build time
+  // instead.
   kernels::GemmTile tile{};
 
   // transpose_a / transpose_b DELETED. launch_gemm_f32 has no transpose
@@ -206,6 +211,21 @@ struct BiasActParams {
   // between them in Phase 4; letting the same activation carry two different
   // names across that boundary is how a translation quietly maps the wrong case.
   enum class Act { kNone, kRelu, kGeluErf, kGeluTanh } act = Act::kGeluErf;
+
+  // 0 = pick the widest legal width via kernels::max_vector_width_f32(). The
+  // launcher REJECTS an illegal width rather than downgrading, so the policy
+  // ("pick the widest that works") has to live on this side of the boundary.
+  int vector_width = 0;
+
+  // 0 = unbounded (one block-row per matrix row, the normal launch). Non-zero
+  // caps gridDim.y to deliberately STARVE the grid.
+  //
+  // Carried here rather than left at the kernel layer because Phase 4's
+  // bandwidth-saturated benchmark graph needs it: two concurrent starved
+  // bias_act nodes leave most SMs idle while the memory system is already ~89%
+  // busy, which is the graph that separates "SMs are idle" from "the machine is
+  // idle". Without this field that experiment cannot be expressed as a graph.
+  int max_row_blocks = 0;
   // GELU has an exact form (0.5x(1+erf(x/sqrt2))) and a tanh approximation.
   // erff() on device is ~20 instructions; the tanh form is ~10 but differs in
   // the 3rd decimal. We implement both and measure, because "which GELU" is a
@@ -244,6 +264,12 @@ class ReduceOp final : public Op {
   // kernel is achieved bandwidth as a fraction of peak. Reporting TFLOP/s for a
   // reduction is a red flag in an interview.
   [[nodiscard]] OpCost cost(const std::vector<Shape>&) const override;
+
+  // The only op in Phases 0-4 that needs scratch: kTwoPass writes per-block
+  // partial sums and reduces them in a second kernel. This is what
+  // Op::workspace_bytes() exists for, and the planner sizes one arena per stream
+  // from it rather than letting the op allocate at launch time.
+  [[nodiscard]] std::size_t workspace_bytes(const std::vector<Shape>&) const override;
 
  private:
   ReduceParams p_;

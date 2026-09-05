@@ -243,47 +243,11 @@ enum class SoftmaxVariant : std::uint8_t { kThreePass, kOnlineOnePass };
 //   kCublasRef     : cuBLAS, as the ceiling. Not cheating — knowing the gap is
 //                    the only way to know whether 65% is good.
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// APPEND-ONLY ENUM. Every addition goes at the END, so no existing enumerator's
-// std::uint8_t value shifts and nothing already recorded or serialised changes
-// meaning. The consequence is that NUMERIC ORDER IS NOT PRESENTATION ORDER --
-// the ladder reads naive_uncoalesced, naive, tiled_smem, tiled_regblock,
-// warptile_nodbuf, warptile_dbuf, warptile_vec4, cublas, and the enum does not.
-// bench/gemm_bench.cpp owns the presentation order; do not infer it from here.
-//
-// kWarpTileNoDbuf exists because kWarpTile bundles TWO independent changes -- a
-// warp-level tile layer AND double-buffered shared memory -- which would give
-// its row two attributable causes. kWarpTileVec4 exists for the same reason
-// applied to vectorized loads. kNaiveUncoalesced exists so the coalesced naive
-// baseline is a MEASURED choice rather than an asserted one.
-//
-// ---------------------------------------------------------------------------
-// TWO CORRECTIONS TO THE PHASE-0 DESCRIPTION ABOVE, both found in design review
-// before any of this ran, and both recorded rather than quietly edited:
-//
-// 1. The earlier text said warp tiling "removes a bank conflict on the
-//    B-fragment load". It CANNOT remove it. With Bs[BK][BN] and TN=8 a lane's
-//    bank is (c*8 + i) % 32, which has PERIOD 4 in the column group c -- at most
-//    4 distinct banks are reachable by any set of 8-aligned column groups, no
-//    matter how lanes are assigned. A pure lane remap can only go from a 2x16
-//    lane layout (A 1-way, B 4-way = 5 phases) to 4x8 (A 1-way, B 2-way =
-//    3 phases). That is a 1.67x cut in shared-load cycles, not elimination.
-//    Padding does not help either: the period comes from the intra-row stride
-//    TN=8, not from the row stride, so widening the row stride leaves it intact.
-//
-// 2. The earlier text said the two effects were "predicted to be comparable in
-//    size". They are not. Warp tiling moves the shared-memory roofline from
-//    ~6.5 to ~9-10.9 TFLOP/s, but the kernel runs at ~3.5-4, so that ceiling was
-//    only marginally binding to begin with. Revised prediction: kWarpTileNoDbuf
-//    buys 5-12%, materially less than double buffering. Recorded here BEFORE the
-//    run, per RESULTS.md rule 6 -- the point is to be judged, not to be right.
-// ---------------------------------------------------------------------------
-enum class GemmVariant : std::uint8_t {
-  kNaive, kTiledSmem, kTiledRegBlock, kWarpTile, kCublasRef,
-  kWarpTileNoDbuf,      // warp tiling WITHOUT double buffering -- the isolator
-  kWarpTileVec4,        // kWarpTile + float4 global->smem loads, nothing else
-  kNaiveUncoalesced,    // kNaive with threadIdx.x mapped to the C ROW, not column
-};
+// The GemmVariant enum and its ladder rationale moved to
+// mcke/kernels/gemm_tile.hpp (included above), alongside GemmTile and the
+// (variant, tile) validity predicate. It is a plain enum with no CUDA
+// dependency, and keeping it next to the tile it is validated against lets
+// gemm_tile_is_supported() take a GemmVariant directly instead of a bool.
 
 // `GemmTile` itself, the runtime-tile -> compile-time-instantiation dispatch,
 // and the four-limiter occupancy calculator all live in mcke/kernels/gemm_tile.hpp

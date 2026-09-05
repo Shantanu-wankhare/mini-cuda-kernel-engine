@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "mcke/graph/cost_model.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
 
@@ -621,6 +622,173 @@ void test_graph_random_dags() {
               "  determinism)\n", graphs);
 }
 
+
+// =============================================================================
+//  The four Op subclasses: shapes, costs, and the enum bridges
+//
+//  The cost assertions use the EXACT byte counts already published in
+//  RESULTS.md sec 3a-3d, which were produced by the Phase 3 benches. That makes
+//  this a cross-validation rather than a restatement: if the graph layer and the
+//  bench layer ever disagree about what an op costs, one of them is wrong and
+//  this test says so. Deriving the expected values from the same formula the
+//  code uses would assert nothing.
+// =============================================================================
+
+void test_op_costs_match_published_results() {
+  std::printf("test_op_costs_match_published_results\n");
+  const Shape big{8192, 4096};   // the pinned sec 3a/3b/3c shape
+
+  // --- sec 3a, fused bias+activation: (2N + cols) * 4
+  {
+    mcke::BiasActParams p; p.act = mcke::BiasActParams::Act::kGeluTanh;
+    mcke::BiasActOp op(p);
+    const auto c = op.cost({big, Shape{4096}});
+    CHECK_EQ(c.bytes, 268451840ull);            // RESULTS.md sec 3a, verbatim
+    CHECK_EQ(c.flops, 33554432ull * 10ull);     // gelu_tanh = 10 flops/element
+  }
+  // --- sec 3b, row reduce: (N + rows) * 4
+  {
+    mcke::ReduceParams p; p.kind = mcke::ReduceParams::Kind::kSum;
+    mcke::ReduceOp op(p);
+    const auto c = op.cost({big});
+    CHECK_EQ(c.bytes, 134250496ull);            // RESULTS.md sec 3b, verbatim
+    CHECK_EQ(c.flops, 8192ull * 4095ull);       // rows * (cols - 1) additions
+  }
+  // --- kMax reports ZERO flops, deliberately: fmaxf is a comparison, not a
+  //     floating-point operation in the FMA sense peak_tflops measures. Counting
+  //     them would inflate the AI of an op that is hopelessly memory-bound.
+  {
+    mcke::ReduceParams p; p.kind = mcke::ReduceParams::Kind::kMax;
+    mcke::ReduceOp op(p);
+    const auto c = op.cost({big});
+    CHECK_EQ(c.flops, 0ull);
+    CHECK_EQ(c.bytes, 134250496ull);            // same traffic as kSum
+  }
+  // --- sec 3c, softmax: 2N * 4 (COMPULSORY, not the 3-4 passes actually made)
+  {
+    mcke::SoftmaxOp op(mcke::SoftmaxParams{});
+    const auto c = op.cost({big});
+    CHECK_EQ(c.bytes, 268435456ull);
+    CHECK_EQ(c.flops, 33554432ull * 5ull);
+  }
+  // --- sec 3d, GEMM 4096-cubed
+  {
+    mcke::GemmOp op(mcke::GemmParams{});
+    const Shape a{4096, 4096}, b{4096, 4096};
+    const auto c = op.cost({a, b});
+    CHECK_EQ(c.flops, 137438953472ull);         // 2*M*N*K
+    CHECK_EQ(c.bytes, 201326592ull);            // (MK+KN+MN)*4
+    // AI ~ 683, twenty times past the T4 ridge point of ~34.5.
+    CHECK(c.arithmetic_intensity() > 682.0 && c.arithmetic_intensity() < 683.0);
+  }
+}
+
+void test_op_infer_shapes() {
+  std::printf("test_op_infer_shapes\n");
+  {  // GEMM: [M,K] x [K,N] -> [M,N]
+    mcke::GemmOp op(mcke::GemmParams{});
+    auto r = op.infer_shapes({Shape{7, 5}, Shape{5, 3}});
+    r.status().throw_if_error();
+    CHECK_EQ(r->size(), 1u);
+    CHECK((*r)[0] == Shape({7, 3}));
+    // inner dimensions must agree, and the error must SAY the shapes
+    auto bad = op.infer_shapes({Shape{7, 5}, Shape{4, 3}});
+    CHECK(!bad.ok());
+    CHECK(bad.status().message().find("inner dimensions disagree") != std::string::npos);
+    CHECK(!op.infer_shapes({Shape{7, 5}}).ok());              // wrong arity
+    CHECK(!op.infer_shapes({Shape{7}, Shape{5, 3}}).ok());    // wrong rank
+  }
+  {  // GEMM: beta != 0 refused at BUILD time, not at launch
+    mcke::GemmParams p; p.beta = 1.0f;
+    mcke::GemmOp op(p);
+    auto r = op.infer_shapes({Shape{4, 4}, Shape{4, 4}});
+    CHECK(!r.ok());
+    CHECK(r.status().message().find("beta != 0") != std::string::npos);
+  }
+  {  // GEMM: THE TILE TRAP. kTiledSmem with a defaulted tile is the natural
+     // thing to write and is an unsupported pairing; it must fail here rather
+     // than inside launch_gemm_f32 on a GPU.
+    mcke::GemmParams p; p.variant = mcke::kernels::GemmVariant::kTiledSmem;
+    mcke::GemmOp op(p);                       // tile defaults to (128,128,8,8,8)
+    CHECK(!op.infer_shapes({Shape{64, 64}, Shape{64, 64}}).ok());
+
+    mcke::GemmParams ok = p;
+    ok.tile = mcke::kernels::GemmTile{32, 32, 32, 1, 1};
+    mcke::GemmOp op2(ok);
+    CHECK(op2.infer_shapes({Shape{64, 64}, Shape{64, 64}}).ok());
+  }
+  {  // BiasAct: bias broadcasts over the last axis
+    mcke::BiasActOp op(mcke::BiasActParams{});
+    auto r = op.infer_shapes({Shape{8, 16}, Shape{16}});
+    r.status().throw_if_error();
+    CHECK((*r)[0] == Shape({8, 16}));
+    CHECK(!op.infer_shapes({Shape{8, 16}, Shape{8}}).ok());        // wrong length
+    CHECK(!op.infer_shapes({Shape{8, 16}, Shape{4, 4}}).ok());     // wrong rank
+  }
+  {  // BiasAct: the vector-width precondition is on COLS, not on numel.
+     // rows=4, cols=3 has numel 12 (divisible by 4) while every odd row start is
+     // misaligned -- the exact mistake kernels.hpp records having made once.
+    mcke::BiasActParams p; p.vector_width = 4;
+    mcke::BiasActOp op(p);
+    CHECK(!op.infer_shapes({Shape{4, 3}, Shape{3}}).ok());
+    CHECK(op.infer_shapes({Shape{3, 4}, Shape{4}}).ok());
+    mcke::BiasActParams bad = p; bad.vector_width = 3;
+    CHECK(!mcke::BiasActOp(bad).infer_shapes({Shape{4, 4}, Shape{4}}).ok());
+  }
+  {  // Reduce drops the last axis; rank 1 collapses to {1}, never to rank 0
+    mcke::ReduceOp op(mcke::ReduceParams{});
+    auto r2 = op.infer_shapes({Shape{8, 16}});   r2.status().throw_if_error();
+    CHECK((*r2)[0] == Shape({8}));
+    auto r3 = op.infer_shapes({Shape{4, 8, 16}}); r3.status().throw_if_error();
+    CHECK((*r3)[0] == Shape({4, 8}));            // needs the runtime-rank ctor
+    auto r1 = op.infer_shapes({Shape{16}});      r1.status().throw_if_error();
+    CHECK((*r1)[0] == Shape({1}));
+    mcke::ReduceParams ax; ax.axis = 0;
+    CHECK(!mcke::ReduceOp(ax).infer_shapes({Shape{8, 16}}).ok());   // interior axis
+  }
+  {  // Softmax is shape-preserving, and refuses a flag it does not honour
+    mcke::SoftmaxOp op(mcke::SoftmaxParams{});
+    auto r = op.infer_shapes({Shape{8, 16}}); r.status().throw_if_error();
+    CHECK((*r)[0] == Shape({8, 16}));
+    mcke::SoftmaxParams p; p.numerically_stable = false;
+    CHECK(!mcke::SoftmaxOp(p).infer_shapes({Shape{8, 16}}).ok());
+  }
+}
+
+void test_cost_model_roofline() {
+  std::printf("test_cost_model_roofline\n");
+  mcke::Roofline rl;
+  rl.peak_gb_s   = 235.4;    // measured Colab T4, RESULTS.md sec 0
+  rl.peak_tflops = 8.130;
+
+  // A 4096-cubed GEMM is COMPUTE bound: 16.9 ms of arithmetic against 0.86 ms of
+  // compulsory traffic, so the compute roof is what binds it.
+  mcke::GemmOp gemm(mcke::GemmParams{});
+  const auto gc = gemm.cost({Shape{4096, 4096}, Shape{4096, 4096}});
+  const double g_ms = mcke::plan_cost_ms(gc, rl);
+  CHECK(g_ms > 16.0 && g_ms < 17.5);
+  CHECK(!mcke::op_is_memory_bound(gc, rl));
+
+  // Softmax at the same pinned shape is MEMORY bound, and the roofline bound
+  // (~1.14 ms) lands close to what sec 3c actually measured (1.1-2.2 ms) --
+  // which is the point of having a cost model at all.
+  mcke::SoftmaxOp sm(mcke::SoftmaxParams{});
+  const auto sc = sm.cost({Shape{8192, 4096}});
+  const double s_ms = mcke::plan_cost_ms(sc, rl);
+  CHECK(s_ms > 1.0 && s_ms < 1.3);
+  CHECK(mcke::op_is_memory_bound(sc, rl));
+
+  // THE POINT OF THE COST MODEL, in one assertion: balancing streams by NODE
+  // COUNT would call these two nodes equal, when one is ~15x the work of the
+  // other. Every Phase 4 benchmark graph mixes exactly these two scales.
+  CHECK(g_ms / s_ms > 10.0);
+
+  // Degenerate rooflines return 0 rather than infinity -- a zero denominator
+  // must not propagate a garbage cost into a schedule.
+  mcke::Roofline zero;
+  CHECK_EQ(mcke::plan_cost_ms(gc, zero), 0.0);
+}
+
 }  // namespace
 
 int main() {
@@ -636,6 +804,9 @@ int main() {
   test_graph_dead_nodes();
   test_graph_finalize_errors();
   test_graph_random_dags();
+  test_op_costs_match_published_results();
+  test_op_infer_shapes();
+  test_cost_model_roofline();
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

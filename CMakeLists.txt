@@ -95,8 +95,13 @@ add_library(mcke_core STATIC
   src/memory/allocator.cpp
   src/memory/buddy_allocator.cpp
   src/memory/freelist_allocator.cpp
+  src/graph/graph.cpp
   src/graph/happens_before.cpp
-  # Phase 4 adds: src/graph/graph.cpp, src/graph/executor.cpp, src/graph/ops_*.cpp
+  src/graph/ops_gemm.cpp
+  src/graph/ops_bias_act.cpp
+  src/graph/ops_reduce.cpp
+  src/graph/ops_softmax.cpp
+  # Phase 4 still to add: src/graph/executor.cpp, src/tensor/tensor.cpp
 )
 target_include_directories(mcke_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mcke_core PUBLIC cxx_std_20)
