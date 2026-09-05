@@ -92,6 +92,7 @@
 #include "mcke/core/status.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
+#include "mcke/graph/schedule.hpp"
 #include "mcke/memory/allocator.hpp"
 #include "mcke/profiling/profiler.hpp"
 #include "mcke/runtime/stream.hpp"
@@ -99,7 +100,10 @@
 
 namespace mcke {
 
-enum class SchedulePolicy : std::uint8_t { kSequential, kLevelParallel, kChainGreedy };
+// SchedulePolicy moved to mcke/graph/schedule.hpp (included below), next to
+// plan_streams() and StreamAssignment -- it is the schedule's vocabulary, and
+// keeping it here would have made schedule.hpp depend on the executor it is
+// meant to be testable without.
 
 // How the planner assigns device memory to intermediate tensors.
 //

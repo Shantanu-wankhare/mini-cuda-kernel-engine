@@ -38,6 +38,7 @@
 #include "mcke/graph/cost_model.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
+#include "mcke/graph/schedule.hpp"
 
 namespace {
 
@@ -789,6 +790,304 @@ void test_cost_model_roofline() {
   CHECK_EQ(mcke::plan_cost_ms(gc, zero), 0.0);
 }
 
+
+// =============================================================================
+//  Stream assignment: the three policies, event counts, and plan ordering
+//
+//  Every integer asserted here is a headline number of RESULTS.md sec 4, and
+//  every one of them is produced on a laptop -- deterministically, with no
+//  timing noise, before any GPU trip.
+// =============================================================================
+
+using mcke::SchedulePolicy;
+using mcke::StreamAssignment;
+
+mcke::Roofline t4_roofline() {
+  mcke::Roofline rl;
+  rl.peak_gb_s   = 235.4;
+  rl.peak_tflops = 8.130;
+  return rl;
+}
+
+// --- The pinned benchmark graphs, built once and shared by every test below.
+Graph build_diamond() {
+  Graph g;
+  auto x = g.add_input(Shape{64, 64}, DType::kF32, "x"); x.status().throw_if_error();
+  auto a = g.add_node(fake(), {*x}, "A");            a.status().throw_if_error();
+  auto b = g.add_node(fake(), {(*a)[0]}, "B");       b.status().throw_if_error();
+  auto c = g.add_node(fake(), {(*a)[0]}, "C");       c.status().throw_if_error();
+  auto d = g.add_node(fake(), {(*b)[0], (*c)[0]}, "D"); d.status().throw_if_error();
+  g.mark_output((*d)[0]).throw_if_error();
+  g.finalize().throw_if_error();
+  return g;
+}
+
+Graph build_chain(int n) {
+  Graph g;
+  auto x = g.add_input(Shape{64, 64}, DType::kF32, "x"); x.status().throw_if_error();
+  TensorId cur = *x;
+  for (int i = 0; i < n; ++i) {
+    auto r = g.add_node(fake(), {cur}, "n" + std::to_string(i));
+    r.status().throw_if_error();
+    cur = (*r)[0];
+  }
+  g.mark_output(cur).throw_if_error();
+  g.finalize().throw_if_error();
+  return g;
+}
+
+// One input -> 4 independent chains of 4 -> 4 outputs. No join node, so no new
+// op is needed. This is the ONLY pinned graph with width > 2, which makes it the
+// only one on which the two parallel policies can actually differ.
+Graph build_fanout(int branches, int depth) {
+  Graph g;
+  auto x = g.add_input(Shape{64, 64}, DType::kF32, "x"); x.status().throw_if_error();
+  for (int b = 0; b < branches; ++b) {
+    TensorId cur = *x;
+    for (int d = 0; d < depth; ++d) {
+      auto r = g.add_node(fake(), {cur}, "b" + std::to_string(b) + "n" + std::to_string(d));
+      r.status().throw_if_error();
+      cur = (*r)[0];
+    }
+    g.mark_output(cur).throw_if_error();
+  }
+  g.finalize().throw_if_error();
+  return g;
+}
+
+StreamAssignment plan(const Graph& g, SchedulePolicy p, int k) {
+  auto sa = mcke::plan_streams(g, p, k, t4_roofline());
+  sa.status().throw_if_error();
+  return std::move(*sa);
+}
+
+void test_schedule_diamond_streams() {
+  std::printf("test_schedule_diamond_streams\n");
+  const Graph g = build_diamond();   // nodes A=0 B=1 C=2 D=3
+
+  // THE DEFECT-3 ASSERTION, and the reason this test exists.
+  //
+  // The rule as originally documented was "keep a node on its predecessor's
+  // stream when it has exactly one predecessor" -- and on the diamond BOTH B and
+  // C have exactly one predecessor. That rule puts both on A's stream, giving a
+  // one-stream schedule with zero events and a RESULTS.md row reading
+  // "diamond / chain_greedy / 1.00x" that looks like an honest negative result
+  // and is a scheduler bug. The donation clause is what prevents it.
+  const StreamAssignment cg = plan(g, SchedulePolicy::kChainGreedy, 2);
+  CHECK_EQ(cg.stream_of[0], 0);              // A
+  CHECK_EQ(cg.stream_of[1], 0);              // B inherits A's stream (free ordering)
+  CHECK_EQ(cg.stream_of[2], 1);              // C CANNOT: A already donated
+  CHECK_EQ(cg.num_streams_used, 2u);         // <- would be 1 with the broken rule
+  CHECK(cg.num_events > 0);                  // <- would be 0 with the broken rule
+
+  const StreamAssignment sq = plan(g, SchedulePolicy::kSequential, 4);
+  for (std::size_t i = 0; i < 4; ++i) CHECK_EQ(sq.stream_of[i], 0);
+  CHECK_EQ(sq.num_streams_used, 1u);
+  // kSequential requests 4 and uses 1. Reporting only the request would claim
+  // concurrency the run never had.
+  CHECK_EQ(sq.num_streams_requested, 4u);
+}
+
+void test_schedule_event_counts() {
+  std::printf("test_schedule_event_counts\n");
+  struct Row { const char* graph; SchedulePolicy p; const char* name; int k;
+               std::size_t rec; std::size_t waits; };
+
+  const Graph dia = build_diamond();
+  const Graph ch  = build_chain(16);
+  const Graph fan = build_fanout(4, 4);
+
+  auto check = [&](const Graph& g, const char* gname, SchedulePolicy p, const char* pname,
+                   int k, std::size_t rec, std::size_t waits) {
+    const StreamAssignment sa = plan(g, p, k);
+    CHECK_EQ(sa.num_events, rec);
+    CHECK_EQ(sa.waits_dedup, waits);
+    std::printf("  %-12s %-14s K=%d -> %2zu records, %2zu waits (raw %zu), %zu streams\n",
+                gname, pname, k, sa.num_events, sa.waits_dedup, sa.waits_raw,
+                sa.num_streams_used);
+    // A recorded event must be waited on by somebody, or we paid for nothing.
+    std::size_t total_waits = 0;
+    for (const auto& w : sa.waits_of) total_waits += w.size();
+    CHECK_EQ(total_waits, sa.waits_dedup);
+  };
+
+  check(dia, "diamond", SchedulePolicy::kSequential,    "sequential",  4, 0, 0);
+  check(dia, "diamond", SchedulePolicy::kLevelParallel, "level_par",   2, 2, 2);
+  check(dia, "diamond", SchedulePolicy::kChainGreedy,   "chain_greedy",2, 2, 2);
+
+  check(ch,  "chain16", SchedulePolicy::kSequential,    "sequential",  4, 0, 0);
+  check(ch,  "chain16", SchedulePolicy::kLevelParallel, "level_par",   4, 0, 0);
+  check(ch,  "chain16", SchedulePolicy::kChainGreedy,   "chain_greedy",4, 0, 0);
+
+  check(fan, "fanout4x4", SchedulePolicy::kSequential,    "sequential",  4, 0, 0);
+  check(fan, "fanout4x4", SchedulePolicy::kLevelParallel, "level_par",   4, 12, 36);
+  check(fan, "fanout4x4", SchedulePolicy::kChainGreedy,   "chain_greedy",4, 0, 0);
+
+  std::printf("  ^ fanout is the ONLY pinned graph where the two parallel policies\n"
+              "    differ: level_parallel manufactures 12 records + 36 waits on a\n"
+              "    graph with ZERO cross-stream data edges, because its barrier is\n"
+              "    between LEVELS, not between dependencies. chain_greedy pays none.\n");
+}
+
+void test_schedule_chain16_is_not_15_events() {
+  std::printf("test_schedule_chain16_is_not_15_events\n");
+  // A CORRECTION TO THE PLAN, recorded rather than quietly absorbed.
+  //
+  // The design review predicted chain16/kLevelParallel would cost 15 records and
+  // 15 waits. That assumed the round-robin index runs GLOBALLY across levels, so
+  // node at depth d lands on stream d % K and every level boundary becomes a
+  // cross-stream barrier.
+  //
+  // We reset the round-robin PER LEVEL instead -- "round-robin the nodes of each
+  // level" reads that way, and it is the better behaviour: a width-1 graph has
+  // exactly one node per level, index 0 every time, so the whole chain stays on
+  // stream 0 and costs nothing. Manufacturing 15 barriers on a chain with no
+  // parallelism to exploit would be a policy defect, not a policy cost.
+  const Graph ch = build_chain(16);
+  const StreamAssignment lp = plan(ch, SchedulePolicy::kLevelParallel, 4);
+  CHECK_EQ(lp.num_streams_used, 1u);
+  CHECK_EQ(lp.num_events, 0u);
+  CHECK_EQ(lp.waits_dedup, 0u);
+  // The consequence: on a chain the two parallel policies are INDISTINGUISHABLE.
+  // That is why the fanout graph had to be added -- without it, every pinned
+  // graph has width <= 2 and the K=4 columns of RESULTS.md sec 4 are decorative.
+  const StreamAssignment cg = plan(ch, SchedulePolicy::kChainGreedy, 4);
+  CHECK_EQ(cg.num_events, lp.num_events);
+  CHECK_EQ(cg.num_streams_used, lp.num_streams_used);
+}
+
+void test_schedule_wait_dedup() {
+  std::printf("test_schedule_wait_dedup\n");
+  // A node with several successors on ONE other stream needs one record and --
+  // after dedup -- one wait, not one per successor. cudaStreamWaitEvent orders
+  // everything SUBSEQUENTLY enqueued on that stream, not just the next launch.
+  Graph g;
+  auto x = g.add_input(Shape{64, 64}, DType::kF32, "x"); x.status().throw_if_error();
+  auto src = g.add_node(fake(), {*x}, "src"); src.status().throw_if_error();
+  // Three consumers, plus a long chain to occupy stream 0 so the consumers get
+  // pushed onto another stream.
+  TensorId cur = (*src)[0];
+  for (int i = 0; i < 3; ++i) {
+    auto r = g.add_node(fake(Shape{512, 512}), {cur}, "heavy" + std::to_string(i));
+    r.status().throw_if_error();
+    cur = (*r)[0];
+  }
+  g.mark_output(cur).throw_if_error();
+  std::vector<TensorId> cons;
+  for (int i = 0; i < 3; ++i) {
+    auto r = g.add_node(fake(), {(*src)[0]}, "c" + std::to_string(i));
+    r.status().throw_if_error();
+    g.mark_output((*r)[0]).throw_if_error();
+    cons.push_back((*r)[0]);
+  }
+  g.finalize().throw_if_error();
+
+  const StreamAssignment cg = plan(g, SchedulePolicy::kChainGreedy, 2);
+  CHECK(cg.waits_dedup <= cg.waits_raw);
+  // Whatever the placement, no stream may wait on the same event twice.
+  for (std::size_t s = 0; s < cg.num_streams_used; ++s) {
+    std::vector<std::uint32_t> seen;
+    for (std::size_t i = 0; i < cg.nodes.size(); ++i) {
+      if (cg.stream_of[i] != s) continue;
+      for (std::uint32_t e : cg.waits_of[i]) {
+        CHECK(std::find(seen.begin(), seen.end(), e) == seen.end());
+        seen.push_back(e);
+      }
+    }
+  }
+}
+
+void test_schedule_record_elision() {
+  std::printf("test_schedule_record_elision\n");
+  // record_of must be kNoEventId whenever every successor shares the stream.
+  // Not recording an unnecessary event is real: a cudaEventRecord is ~0.3-0.5 us
+  // of host time, and on a launch-bound graph that is the critical path.
+  for (int k : {1, 2, 4}) {
+    for (auto p : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                   SchedulePolicy::kChainGreedy}) {
+      const Graph g = build_fanout(4, 4);
+      const StreamAssignment sa = plan(g, p, k);
+      for (std::size_t i = 0; i < sa.nodes.size(); ++i) {
+        bool any_cross = false;
+        for (std::size_t j = 0; j < sa.nodes.size(); ++j)
+          for (std::uint32_t e : sa.waits_of[j])
+            if (e == sa.record_of[i] && sa.record_of[i] != mcke::kNoEventId)
+              any_cross = any_cross || (sa.stream_of[j] != sa.stream_of[i]);
+        // An event that is recorded must be waited on from another stream.
+        if (sa.record_of[i] != mcke::kNoEventId) CHECK(any_cross);
+      }
+    }
+  }
+}
+
+// The single highest-value property in the phase per unit of effort: the
+// scheduler's whole contract, checked over thousands of graphs with no GPU.
+void test_schedule_ordering_property() {
+  std::printf("test_schedule_ordering_property\n");
+  std::uint64_t rng = 0xD1B54A32D192ED03ull;
+  auto next = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                      return static_cast<std::uint32_t>(rng >> 33); };
+
+  int planned = 0;
+  for (int trial = 0; trial < 250; ++trial) {
+    const int n = 1 + static_cast<int>(next() % 14);
+    Graph g;
+    auto in = g.add_input(Shape{16, 16}, DType::kF32, "in"); in.status().throw_if_error();
+    std::vector<TensorId> avail{*in}, outs;
+    for (int i = 0; i < n; ++i) {
+      std::vector<TensorId> ins;
+      const int want = 1 + static_cast<int>(next() % 3);
+      for (int k = 0; k < want; ++k) ins.push_back(avail[next() % avail.size()]);
+      std::sort(ins.begin(), ins.end());
+      ins.erase(std::unique(ins.begin(), ins.end()), ins.end());
+      auto r = g.add_node(fake(Shape{16, 16}), ins, "n" + std::to_string(i));
+      r.status().throw_if_error();
+      avail.push_back((*r)[0]);
+      outs.push_back((*r)[0]);
+    }
+    g.mark_output(outs.back()).throw_if_error();
+    for (TensorId t : outs) if (next() % 3 == 0) g.mark_output(t).throw_if_error();
+    g.finalize().throw_if_error();
+
+    for (auto p : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                   SchedulePolicy::kChainGreedy}) {
+      for (int k : {1, 2, 4, 8}) {
+        const StreamAssignment sa = plan(g, p, k);
+        // (1) EVERY data dependency is realised as same-stream order or an event.
+        const Status ord = mcke::verify_plan_ordering(g, sa);
+        CHECK(ord.ok());
+        if (!ord.ok()) {
+          const char* pn = (p == SchedulePolicy::kSequential) ? "sequential"
+                         : (p == SchedulePolicy::kLevelParallel) ? "level_par"
+                                                                 : "chain_greedy";
+          std::printf("    [policy=%s K=%d trial=%d]\n    %s\n    %s",
+                      pn, k, trial, ord.message().c_str(), sa.describe().c_str());
+        }
+        // (2) no dead node is ever scheduled
+        for (NodeId nd : sa.nodes) CHECK(!g.node(nd).is_dead);
+        // (3) streams actually used are a dense 0..used-1, which HappensBefore
+        //     requires and which the stream-compaction pass exists to guarantee
+        CHECK(sa.num_streams_used >= 1u);
+        CHECK(sa.num_streams_used <= static_cast<std::size_t>(k));
+        for (std::size_t i = 0; i < sa.nodes.size(); ++i)
+          CHECK(sa.stream_of[i] < sa.num_streams_used);
+        // (4) kSequential is always exactly one stream and zero events
+        if (p == SchedulePolicy::kSequential) {
+          CHECK_EQ(sa.num_streams_used, 1u);
+          CHECK_EQ(sa.num_events, 0u);
+        }
+        // (5) K=1 forces one stream for EVERY policy, hence zero events
+        if (k == 1) {
+          CHECK_EQ(sa.num_streams_used, 1u);
+          CHECK_EQ(sa.num_events, 0u);
+        }
+        ++planned;
+      }
+    }
+  }
+  std::printf("  %d schedules verified (3 policies x 4 stream counts x 250 DAGs)\n", planned);
+}
+
 }  // namespace
 
 int main() {
@@ -807,6 +1106,12 @@ int main() {
   test_op_costs_match_published_results();
   test_op_infer_shapes();
   test_cost_model_roofline();
+  test_schedule_diamond_streams();
+  test_schedule_event_counts();
+  test_schedule_chain16_is_not_15_events();
+  test_schedule_wait_dedup();
+  test_schedule_record_elision();
+  test_schedule_ordering_property();
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }
