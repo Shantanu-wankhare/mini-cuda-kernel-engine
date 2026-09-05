@@ -30,7 +30,12 @@ if [ ${#targets[@]} -eq 0 ]; then
   # Host .cpp files first (no language extensions needed), then every .cu.
   # Glob bench/*.cpp rather than naming files, so a new bench is covered the
   # moment it exists instead of when someone remembers to add it here.
-  targets=(src/core/*.cpp src/memory/*.cpp bench/*.cpp tests/test_host_core.cpp)
+  # src/*/*.cpp rather than naming the subdirectories: Phase 4 added src/graph/,
+  # and the previous list (src/core + src/memory only) silently excluded it --
+  # so the MCKE_WITH_CUDA=1 path of every graph file would have reached Colab
+  # completely unverified, which is the exact failure this script exists to
+  # prevent. Same reasoning for tests/test_*.cpp.
+  targets=(src/*/*.cpp bench/*.cpp tests/test_*.cpp)
   while IFS= read -r f; do targets+=("$f"); done < <(find kernels bench tests tools -name '*.cu' | sort)
 fi
 

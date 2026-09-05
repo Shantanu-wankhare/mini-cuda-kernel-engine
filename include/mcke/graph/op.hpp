@@ -53,6 +53,7 @@
 
 #include "mcke/core/device.hpp"   // DeviceInfo, for launch-time tile/occupancy choices
 #include "mcke/core/status.hpp"
+#include "mcke/kernels/kernels.hpp"   // GemmVariant/GemmTile: aliased, not re-declared
 #include "mcke/runtime/stream.hpp"
 #include "mcke/tensor/tensor.hpp"
 
@@ -71,9 +72,19 @@ inline constexpr NodeId   kInvalidNode   = 0xFFFFFFFFu;
 struct OpContext {
   rt::StreamHandle  stream = {};        // stream this op was scheduled onto
   const DeviceInfo* device = nullptr;   // for occupancy/tile decisions at launch
-  // Scratch allocator for ops that need workspace (e.g. a two-pass reduction's
-  // partial-sums buffer). Ops must NOT capture this; it is valid for the call.
-  DeviceAllocator*  workspace = nullptr;
+  // Scratch for ops that need workspace (e.g. a two-pass reduction's
+  // partial-sums buffer). A PLAIN POINTER AND SIZE, not a DeviceAllocator*.
+  //
+  // An earlier version handed ops an allocator here, which invited
+  // allocate() on the per-iteration hot path. Phase 2 measured raw cudaMalloc at
+  // up to 720 us with a cudaFree that SYNCHRONISES THE DEVICE -- so a single
+  // such call inside run_async() silently converts this whole runtime back to
+  // synchronous execution, which is precisely the invariant Op::launch's own
+  // contract below declares load-bearing. The planner sizes workspace once from
+  // Op::workspace_bytes() and carves one arena per stream; same-stream in-order
+  // issue then makes sharing it safe with no analysis at all.
+  void*             workspace       = nullptr;
+  std::size_t       workspace_bytes = 0;
 };
 
 // Cost model, reported per op instance (it depends on the shapes).
@@ -120,14 +131,45 @@ using OpPtr = std::unique_ptr<Op>;
 // ---- 1. GEMM: C = alpha * op(A) @ op(B) + beta * C -------------------------
 struct GemmParams {
   float alpha = 1.f;
+  // beta != 0 is REJECTED in Phase 4, by GemmOp's constructor. Not laziness:
+  // a beta != 0 GEMM reads C before writing it, so C is a third INPUT that the
+  // graph does not model. Under any buffer-reuse policy C is recycled bytes
+  // whose contents depend on the schedule, which (a) violates the SSA
+  // single-producer rule the graph is built on and (b) guarantees a bit-identity
+  // failure in the numerics gate that would look like a race and would not be
+  // one. Modelling it properly means taking C as a declared input producing a
+  // new output tensor; that is a later phase.
   float beta  = 0.f;
-  bool  transpose_a = false;
-  bool  transpose_b = false;
+
   // Which kernel variant to launch. Exposed as a parameter (not auto-chosen)
   // because Phase 3 is a *comparison*: the same graph must be runnable with
   // each variant so the speedups are apples-to-apples on one machine.
-  enum class Variant { kNaive, kTiledSmem, kTiledRegBlock, kWarpTile, kCublasRef } variant =
-      Variant::kTiledRegBlock;
+  //
+  // ALIASED, NOT RE-DECLARED. This was its own five-enumerator enum through
+  // Phase 3, which then grew kernels::GemmVariant to eight (kWarpTileNoDbuf,
+  // kWarpTileVec4, kNaiveUncoalesced) and left three of them unreachable from
+  // the graph layer with no compile error. The rule this establishes:
+  // AN ENUM THAT EXISTS ONLY TO BE TRANSLATED 1:1 INTO ANOTHER ENUM SHOULD BE
+  // THE OTHER ENUM. Aliasing keeps every existing spelling
+  // (GemmParams::Variant::kNaive still compiles) and makes drift structurally
+  // impossible rather than merely warned about -- see the note on Act below,
+  // which warns about exactly this class of bug and was written before it
+  // happened here.
+  using Variant = kernels::GemmVariant;
+  Variant variant = Variant::kTiledRegBlock;
+
+  // launch_gemm_f32 requires a tile, and it CANNOT be defaulted safely: the
+  // struct's own defaults are (128,128,8,8,8), while kTiledSmem is only
+  // instantiated for (32,32,32,1,1) and hard-rejects anything else. So the
+  // natural-looking GemmParams{.variant = kTiledSmem} is an InvalidArgumentError
+  // discovered at launch time -- the worst possible place. GemmOp's constructor
+  // validates the (variant, tile) pair at graph-build time instead.
+  kernels::GemmTile tile{};
+
+  // transpose_a / transpose_b DELETED. launch_gemm_f32 has no transpose
+  // parameters, so these were unimplementable -- and worse than the enum drift
+  // above, because a silently-ignored transpose flag computes A@B when the
+  // caller asked for A^T@B and nothing anywhere reports it.
 };
 
 class GemmOp final : public Op {

@@ -95,7 +95,8 @@ add_library(mcke_core STATIC
   src/memory/allocator.cpp
   src/memory/buddy_allocator.cpp
   src/memory/freelist_allocator.cpp
-  # Phase 3+ adds: src/graph/graph.cpp, src/graph/executor.cpp, src/graph/ops_*.cpp
+  src/graph/happens_before.cpp
+  # Phase 4 adds: src/graph/graph.cpp, src/graph/executor.cpp, src/graph/ops_*.cpp
 )
 target_include_directories(mcke_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mcke_core PUBLIC cxx_std_20)
@@ -244,6 +245,23 @@ if(MCKE_BUILD_TESTS)
   target_link_libraries(mcke_test_host_core PRIVATE mcke_core)
   target_include_directories(mcke_test_host_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   add_test(NAME host_core COMMAND mcke_test_host_core)
+
+  # Phase 4: the graph layer. Host-only ON PURPOSE, and worth saying why rather
+  # than treating it as a limitation.
+  #
+  # The graph engine's hardest correctness property -- that buffer reuse must be
+  # keyed on happens-before rather than on topological order -- is a property of
+  # the PLAN, which is pure data with no data-dependent control flow. So it is
+  # decidable without a device, exhaustively, deterministically, and in
+  # milliseconds. Everything that needs a GPU (actual overlap, event timing, the
+  # nsys timeline) is measurement; everything that needs to be CORRECT is here.
+  #
+  # Links mcke_core, not the `mcke` umbrella: no device code, so this target
+  # builds and runs identically on the MacBook and on Explorer.
+  add_executable(mcke_test_graph_host tests/test_graph_host.cpp)
+  target_link_libraries(mcke_test_graph_host PRIVATE mcke_core)
+  target_include_directories(mcke_test_graph_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  add_test(NAME graph_host COMMAND mcke_test_graph_host)
 
   # Phase 2d: the stream-safety race. The repo's FIRST .cu test target.
   #

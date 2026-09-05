@@ -164,10 +164,27 @@ class [[nodiscard]] StatusOr {
     if (!_mcke_status.ok()) return _mcke_status;      \
   } while (0)
 
-// Assign-or-return. Note the unique temporary name: nesting two of these in one
-// scope would otherwise shadow. (A real codebase would append __LINE__ via a
-// token-paste helper; we keep it simple and just avoid nesting.)
+// Assign-or-return.
+//
+// The temporary's name is token-pasted with __LINE__, and that is not
+// fastidiousness. An earlier version declared a fixed `_mcke_or` and its comment
+// claimed the hazard was that "nesting two of these in one scope would otherwise
+// shadow". That was wrong twice over: shadowing inside a *nested* scope would
+// have been perfectly legal, and the actual failure is two SEQUENTIAL uses in
+// the SAME scope, which is a hard `redefinition of '_mcke_or'` error.
+//
+// Phase 4 is where it bites: GraphExecutor::plan() naturally wants
+// topological_order() and then levels(), back to back, in one function body.
+// The old macro made the obvious code not compile, which would have pushed the
+// implementation into gratuitous extra scopes to work around a comment's
+// misdiagnosis.
+#define MCKE_CONCAT_INNER(a, b) a##b
+#define MCKE_CONCAT(a, b) MCKE_CONCAT_INNER(a, b)
+
+#define MCKE_ASSIGN_OR_RETURN_IMPL(tmp, lhs, expr)    \
+  auto tmp = (expr);                                  \
+  if (!tmp.ok()) return tmp.status();                 \
+  lhs = std::move(*tmp)
+
 #define MCKE_ASSIGN_OR_RETURN(lhs, expr)              \
-  auto _mcke_or = (expr);                             \
-  if (!_mcke_or.ok()) return _mcke_or.status();       \
-  lhs = std::move(*_mcke_or)
+  MCKE_ASSIGN_OR_RETURN_IMPL(MCKE_CONCAT(_mcke_or_, __LINE__), lhs, expr)

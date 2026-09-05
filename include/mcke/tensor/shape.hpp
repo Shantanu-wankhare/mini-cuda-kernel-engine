@@ -24,6 +24,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -43,11 +44,56 @@ class Shape {
   Shape() = default;
 
   // Host-only constructor (initializer_list is not device-constructible).
+  //
+  // THE CLAMP IS LOAD-BEARING, and it was added after observing the failure.
+  // Without it, `Shape{1,2,3,4,5,6}` (rank 6 against kMaxRank 5) did not crash
+  // and did not complain -- it emerged as a PLAUSIBLE rank-1 shape with
+  // stride(0) == 720. The mechanism: `dims_`, `strides_` and `rank_` are
+  // adjacent members, so the sixth dim writes into strides_[0], and then
+  // compute_contiguous_strides() -- whose loop bound is captured before the
+  // damage -- writes strides_[5], which overlays `rank_` itself. Every
+  // downstream consumer then reads a self-consistent, entirely wrong shape.
+  //
+  // Phases 0-3 never reached this constructor with user-supplied ranks (kernels
+  // took raw pointers and explicit extents). Phase 4 is the first time graph
+  // callers build shapes, so this is the first phase where it could fire.
+  //
+  // Clamping cannot be the whole answer -- silently truncating a rank is also a
+  // wrong answer, just a different one. It is here purely to make MEMORY
+  // CORRUPTION impossible; reporting the error is the job of the Status-returning
+  // layer above (Graph::add_input / Graph::finalize), which can actually name the
+  // offending tensor. Defence in depth: the aggregate can never be corrupt, and
+  // the API that has somewhere to put an error message is the one that complains.
   Shape(std::initializer_list<dim_t> dims) {
-    rank_ = static_cast<int>(dims.size());
+    assert(dims.size() <= static_cast<std::size_t>(kMaxRank) &&
+           "Shape: rank exceeds kMaxRank");
+    rank_ = static_cast<int>(dims.size() < static_cast<std::size_t>(kMaxRank)
+                                 ? dims.size()
+                                 : static_cast<std::size_t>(kMaxRank));
     int i = 0;
-    for (dim_t d : dims) dims_[i++] = d;
+    for (dim_t d : dims) {
+      if (i >= rank_) break;
+      dims_[i++] = d;
+    }
     compute_contiguous_strides();
+  }
+
+  // Runtime-rank constructor. Required by Phase 4: Op::infer_shapes has to
+  // produce a shape whose rank is a runtime value -- ReduceOp on a rank-4 input
+  // reducing the last axis yields rank 3 -- and an initializer_list cannot
+  // express that without a hand-written switch over every rank up to kMaxRank.
+  Shape(const dim_t* dims, int rank) {
+    assert(rank >= 0 && rank <= kMaxRank && "Shape: rank out of range");
+    rank_ = rank < 0 ? 0 : (rank > kMaxRank ? kMaxRank : rank);
+    for (int i = 0; i < rank_; ++i) dims_[i] = dims[i];
+    compute_contiguous_strides();
+  }
+
+  // True iff this shape could be represented without clamping or truncation.
+  // The constructors above cannot report failure, so the checked API layer calls
+  // this and turns a false into a Status naming the tensor.
+  [[nodiscard]] static bool rank_is_representable(std::size_t rank) noexcept {
+    return rank <= static_cast<std::size_t>(kMaxRank);
   }
 
   MCKE_HOST_DEVICE int rank() const noexcept { return rank_; }
