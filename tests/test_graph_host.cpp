@@ -38,7 +38,9 @@
 #include "mcke/graph/cost_model.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
+#include "mcke/graph/executor.hpp"
 #include "mcke/graph/memory_plan.hpp"
+#include "mcke/memory/allocator.hpp"
 #include "mcke/graph/schedule.hpp"
 
 namespace {
@@ -309,9 +311,31 @@ class FakeOp final : public mcke::Op {
  public:
   explicit FakeOp(Shape out, int n_out = 1) : out_(out), n_out_(n_out) {}
   [[nodiscard]] std::string_view type_name() const override { return "Fake"; }
-  [[nodiscard]] Status launch(const mcke::OpContext&, const std::vector<mcke::Tensor>&,
-                              const std::vector<mcke::Tensor>&) override {
-    return mcke::UnimplementedError("FakeOp::launch is never called in host tests");
+  // A no-op launch that VALIDATES ITS ARGUMENTS. It used to return
+  // Unimplemented on the theory that host tests never launch anything -- true
+  // until GraphExecutor::run_async() existed, at which point it turned every
+  // executor test into a failure that said nothing about the executor.
+  //
+  // Checking the tensors here is worth more than returning OkStatus blindly: it
+  // asserts that the planner bound every input and output to real, distinct
+  // storage before the replay loop ever ran.
+  [[nodiscard]] Status launch(const mcke::OpContext& ctx,
+                              const std::vector<mcke::Tensor>& inputs,
+                              const std::vector<mcke::Tensor>& outputs) override {
+    for (const auto& t : inputs)
+      if (!t.defined()) return mcke::InternalError("FakeOp::launch: undefined input");
+    for (const auto& t : outputs)
+      if (!t.defined()) return mcke::InternalError("FakeOp::launch: undefined output");
+    if (outputs.empty()) return mcke::InternalError("FakeOp::launch: no outputs");
+    // An output must never alias an input: the graph is SSA, so a node writing
+    // over a tensor it is also reading would mean the planner reused a buffer
+    // whose live range had not ended.
+    for (const auto& i : inputs)
+      for (const auto& o : outputs)
+        if (i.data_ptr() && i.data_ptr() == o.data_ptr())
+          return mcke::InternalError("FakeOp::launch: output aliases an input");
+    (void)ctx;
+    return mcke::OkStatus();
   }
   [[nodiscard]] mcke::StatusOr<std::vector<Shape>> infer_shapes(
       const std::vector<Shape>& in) const override {
@@ -1305,6 +1329,136 @@ void test_memory_race_fuzz() {
   CHECK(naive_races > 0);
 }
 
+
+// =============================================================================
+//  GraphExecutor, end to end, on a machine with no GPU
+//
+//  This works because a host-only build's raw_device_malloc returns HOST memory
+//  and every rt::StreamHandle is null -- so plan() exercises its entire real
+//  code path (scheduling, happens-before, arena packing, stream/event creation,
+//  tensor binding) and run_async() walks the real replay loop.
+//
+//  Its honest limit, stated the way tests/test_stream_safety.cu states its own:
+//  with MCKE_WITH_CUDA=0 all "streams" are the same null stream, so there is no
+//  concurrency and this can NOT exercise a race. Race-freedom is proven by
+//  verify_no_buffer_races on the plan; this proves the plan is BUILDABLE and the
+//  replay loop is well-formed.
+// =============================================================================
+
+mcke::DeviceInfo host_device() {
+  mcke::DeviceInfo d;
+  d.name = "host (synthetic)";
+  d.sm_count = 1;
+  d.max_threads_per_sm = 1024;
+  d.max_threads_per_block = 1024;
+  d.memory_bus_width_bits = 256;
+  d.memory_clock_khz = 1000000;
+  return d;
+}
+
+void test_executor_end_to_end() {
+  std::printf("test_executor_end_to_end\n");
+  for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
+                  SchedulePolicy::kChainGreedy}) {
+    for (auto mp : {MemoryPolicy::kAllocPerTensor, MemoryPolicy::kReuseSameStream,
+                    MemoryPolicy::kReuseHappensBefore}) {
+      Graph g = build_diamond();
+      const TensorId in_id = 0;   // the graph input is always tensor 0 here
+      TensorId out_id = 0;
+      for (std::size_t t = 0; t < g.num_tensors(); ++t)
+        if (g.tensor(t).is_graph_output) out_id = static_cast<TensorId>(t);
+
+      mcke::RawDeviceAllocator alloc;
+      mcke::ExecutorOptions opts;
+      opts.schedule = sp;
+      opts.memory   = mp;
+      opts.num_streams = 2;
+      mcke::GraphExecutor ex(std::move(g), alloc, host_device(), opts);
+
+      // plan() runs verify_plan_ordering AND verify_no_buffer_races internally,
+      // so a successful plan is already a proof that the schedule realises every
+      // dependency and that no two overlapping buffers are unordered.
+      const Status planned = ex.plan();
+      CHECK(planned.ok());
+      if (!planned.ok()) { std::printf("    %s\n", planned.message().c_str()); continue; }
+
+      const mcke::ExecutionPlan& pl = ex.plan_ref();
+      CHECK(pl.peak_memory_bytes() > 0);
+      CHECK(pl.peak_memory_bytes() <= pl.naive_memory_bytes());
+      // kAllocPerTensor is the no-reuse baseline BY DEFINITION, so its arena must
+      // equal the naive figure exactly. If it ever does not, naive_bytes is being
+      // computed differently from the thing it is the baseline for.
+      if (mp == MemoryPolicy::kAllocPerTensor)
+        CHECK_EQ(pl.peak_memory_bytes(), pl.naive_memory_bytes());
+
+      // Fork/join is a FIXED per-iteration cost of the async contract, not
+      // something attributable to the schedule policy, so it is reported
+      // separately: K records + 2(K-1) waits.
+      const std::size_t k = pl.num_streams();
+      CHECK_EQ(pl.forkjoin_events(), k <= 1 ? 0u : k + 2 * (k - 1));
+      if (sp == SchedulePolicy::kSequential) {
+        CHECK_EQ(pl.num_streams(), 1u);
+        CHECK_EQ(pl.intra_events(), 0u);
+        CHECK_EQ(pl.forkjoin_events(), 0u);   // one stream needs no fork at all
+      }
+
+      std::vector<float> host(64 * 64, 1.5f);
+      CHECK(ex.set_input(in_id, host.data(), host.size() * sizeof(float)).ok());
+      // Three back-to-back run_async calls with no intervening sync: the exact
+      // pattern the header advertises, and the one the fork/join exists to make
+      // safe under buffer reuse.
+      for (int i = 0; i < 3; ++i) CHECK(ex.run_async().ok());
+      CHECK(ex.synchronize().ok());
+
+      auto out = ex.output(out_id);
+      CHECK(out.ok());
+      if (out.ok()) CHECK(out->defined());
+      // Asking for a non-output must fail rather than hand back an intermediate
+      // whose buffer is about to be reused by the next iteration.
+      CHECK(!ex.output(in_id).ok());
+    }
+  }
+}
+
+void test_executor_preconditions() {
+  std::printf("test_executor_preconditions\n");
+  Graph g = build_diamond();
+  mcke::RawDeviceAllocator alloc;
+  mcke::GraphExecutor ex(std::move(g), alloc, host_device(), mcke::ExecutorOptions{});
+  // Every entry point must refuse before plan(), rather than dereference an
+  // empty schedule.
+  float dummy = 0.0f;
+  CHECK(!ex.set_input(0, &dummy, sizeof(float)).ok());
+  CHECK(!ex.run_async().ok());
+  CHECK(!ex.synchronize().ok());
+  CHECK(!ex.output(0).ok());
+  CHECK(ex.plan().ok());
+  CHECK(ex.plan().ok());               // idempotent
+  CHECK(ex.run_async().ok());
+  CHECK(ex.synchronize().ok());
+  // set_input on a tensor that is not a declared graph input.
+  CHECK(!ex.set_input(1, &dummy, sizeof(float)).ok());
+}
+
+void test_executor_poison_and_arena_alignment() {
+  std::printf("test_executor_poison_and_arena_alignment\n");
+  Graph g = build_chain(6);
+  mcke::RawDeviceAllocator alloc;
+  mcke::ExecutorOptions opts;
+  opts.poison_buffers = true;          // fills the arena with a per-iteration pattern
+  opts.num_streams = 1;
+  mcke::GraphExecutor ex(std::move(g), alloc, host_device(), opts);
+  CHECK(ex.plan().ok());
+  for (int i = 0; i < 3; ++i) CHECK(ex.run_async().ok());
+  CHECK(ex.synchronize().ok());
+
+  // Every bound tensor must sit at a device-aligned address inside the arena.
+  const mcke::MemoryPlan& mp = ex.plan_ref().memory_plan();
+  for (std::size_t t = 0; t < mp.offset_of.size(); ++t)
+    if (mp.offset_of[t] != mcke::kNoOffset)
+      CHECK_EQ(mp.offset_of[t] % mcke::kDeviceAlignment, 0u);
+}
+
 }  // namespace
 
 int main() {
@@ -1334,6 +1488,9 @@ int main() {
   test_memory_single_stream_degeneracy();
   test_memory_peak_rises_with_streams();
   test_memory_race_fuzz();
+  test_executor_end_to_end();
+  test_executor_preconditions();
+  test_executor_poison_and_arena_alignment();
   std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

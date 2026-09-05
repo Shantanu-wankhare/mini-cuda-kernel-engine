@@ -24,6 +24,11 @@ trap 'rm -rf "$TMP"' EXIT
 
 CXX="${CXX:-clang++}"
 FLAGS=(-std=c++20 -Wall -Wextra -fsyntax-only -I include -I tests -I bench -I kernels -I "$FAKE" -DMCKE_WITH_CUDA=1)
+# Second pass with NVTX on. profiler.hpp's NvtxRange gains a member field under
+# MCKE_USE_NVTX, and src/graph/executor.cpp wraps every node launch in one, so
+# without this pass the entire Nsight-Systems path -- Phase 4's exit criterion --
+# would only ever be compiled for the first time on Explorer.
+NVTX_FLAGS=("${FLAGS[@]}" -DMCKE_USE_NVTX)
 
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
@@ -67,6 +72,12 @@ for f in "${targets[@]}"; do
     *)
       if "$CXX" "${FLAGS[@]}" "$f" 2>"$TMP/err"; then echo "  ok    $f"
       else echo "  FAIL  $f"; sed -n '1,20p' "$TMP/err"; fail=1; fi
+      # NVTX pass, host .cpp only: the ranges live in executor.cpp and the
+      # macro changes NvtxRange's layout, so this catches an ODR-shaped
+      # mistake and a missing include before Explorer does.
+      if ! "$CXX" "${NVTX_FLAGS[@]}" "$f" 2>"$TMP/errn"; then
+        echo "  FAIL  $f  (with -DMCKE_USE_NVTX)"; sed -n '1,20p' "$TMP/errn"; fail=1
+      fi
       ;;
   esac
 done

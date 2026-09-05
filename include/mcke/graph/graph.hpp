@@ -169,6 +169,16 @@ class Graph {
 
   [[nodiscard]] bool finalized() const noexcept { return finalized_; }
 
+  // Op::launch is non-const (an op may legitimately cache per-launch state), and
+  // GraphExecutor owns its Graph by value, so it needs mutable access to the
+  // ops. Deliberately narrow -- the Op pointer only, never a mutable Node -- so
+  // that nothing can alter the topology after finalize() and invalidate the
+  // preds/succs/depth/liveness derived from it.
+  [[nodiscard]] Op* node_op(NodeId n) {
+    assert(n < nodes_.size() && "Graph::node_op: NodeId out of range");
+    return nodes_[n].op.get();
+  }
+
   // --- Queries ------------------------------------------------------------
 
   [[nodiscard]] std::size_t num_nodes() const noexcept { return nodes_.size(); }

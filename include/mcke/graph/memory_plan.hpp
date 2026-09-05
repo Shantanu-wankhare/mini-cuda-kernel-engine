@@ -53,12 +53,55 @@
 #include <vector>
 
 #include "mcke/core/status.hpp"
-#include "mcke/graph/executor.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
 #include "mcke/graph/schedule.hpp"
 
 namespace mcke {
+
+// How the planner assigns device memory to intermediate tensors.
+//
+// Five arms rather than two, mirroring the three-policy ReusePolicy comparison
+// Phase 2 built for cross-stream allocator reuse -- and for the same reason: the
+// safe answer is only convincing next to the unsafe one.
+enum class MemoryPolicy : std::uint8_t {
+  // One allocator call per tensor. Simple, highest peak, and the only arm that
+  // exercises the Phase 2 pooling allocators per-tensor. Supplies naive_bytes_.
+  kAllocPerTensor,
+
+  // DELIBERATELY UNSAFE UNDER ANY PARALLEL SCHEDULE. Linear-scan reuse keyed on
+  // non-overlap of [def_pos, last_use_pos] in the topological order -- the
+  // obvious implementation, and wrong. Shipped on purpose so the trap is
+  // DEMONSTRATED rather than merely avoided: the host-side race checker flags it
+  // with no GPU, and the numerics gate fails it under kChainGreedy while passing
+  // it under kSequential. Same role as Phase 2's naive arm in
+  // test_stream_safety.cu and Phase 3's naive_uncoalesced row.
+  kReuseTopoNaive,
+
+  // Reuse only within one stream. Sound (same-stream issue order IS a
+  // happens-before edge) but conservative -- it declines every reuse that
+  // cross-stream events had already made safe.
+  kReuseSameStream,
+
+  // DEFAULT: sound and maximal. Reuse iff every access to the old tensor
+  // happens-before the producer of the new one, per graph/happens_before.hpp.
+  // Degenerates exactly to kReuseTopoNaive when there is one stream, which is
+  // asserted in a host test -- one planner, not two code paths.
+  kReuseHappensBefore,
+
+  // NOT AN ARM, and worth recording why rather than shipping a stub that always
+  // errors. The design review proposed a kReuseWithSyncEdges policy that ADDS
+  // synchronisation edges to create the happens-before relations that would make
+  // more reuse legal -- trading wall-clock for peak bytes.
+  //
+  // It cannot be a post-pass over a fixed schedule. Adding a sync edge changes
+  // the schedule, which changes happens-before, which changes what reuse is
+  // legal, which changes which edges you would want to add. Scheduling and
+  // allocation become a FIXPOINT, and doing it properly means co-designing them
+  // (the register-allocator/instruction-scheduler problem, where buffer sharing
+  // creates anti-dependences the scheduler must then honour). That is a real
+  // piece of work and it is out of scope for Phase 4; see DECISIONS.md.
+};
 
 inline constexpr std::size_t kNoOffset = static_cast<std::size_t>(-1);
 

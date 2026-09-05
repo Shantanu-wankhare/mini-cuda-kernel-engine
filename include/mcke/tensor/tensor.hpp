@@ -122,9 +122,22 @@ class Tensor {
   // Zero-copy view with a different shape. Fails if numel differs.
   [[nodiscard]] StatusOr<Tensor> reshape(Shape new_shape) const;
 
-  // Sub-view starting at `elem_offset` with `shape`. This is how the Phase-4
-  // memory planner hands two graph nodes disjoint slices of one buffer.
+  // Sub-view starting at `elem_offset` with `shape`.
   [[nodiscard]] StatusOr<Tensor> slice(dim_t elem_offset, Shape shape) const;
+
+  // Sub-view at a BYTE offset into an existing Storage. This is how the Phase-4
+  // memory planner hands two graph nodes disjoint slices of one arena.
+  //
+  // WHY A SEPARATE ENTRY POINT rather than reusing slice(): the planner works in
+  // BYTES (its offsets are kDeviceAlignment-aligned) while slice() takes an
+  // ELEMENT offset. Converting between them at every call site is exactly where
+  // an alignment bug hides -- and it would be an invisible one, because a
+  // misaligned slice does not fail, it just quietly breaks the coalescing
+  // assumption every Phase 3 kernel was tuned under. This validates the
+  // alignment once, here, and refuses rather than degrading.
+  [[nodiscard]] static StatusOr<Tensor> from_storage(std::shared_ptr<Storage> s,
+                                                     std::size_t byte_offset,
+                                                     Shape shape, DType dtype);
 
   [[nodiscard]] const Shape& shape() const noexcept { return shape_; }
   [[nodiscard]] DType dtype() const noexcept { return dtype_; }

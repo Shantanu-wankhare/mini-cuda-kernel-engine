@@ -69,6 +69,8 @@
 #include "mcke/runtime/cuda_check.hpp"
 
 #include <mutex>
+#include <utility>
+#include <vector>
 
 namespace mcke::kernels {
 namespace {
@@ -737,13 +739,34 @@ struct GemmLaunchSpec {
 // destructor calling cublasDestroy runs during program teardown, potentially
 // AFTER the CUDA context has been destroyed, which is a classic crash-at-exit.
 // The OS reclaims it either way. The leak is the safer of the two bugs.
-[[nodiscard]] StatusOr<cublasHandle_t> cublas_handle() {
-  static cublasHandle_t handle = nullptr;
-  static cublasStatus_t create_status = CUBLAS_STATUS_SUCCESS;
-  static std::once_flag once;
-  std::call_once(once, [] {
+[[nodiscard]] StatusOr<cublasHandle_t> cublas_handle_for(rt::StreamHandle stream) {
+  // ONE HANDLE PER STREAM, keyed on the stream itself.
+  //
+  // Phase 3 had a single static handle and that was safe, because Phase 3 only
+  // ever had one stream. PHASE 4 IS THE FIRST PHASE THAT CAN RUN TWO cuBLAS
+  // GEMMs CONCURRENTLY, and a cuBLAS handle carries internal workspace: two
+  // concurrent SGEMMs sharing one handle corrupt each other's results. NVIDIA's
+  // rule is one handle per concurrent stream.
+  //
+  // Keyed on rt::StreamHandle rather than a stream index because
+  // launch_gemm_f32's signature is frozen and receives a handle, not an index.
+  // The mutex is cheap insurance: our executor enqueues from one host thread, so
+  // it is uncontended, but a handle cache that silently required single-threaded
+  // access would be a trap for whoever adds a worker pool.
+  static std::mutex mu;
+  static std::vector<std::pair<rt::StreamHandle, cublasHandle_t>> cache;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    for (const auto& kv : cache)
+      if (kv.first == stream) return kv.second;
+  }
+
+  cublasHandle_t handle = nullptr;
+  cublasStatus_t create_status = CUBLAS_STATUS_SUCCESS;
+  {
     create_status = cublasCreate(&handle);
-    if (create_status != CUBLAS_STATUS_SUCCESS) return;
+    if (create_status != CUBLAS_STATUS_SUCCESS)
+      return rt::cublas_status(create_status, "cublasCreate", __FILE__, __LINE__);
     // PEDANTIC, not DEFAULT. Without this, cuBLAS is free to run SGEMM on TF32
     // tensor cores on sm_80+ (L4 / A100 / 5060 are all in CLAUDE.md's target
     // table) -- which would measure the ceiling row in DIFFERENT ARITHMETIC than
@@ -751,22 +774,32 @@ struct GemmLaunchSpec {
     // "% of measured FMA peak" above 100% against a denominator from a pure-f32
     // microbenchmark. RESULTS.md rule 5 exists to prevent exactly this.
     create_status = cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-    if (create_status != CUBLAS_STATUS_SUCCESS) return;
+    if (create_status != CUBLAS_STATUS_SUCCESS)
+      return rt::cublas_status(create_status, "cublasSetMathMode", __FILE__, __LINE__);
     // alpha/beta are passed as pointers to host stack locals below, which is
     // only legal in HOST pointer mode. It is the default, but the default is not
     // guaranteed across versions, so state it.
     create_status = cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
-  });
-  if (create_status != CUBLAS_STATUS_SUCCESS)
-    return rt::cublas_status(create_status, "cublasCreate/SetMathMode/SetPointerMode",
-                             __FILE__, __LINE__);
+    if (create_status != CUBLAS_STATUS_SUCCESS)
+      return rt::cublas_status(create_status, "cublasSetMathMode/SetPointerMode",
+                               __FILE__, __LINE__);
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    // Re-check: another thread may have created one for this stream while we
+    // were outside the lock. Keep theirs and leak ours -- see below on why
+    // cublasDestroy is never called here.
+    for (const auto& kv : cache)
+      if (kv.first == stream) return kv.second;
+    cache.emplace_back(stream, handle);
+  }
   return handle;
 }
 
 [[nodiscard]] Status launch_cublas(const float* a, const float* b, float* c,
                                    std::int64_t m, std::int64_t n, std::int64_t k,
                                    float alpha, float beta, rt::StreamHandle stream) {
-  auto h = cublas_handle();
+  auto h = cublas_handle_for(stream);
   MCKE_RETURN_IF_ERROR(h.status());
 
   // MANDATORY, not hygiene. rt::Stream creates every stream with

@@ -38,6 +38,7 @@ option(MCKE_BUILD_TESTS        "Build unit tests"                          ON)
 option(MCKE_BUILD_BENCH        "Build benchmark harnesses"                 ON)
 option(MCKE_CUDA_PTXAS_VERBOSE "Pass -Xptxas -v (register/smem usage)"     OFF)
 option(MCKE_CUDA_LINEINFO      "Pass -lineinfo (needed by Nsight Compute)" ON)
+option(MCKE_USE_NVTX           "Emit NVTX ranges for Nsight Systems timelines" OFF)
 set(MCKE_CUDA_ARCH "native" CACHE STRING
     "CUDA architectures: 'native', or e.g. '75;80;89;120'")
 
@@ -103,7 +104,8 @@ add_library(mcke_core STATIC
   src/graph/ops_bias_act.cpp
   src/graph/ops_reduce.cpp
   src/graph/ops_softmax.cpp
-  # Phase 4 still to add: src/graph/executor.cpp, src/tensor/tensor.cpp
+  src/graph/executor.cpp
+  src/tensor/tensor.cpp
 )
 target_include_directories(mcke_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mcke_core PUBLIC cxx_std_20)
@@ -120,6 +122,40 @@ if(MCKE_ENABLE_CUDA)
   target_link_libraries(mcke_core PUBLIC CUDA::cudart)
 else()
   target_compile_definitions(mcke_core PUBLIC MCKE_WITH_CUDA=0)
+endif()
+
+# -----------------------------------------------------------------------------
+# NVTX — named, coloured bands in an Nsight Systems timeline.
+#
+# Phase 4's exit criterion is an nsys timeline showing actual overlap (or
+# explaining its absence), and without NVTX that timeline is a wall of
+# `void mcke::kernels::gemm_regblock_kernel<...>` bars you cannot attribute to
+# graph nodes. profiler.hpp has had the NvtxRange class since Phase 0; nothing
+# ever defined the macro, so the whole path was dead code.
+#
+# PUBLIC IS MANDATORY, NOT STYLISTIC. NvtxRange gains a member field under this
+# macro, so a translation unit that disagrees about it sees a differently-sized
+# class — an ODR violation with no diagnostic.
+#
+# DO NOT LINK libnvToolsExt. NVTX v3 (`nvtx3/nvToolsExt.h`, CUDA >= 10) is
+# HEADER-ONLY: it lazily dlopen()s the injection library that nsys itself sets
+# via NVTX_INJECTION64_PATH. libnvToolsExt is the deprecated v2 library, still
+# shipped in CUDA 12.x and removed later — linking it is how a build breaks on a
+# toolkit upgrade.
+if(MCKE_ENABLE_CUDA AND MCKE_USE_NVTX)
+  target_compile_definitions(mcke_core PUBLIC MCKE_USE_NVTX)
+  if(TARGET CUDA::nvtx3)
+    # CUDA::nvtx3 is an INTERFACE (headers-only) target and first appears in
+    # CMake 3.25. Our floor is 3.24, so the fallback below is required rather
+    # than defensive.
+    target_link_libraries(mcke_core PUBLIC CUDA::nvtx3)
+  else()
+    target_include_directories(mcke_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+  endif()
+  target_link_libraries(mcke_core PUBLIC ${CMAKE_DL_LIBS})   # dlopen on older glibc
+  message(STATUS "MCKE: NVTX ranges ON (header-only nvtx3; no library linked)")
+elseif(MCKE_USE_NVTX)
+  message(WARNING "MCKE: MCKE_USE_NVTX ignored — CUDA is off")
 endif()
 
 # -----------------------------------------------------------------------------

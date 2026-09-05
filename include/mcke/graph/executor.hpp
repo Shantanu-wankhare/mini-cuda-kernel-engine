@@ -92,6 +92,7 @@
 #include "mcke/core/status.hpp"
 #include "mcke/graph/graph.hpp"
 #include "mcke/graph/happens_before.hpp"
+#include "mcke/graph/memory_plan.hpp"
 #include "mcke/graph/schedule.hpp"
 #include "mcke/memory/allocator.hpp"
 #include "mcke/profiling/profiler.hpp"
@@ -105,56 +106,41 @@ namespace mcke {
 // keeping it here would have made schedule.hpp depend on the executor it is
 // meant to be testable without.
 
-// How the planner assigns device memory to intermediate tensors.
-//
-// Five arms rather than two, mirroring the three-policy ReusePolicy comparison
-// Phase 2 built for cross-stream allocator reuse -- and for the same reason: the
-// safe answer is only convincing next to the unsafe one.
-enum class MemoryPolicy : std::uint8_t {
-  // One allocator call per tensor. Simple, highest peak, and the only arm that
-  // exercises the Phase 2 pooling allocators per-tensor. Supplies naive_bytes_.
-  kAllocPerTensor,
-
-  // DELIBERATELY UNSAFE UNDER ANY PARALLEL SCHEDULE. Linear-scan reuse keyed on
-  // non-overlap of [def_pos, last_use_pos] in the topological order -- the
-  // obvious implementation, and wrong. Shipped on purpose so the trap is
-  // DEMONSTRATED rather than merely avoided: the host-side race checker flags it
-  // with no GPU, and the numerics gate fails it under kChainGreedy while passing
-  // it under kSequential. Same role as Phase 2's naive arm in
-  // test_stream_safety.cu and Phase 3's naive_uncoalesced row.
-  kReuseTopoNaive,
-
-  // Reuse only within one stream. Sound (same-stream issue order IS a
-  // happens-before edge) but conservative -- it declines every reuse that
-  // cross-stream events had already made safe.
-  kReuseSameStream,
-
-  // DEFAULT: sound and maximal. Reuse iff every access to the old tensor
-  // happens-before the producer of the new one, per graph/happens_before.hpp.
-  // Degenerates exactly to kReuseTopoNaive when there is one stream, which is
-  // asserted in a host test -- one planner, not two code paths.
-  kReuseHappensBefore,
-
-  // NOT AN ARM, and worth recording why rather than shipping a stub that always
-  // errors. The design review proposed a kReuseWithSyncEdges policy that ADDS
-  // synchronisation edges to create the happens-before relations that would make
-  // more reuse legal -- trading wall-clock for peak bytes.
-  //
-  // It cannot be a post-pass over a fixed schedule. Adding a sync edge changes
-  // the schedule, which changes happens-before, which changes what reuse is
-  // legal, which changes which edges you would want to add. Scheduling and
-  // allocation become a FIXPOINT, and doing it properly means co-designing them
-  // (the register-allocator/instruction-scheduler problem, where buffer sharing
-  // creates anti-dependences the scheduler must then honour). That is a real
-  // piece of work and it is out of scope for Phase 4; see DECISIONS.md.
-};
+// MemoryPolicy moved to mcke/graph/memory_plan.hpp (included below), next to
+// plan_memory() -- same reasoning as SchedulePolicy: it is the planner's
+// vocabulary, and leaving it here made memory_plan.hpp include the executor
+// it is meant to be testable without, which is a circular include.
 
 struct ExecutorOptions {
   SchedulePolicy schedule     = SchedulePolicy::kChainGreedy;
   MemoryPolicy   memory       = MemoryPolicy::kReuseHappensBefore;
   int            num_streams  = 4;    // > graph width is pointless; measure it
   bool           profile      = false;// insert per-node timing events + NVTX ranges
+  int            profile_slots = 32;  // probe-ring depth; must be >= timed iterations
   bool           validate_numerics = false;  // compare against kSequential run
+  // Fill every planned buffer with a distinctive pattern before each run.
+  //
+  // The highest-value debug affordance in the phase for its size. An op that
+  // reads memory it did not write produces a DIFFERENT wrong answer per pattern,
+  // which separates "the scheduler races" from "an op reads uninitialised
+  // memory" -- different bugs with different fixes, and otherwise very hard to
+  // tell apart from a bit-identity failure alone.
+  bool           poison_buffers = false;
+  std::uint32_t  poison_pattern = 0x7F7F7F7Fu;   // a finite float, deliberately:
+                                                 // a NaN can be swallowed by a
+                                                 // max() and mask the very read
+                                                 // this is meant to expose
+};
+
+// Per-node timing, filled by collect_timings() after synchronize().
+struct NodeTiming {
+  NodeId        node = kInvalidNode;
+  std::string   name;
+  int           stream_idx = 0;
+  double        median_ms  = 0.0;
+  double        min_ms     = 0.0;
+  std::uint64_t flops = 0, bytes = 0;
+  int           samples = 0;
 };
 
 inline constexpr std::uint32_t kNoEvent = 0xFFFFFFFFu;
@@ -208,6 +194,17 @@ class ExecutionPlan {
     return wait_pool_;
   }
   [[nodiscard]] std::string describe() const;   // for PROJECT_LOG.md entries
+  [[nodiscard]] const StreamAssignment& stream_plan() const noexcept { return streams_plan_; }
+  [[nodiscard]] const MemoryPlan& memory_plan() const noexcept { return memory_plan_; }
+  // Intra-graph events only. The per-iteration fork/join adds
+  // num_streams + 2*(num_streams-1) more; they are reported separately because
+  // folding them together would misattribute a fixed overhead to the policy.
+  [[nodiscard]] std::size_t intra_events() const noexcept { return streams_plan_.num_events; }
+  [[nodiscard]] std::size_t intra_waits() const noexcept { return streams_plan_.waits_dedup; }
+  [[nodiscard]] std::size_t forkjoin_events() const noexcept {
+    const std::size_t k = streams_plan_.num_streams_used;
+    return k <= 1 ? 0 : k + 2 * (k - 1);
+  }
 
  private:
   friend class GraphExecutor;
@@ -215,6 +212,33 @@ class ExecutionPlan {
   std::vector<std::uint32_t>  wait_pool_;   // flattened wait lists; see ScheduledNode
   std::vector<rt::Stream>     streams_;
   std::vector<rt::Event>      events_;
+  // CROSS-ITERATION FORK/JOIN. run_async() advertises that the caller may
+  // enqueue iteration N+1 while N is still running -- and with buffer reuse and
+  // K>1 that is a race the INTRA-iteration events do not cover: iteration N+1's
+  // node on stream 1 can overwrite a reused buffer that iteration N's node on
+  // stream 0 is still reading. So every iteration opens with a fork (stream 0
+  // records, all others wait) and closes with a join (all others record, stream 0
+  // waits). Cost is K records + 2(K-1) waits per iteration and it must be
+  // reported SEPARATELY from the intra-graph event count, or the published
+  // events/iteration figure is simply wrong.
+  // A 0-or-1 vector rather than a plain member: rt::Event has no default
+  // constructor (it owns a cudaEvent_t, and a default-constructed one would be
+  // a null handle masquerading as an event), so a bare member would make
+  // ExecutionPlan itself non-default-constructible.
+  std::vector<rt::Event>      fork_event_;
+  std::vector<rt::Event>      join_events_;
+  // Per-node timing probes, opts.profile only. A RING: re-recording an event
+  // overwrites its timestamp, so a single pair per node would yield only the
+  // last iteration, and reading between iterations would need a host sync per
+  // iteration -- destroying the async model this phase exists to measure.
+  std::vector<rt::Event>      probes_;
+  int                         probe_slots_ = 0;
+  int                         iteration_   = 0;
+  // The sub-plans, kept so a bench can print exactly what ran.
+  StreamAssignment            streams_plan_;
+  MemoryPlan                  memory_plan_;
+  std::shared_ptr<Storage>    arena_;
+  std::vector<std::shared_ptr<Storage>> workspaces_;
   // Per-node input/output Tensor vectors, built ONCE here rather than per
   // launch. Op::launch takes const std::vector<Tensor>&, so constructing them
   // in the replay loop would cost two heap allocations and N shared_ptr
@@ -257,6 +281,12 @@ class GraphExecutor {
   }
 
   [[nodiscard]] StatusOr<Tensor> output(TensorId t) const;
+
+  // Read the probe ring. Call after synchronize(); opts.profile only.
+  [[nodiscard]] Status collect_timings();
+  [[nodiscard]] const std::vector<NodeTiming>& node_timings() const noexcept {
+    return node_timings_;
+  }
   [[nodiscard]] const ExecutionPlan& plan_ref() const { return plan_; }
   [[nodiscard]] const Profiler& profiler() const { return profiler_; }
 
@@ -281,6 +311,7 @@ class GraphExecutor {
   ExecutorOptions  opts_;
   ExecutionPlan    plan_;
   Profiler         profiler_;
+  std::vector<NodeTiming> node_timings_;
   bool             planned_ = false;
 };
 
