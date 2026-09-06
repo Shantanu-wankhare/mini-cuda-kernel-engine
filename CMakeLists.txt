@@ -299,10 +299,26 @@ if(MCKE_BUILD_TESTS)
   # milliseconds. Everything that needs a GPU (actual overlap, event timing, the
   # nsys timeline) is measurement; everything that needs to be CORRECT is here.
   #
-  # Links mcke_core, not the `mcke` umbrella: no device code, so this target
-  # builds and runs identically on the MacBook and on Explorer.
+  # Links the `mcke` UMBRELLA, not mcke_core alone -- unlike every other
+  # host-only test target, and for a subtler reason than test_stream_safety's
+  # (which needs it because it contains .cu device code directly).
+  #
+  # tests/test_graph_host.cpp constructs real Op subclasses (GemmOp, BiasActOp,
+  # ReduceOp, SoftmaxOp) to test infer_shapes()/cost() -- never launch(). But
+  # under the Itanium ABI, a class's vtable is emitted in the translation unit
+  # holding its first out-of-line virtual function, which for every one of
+  # these is launch(), defined in src/graph/ops_*.cpp. So merely CONSTRUCTING a
+  # GemmOp pulls in ops_gemm.cpp.o's vtable -- and with MCKE_WITH_CUDA=1,
+  # ops_gemm.cpp's launch() body genuinely calls kernels::launch_gemm_f32,
+  # which lives in mcke_kernels.
+  #
+  # This was invisible on macOS: MCKE_WITH_CUDA=0 makes every ops_*.cpp
+  # launch() body a plain `return UnimplementedError(...)` that never
+  # references a kernel launcher, so no undefined symbol existed to catch.
+  # Colab -- the first MCKE_WITH_CUDA=1 build of this target -- is what
+  # surfaced it: "undefined reference to launch_gemm_f32" et al. at link time.
   add_executable(mcke_test_graph_host tests/test_graph_host.cpp)
-  target_link_libraries(mcke_test_graph_host PRIVATE mcke_core)
+  target_link_libraries(mcke_test_graph_host PRIVATE mcke)
   target_include_directories(mcke_test_graph_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   add_test(NAME graph_host COMMAND mcke_test_graph_host)
 
