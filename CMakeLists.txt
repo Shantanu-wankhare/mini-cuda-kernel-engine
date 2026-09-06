@@ -191,8 +191,35 @@ if(MCKE_ENABLE_CUDA)
 endif()
 
 # Convenience umbrella target: link this from apps/tests/benches.
+#
+# LINK_GROUP:RESCAN, not a plain list -- and this is not decoration.
+# src/graph/ops_*.cpp (inside mcke_core) call straight into mcke_kernels'
+# launchers: GemmOp::launch -> kernels::launch_gemm_f32, etc. That is a REAL
+# link-time dependency of mcke_core ON mcke_kernels. But the only edge
+# actually DECLARED to CMake runs the other way -- `mcke_kernels PUBLIC
+# mcke_core`, above, which exists purely to propagate mcke_core's include
+# dirs / MCKE_WITH_CUDA define to kernel translation units, not because any
+# kernels/*.cu needs a mcke_core SYMBOL. CMake's link-line ordering has no
+# visibility into actual object-file symbol needs -- only into declared
+# target_link_libraries edges -- so it is free to place mcke_kernels before
+# mcke_core in the final link command (which satisfies the edge it DOES
+# know about). When it does, `ld` has already passed mcke_kernels.a by the
+# time it discovers mcke_core.a's undefined references to launch_gemm_f32
+# et al., and the link fails -- exactly the failure this project's first
+# CUDA build of the graph layer hit, on two targets (mcke_test_graph_host
+# and mcke_graph_bench) that construct real Op subclasses.
+#
+# LINK_GROUP:RESCAN (CMake >= 3.24, our stated floor) wraps both archives in
+# the --start-group/--end-group idiom, so the linker rescans the pair until
+# nothing is missing, regardless of which order CMake happens to emit them
+# in. This fixes the root cause once, for every consumer of `mcke`, instead
+# of patching each affected executable's link line individually.
 add_library(mcke INTERFACE)
-target_link_libraries(mcke INTERFACE mcke_core $<$<BOOL:${MCKE_ENABLE_CUDA}>:mcke_kernels>)
+if(MCKE_ENABLE_CUDA)
+  target_link_libraries(mcke INTERFACE $<LINK_GROUP:RESCAN,mcke_core,mcke_kernels>)
+else()
+  target_link_libraries(mcke INTERFACE mcke_core)
+endif()
 
 # -----------------------------------------------------------------------------
 # Tools
