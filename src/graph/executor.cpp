@@ -136,6 +136,35 @@ Status GraphExecutor::plan() {
     for (TensorId t : nd.outputs) plan_.node_outputs_[i].push_back(plan_.bound_[t]);
   }
 
+  // --- Graph-input byte ranges, sorted and merged, for the poison fill in
+  //     run_async() to skip. See input_byte_ranges_'s declaration for why this
+  //     must exist: set_input() writes these bytes ONCE, before the caller's
+  //     repeat loop begins, and poisoning the whole arena on every run_async()
+  //     call would clobber them -- which it used to do, silently, until a
+  //     Colab run of the numerics gate produced exactly the symptom that bug
+  //     would produce (every repeat computing from different garbage inputs)
+  //     and it was traced back here.
+  plan_.input_byte_ranges_.clear();
+  for (std::size_t t = 0; t < graph_.num_tensors(); ++t) {
+    if (mp.offset_of[t] == kNoOffset) continue;
+    if (!graph_.tensor(static_cast<TensorId>(t)).is_graph_input) continue;
+    plan_.input_byte_ranges_.emplace_back(mp.offset_of[t], mp.offset_of[t] + mp.bytes_of[t]);
+  }
+  std::sort(plan_.input_byte_ranges_.begin(), plan_.input_byte_ranges_.end());
+  // Merge adjacent/overlapping ranges so the poison loop below can treat gaps
+  // between them as simple half-open intervals with no double-counting.
+  {
+    std::vector<std::pair<std::size_t, std::size_t>> merged;
+    for (const auto& r : plan_.input_byte_ranges_) {
+      if (!merged.empty() && r.first <= merged.back().second) {
+        merged.back().second = std::max(merged.back().second, r.second);
+      } else {
+        merged.push_back(r);
+      }
+    }
+    plan_.input_byte_ranges_ = std::move(merged);
+  }
+
   plan_.peak_bytes_  = mp.arena_bytes;
   plan_.naive_bytes_ = mp.naive_bytes;
 
@@ -193,14 +222,41 @@ Status GraphExecutor::run_async() {
     // swallowed (fmaxf drops NaN on some paths; 0 * NaN does not).
     const std::uint32_t pat = opts_.poison_pattern +
                               static_cast<std::uint32_t>(plan_.iteration_) * 0x9E3779B9u;
-    std::vector<std::uint32_t> fill(plan_.arena_->bytes() / 4, pat);
+
+    // FILLS EVERYTHING EXCEPT GRAPH-INPUT BYTE RANGES.
+    //
+    // An earlier version poisoned the WHOLE arena unconditionally, on every
+    // call. That clobbers graph inputs, which set_input() writes exactly ONCE
+    // before the caller's repeat loop begins -- and both a real benchmark loop
+    // and the numerics gate assume inputs stay valid across many run_async()
+    // calls. The bug was found because it produces a specific, misleading
+    // symptom: with the pattern varying per iteration, each repeat computed
+    // from DIFFERENT garbage inputs, so every repeat's output differed --
+    // which looks EXACTLY like a data race, on a config (kSequential, single
+    // stream, no reuse) where a real race is structurally impossible. Skipping
+    // input ranges here is what makes poisoning trustworthy as a diagnostic
+    // rather than a source of the very symptom it exists to explain.
+    const std::size_t total = plan_.arena_->bytes();
+    std::size_t cursor = 0;
+    auto poison_range = [&](std::size_t begin, std::size_t end) -> Status {
+      if (begin >= end) return OkStatus();
+      const std::size_t n = end - begin;
+      std::vector<std::uint32_t> fill(n / 4, pat);
 #if MCKE_WITH_CUDA
-    MCKE_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(plan_.arena_->data(), fill.data(),
-                                              fill.size() * 4, cudaMemcpyHostToDevice,
-                                              plan_.streams_[0].native()));
+      MCKE_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          static_cast<char*>(plan_.arena_->data()) + begin, fill.data(), fill.size() * 4,
+          cudaMemcpyHostToDevice, plan_.streams_[0].native()));
 #else
-    std::memcpy(plan_.arena_->data(), fill.data(), fill.size() * 4);
+      std::memcpy(static_cast<char*>(plan_.arena_->data()) + begin, fill.data(),
+                 fill.size() * 4);
 #endif
+      return OkStatus();
+    };
+    for (const auto& r : plan_.input_byte_ranges_) {
+      MCKE_RETURN_IF_ERROR(poison_range(cursor, r.first));
+      cursor = r.second;   // skip straight over the protected input range
+    }
+    MCKE_RETURN_IF_ERROR(poison_range(cursor, total));
   }
 
   // --- FORK. Without it, iteration N+1's node on stream 1 can overwrite a
@@ -340,6 +396,27 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
   if (outs.empty()) return InvalidArgumentError("validate_numerics: graph has no outputs");
 
   const ExecutorOptions saved = opts_;
+  // FORCE poisoning on for the duration of the gate, regardless of what the
+  // caller set. This is the mechanism that turns "which byte is wrong" into
+  // "WHY is it wrong":
+  //
+  //   * poison_buffers fills every planned buffer with a distinctive,
+  //     obviously-not-real-data pattern before each run, and VARIES the
+  //     pattern per iteration (see run_async()). Real GELU/bias-add outputs
+  //     for this project's input ranges never land near 0x7F7F7F7F.
+  //   * If some op reads a byte it never wrote, the poison value (or
+  //     something derived from it) leaks straight into the output --
+  //     PROVING an uninitialised read, and because the pattern now varies
+  //     per iteration, it also makes such a bug show up as run-to-run
+  //     variance WITHIN one config (caught by the self-consistency check
+  //     below), not just as a mismatch against golden.
+  //   * If instead the output is some OTHER wrong-but-plausible value, the
+  //     bug is a genuine data race or logic error, not an uninitialised
+  //     read -- a different diagnosis with a different fix.
+  //
+  // Free during correctness validation (never during timed benchmarking,
+  // where poisoning is opt-in), so there is no reason not to force it here.
+  opts_.poison_buffers = true;
 
   // Runs one configuration `repeats` times, returning the outputs of the FIRST
   // run and failing if any later run disagrees with it.

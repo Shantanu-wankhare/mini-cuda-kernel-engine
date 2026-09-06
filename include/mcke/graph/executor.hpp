@@ -261,6 +261,12 @@ class ExecutionPlan {
   MemoryPlan                  memory_plan_;
   std::shared_ptr<Storage>    arena_;
   std::vector<std::shared_ptr<Storage>> workspaces_;
+  // Byte ranges within the arena that back GRAPH INPUTS, sorted and merged.
+  // Poisoning must never touch these: set_input() writes them ONCE, before the
+  // caller's repeat loop begins, and both a real benchmark loop and the
+  // numerics gate assume they stay valid across many run_async() calls. See
+  // the long comment on the poison fill in run_async() for how this was found.
+  std::vector<std::pair<std::size_t, std::size_t>> input_byte_ranges_;
   // Per-node input/output Tensor vectors, built ONCE here rather than per
   // launch. Op::launch takes const std::vector<Tensor>&, so constructing them
   // in the replay loop would cost two heap allocations and N shared_ptr
