@@ -309,6 +309,11 @@ class GraphExecutor {
   }
 
   [[nodiscard]] StatusOr<Tensor> output(TensorId t) const;
+  // Internal: reads ANY bound tensor, not just declared graph outputs. Used
+  // only by validate_numerics()'s intermediate-tensor diagnostic, which is
+  // safe only under kAllocPerTensor -- see the .cpp for why. Not part of the
+  // public read surface; output() remains the API for ordinary callers.
+  [[nodiscard]] StatusOr<Tensor> any_bound_tensor(TensorId t) const;
 
   // Read the probe ring. Call after synchronize(); opts.profile only.
   [[nodiscard]] Status collect_timings();

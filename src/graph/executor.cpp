@@ -198,6 +198,26 @@ Status GraphExecutor::set_input(TensorId t, const void* host_data, std::size_t b
   // AFTER these copies and every other stream waits on it.
   const rt::StreamHandle s0 = plan_.streams_.empty() ? rt::StreamHandle{}
                                                      : plan_.streams_[0].native();
+  // THE DEVICE COPY MUST HAPPEN BEFORE THE CACHE IS TOUCHED.
+  //
+  // validate_numerics()'s replay loop calls this function as
+  // set_input(kv.first, kv.second.data(), kv.second.size()) -- so `host_data`
+  // routinely POINTS INTO input_cache_'s OWN BUFFER for that tensor. An
+  // earlier version updated the cache FIRST: `kv.second = std::move(copy)`
+  // reassigns that vector, which FREES its old backing buffer -- the exact
+  // buffer `host_data` (still the original, unchanged parameter) points into.
+  // The copy_from_host call that followed then read through a DANGLING
+  // pointer, and the "wrong" bytes it copied were whatever heap garbage
+  // happened to reoccupy that freed block -- not a race, not the GPU, not the
+  // scheduler. This is exactly why the corruption looked plausible-but-wrong
+  // rather than looking like poison: it was real freed-heap content, read
+  // after use.
+  //
+  // Doing the copy first means `host_data` is read while it is unambiguously
+  // the caller's own valid buffer (their contract to uphold for the duration
+  // of this call, same as any copy_from_host caller), and the cache is only
+  // ever mutated afterward.
+  MCKE_RETURN_IF_ERROR(plan_.bound_[t].copy_from_host(host_data, bytes, s0));
   if (opts_.validate_numerics) {
     // The gate re-plans between configurations, which rebinds every tensor, so
     // it must be able to re-feed byte-identical inputs afterwards.
@@ -207,7 +227,7 @@ Status GraphExecutor::set_input(TensorId t, const void* host_data, std::size_t b
       if (kv.first == t) { kv.second = std::move(copy); copy.clear(); break; }
     if (!copy.empty()) input_cache_.emplace_back(t, std::move(copy));
   }
-  return plan_.bound_[t].copy_from_host(host_data, bytes, s0);
+  return OkStatus();
 }
 
 Status GraphExecutor::run_async() {
@@ -328,6 +348,19 @@ StatusOr<Tensor> GraphExecutor::output(TensorId t) const {
   return plan_.bound_[t];
 }
 
+// Reads ANY bound tensor, not just declared graph outputs. Used exclusively by
+// validate_numerics()'s intermediate-tensor diagnostic under kAllocPerTensor,
+// where every tensor has its own never-reused buffer and is therefore safe to
+// read after full execution. Not exposed in the header: this is an internal
+// diagnostic helper, not part of the public read surface.
+StatusOr<Tensor> GraphExecutor::any_bound_tensor(TensorId t) const {
+  if (!planned_) return FailedPreconditionError("any_bound_tensor: call plan() first");
+  if (t >= plan_.bound_.size() || !plan_.bound_[t].defined())
+    return InvalidArgumentError("any_bound_tensor: tensor " + std::to_string(t) +
+                                " has no buffer in this plan");
+  return plan_.bound_[t];
+}
+
 Status GraphExecutor::collect_timings() {
   node_timings_.clear();
   if (!opts_.profile) return OkStatus();
@@ -418,9 +451,28 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
   // where poisoning is opt-in), so there is no reason not to force it here.
   opts_.poison_buffers = true;
 
+  // Under kAllocPerTensor every tensor has its own NEVER-REUSED buffer, so it
+  // is the only policy where reading an INTERMEDIATE after full execution is
+  // meaningful -- under any reuse policy that buffer may already belong to a
+  // LATER tensor by the time we read it. So the diagnostic "which of the 4
+  // chained nodes first diverges" is only asked when mp == kAllocPerTensor;
+  // every other policy still compares declared outputs only, exactly as before.
+  auto tensors_to_check = [&](MemoryPolicy mp) {
+    std::vector<TensorId> ids;
+    if (mp == MemoryPolicy::kAllocPerTensor) {
+      const MemoryPlan& mplan = plan_.memory_plan_;
+      for (std::size_t t = 0; t < mplan.offset_of.size(); ++t)
+        if (mplan.offset_of[t] != kNoOffset) ids.push_back(static_cast<TensorId>(t));
+    } else {
+      ids = outs;
+    }
+    return ids;
+  };
+
   // Runs one configuration `repeats` times, returning the outputs of the FIRST
   // run and failing if any later run disagrees with it.
   auto run_config = [&](SchedulePolicy sp, MemoryPolicy mp, int n,
+                        std::vector<TensorId>* ids_out,
                         std::vector<std::vector<char>>* first,
                         std::string* err) -> Status {
     opts_.schedule = sp;
@@ -429,20 +481,22 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
     MCKE_RETURN_IF_ERROR(plan());
     for (const auto& kv : input_cache_)
       MCKE_RETURN_IF_ERROR(set_input(kv.first, kv.second.data(), kv.second.size()));
+    const std::vector<TensorId> ids = tensors_to_check(mp);
+    *ids_out = ids;
 
     for (int r = 0; r < n; ++r) {
       MCKE_RETURN_IF_ERROR(run_async());
       MCKE_RETURN_IF_ERROR(synchronize());
-      std::vector<std::vector<char>> got(outs.size());
-      for (std::size_t k = 0; k < outs.size(); ++k) {
-        MCKE_ASSIGN_OR_RETURN(Tensor t, output(outs[k]));
+      std::vector<std::vector<char>> got(ids.size());
+      for (std::size_t k = 0; k < ids.size(); ++k) {
+        MCKE_ASSIGN_OR_RETURN(Tensor t, any_bound_tensor(ids[k]));
         got[k].resize(t.nbytes());
         MCKE_RETURN_IF_ERROR(t.copy_to_host(got[k].data(), got[k].size(),
                                             plan_.streams_[0].native()));
       }
       MCKE_RETURN_IF_ERROR(synchronize());
       if (r == 0) { *first = std::move(got); continue; }
-      for (std::size_t k = 0; k < outs.size(); ++k) {
+      for (std::size_t k = 0; k < ids.size(); ++k) {
         const std::size_t off = first_bit_mismatch((*first)[k].data(), got[k].data(),
                                                    got[k].size());
         if (off < got[k].size()) {
@@ -451,7 +505,7 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
           std::memcpy(&wb, got[k].data() + off, 4);
           std::ostringstream os;
           os << "run-to-run variance within one configuration at repeat " << r
-             << ", tensor " << outs[k] << " word " << (off / 4) << ": 0x" << std::hex
+             << ", tensor " << ids[k] << " word " << (off / 4) << ": 0x" << std::hex
              << wa << " vs 0x" << wb << std::dec;
           *err = os.str();
           return OkStatus();   // reported through err, not as a Status failure
@@ -464,10 +518,11 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
   NumericsResult res;
   res.repeats = repeats;
 
+  std::vector<TensorId> golden_ids;
   std::vector<std::vector<char>> golden;
   std::string err;
   const Status g = run_config(SchedulePolicy::kSequential, MemoryPolicy::kAllocPerTensor,
-                              repeats, &golden, &err);
+                              repeats, &golden_ids, &golden, &err);
   if (!g.ok()) { opts_ = saved; return g; }
   if (!err.empty()) {
     opts_ = saved;
@@ -476,13 +531,26 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
   }
   for (const auto& b : golden) res.elements_compared += b.size() / 4;
 
+  // golden_ids is EVERY tensor with a buffer (kAllocPerTensor), but a config
+  // under a REUSE policy only captures the DECLARED OUTPUTS (see
+  // tensors_to_check) -- a strictly smaller, differently-ORDERED set. Indexing
+  // both lists by the same raw position k, as an earlier version of this loop
+  // did, silently compares UNRELATED tensors the moment mp != kAllocPerTensor
+  // (e.g. golden[0] is the graph input while got[0] is the first declared
+  // output) -- caught by this very diagnostic once it started checking
+  // configs beyond the first. Map by TensorId instead, which is correct
+  // regardless of which subset either side captured.
+  std::vector<const std::vector<char>*> golden_by_id(graph_.num_tensors(), nullptr);
+  for (std::size_t j = 0; j < golden_ids.size(); ++j) golden_by_id[golden_ids[j]] = &golden[j];
+
   for (auto sp : {SchedulePolicy::kSequential, SchedulePolicy::kLevelParallel,
                   SchedulePolicy::kChainGreedy}) {
     for (auto mp : {MemoryPolicy::kAllocPerTensor, MemoryPolicy::kReuseSameStream,
                     MemoryPolicy::kReuseHappensBefore}) {
+      std::vector<TensorId> ids;
       std::vector<std::vector<char>> got;
       err.clear();
-      const Status s = run_config(sp, mp, repeats, &got, &err);
+      const Status s = run_config(sp, mp, repeats, &ids, &got, &err);
       if (!s.ok()) { opts_ = saved; return s; }
       ++res.configs_compared;
       const char* spn = (sp == SchedulePolicy::kSequential) ? "sequential"
@@ -496,24 +564,38 @@ StatusOr<NumericsResult> GraphExecutor::validate_numerics(int repeats) {
         res.detail = std::string(spn) + " x " + mpn + ": " + err;
         return res;
       }
-      for (std::size_t k = 0; k < outs.size(); ++k) {
-        const std::size_t off = first_bit_mismatch(golden[k].data(), got[k].data(),
-                                                   got[k].size());
+      // DOES NOT STOP AT THE FIRST MISMATCH. When mp == kAllocPerTensor this
+      // walks every intermediate too, so the report can say WHICH of the
+      // chained nodes first diverges rather than only the final output four
+      // hops downstream -- the single most useful thing this diagnostic can
+      // say about a bug that looks structurally impossible under kSequential.
+      std::vector<std::string> mismatches;
+      for (std::size_t k = 0; k < ids.size(); ++k) {
+        const std::vector<char>* gold = golden_by_id[ids[k]];
+        if (!gold) continue;   // golden had no buffer for this tensor (dead node)
+        const std::size_t off = first_bit_mismatch(gold->data(), got[k].data(), got[k].size());
         if (off < got[k].size()) {
           std::uint32_t wa = 0, wb = 0;
           float fa = 0, fb = 0;
-          std::memcpy(&wa, golden[k].data() + off, 4);
+          std::memcpy(&wa, gold->data() + off, 4);
           std::memcpy(&wb, got[k].data() + off, 4);
           std::memcpy(&fa, &wa, 4);
           std::memcpy(&fb, &wb, 4);
           std::ostringstream os;
-          os << spn << " x " << mpn << " differs from golden at tensor " << outs[k]
-             << " word " << (off / 4) << ": golden 0x" << std::hex << wa << " (" << std::dec
-             << fa << ") vs 0x" << std::hex << wb << " (" << std::dec << fb << ")";
-          opts_ = saved;
-          res.detail = os.str();
-          return res;
+          os << "tensor " << ids[k] << " ('" << graph_.tensor(ids[k]).name << "') word "
+             << (off / 4) << ": golden 0x" << std::hex << wa << " (" << std::dec << fa
+             << ") vs 0x" << std::hex << wb << " (" << std::dec << fb << ")";
+          mismatches.push_back(os.str());
         }
+      }
+      if (!mismatches.empty()) {
+        std::ostringstream os;
+        os << spn << " x " << mpn << " differs from golden in " << mismatches.size()
+           << "/" << ids.size() << " tensor(s):";
+        for (const auto& m : mismatches) os << "\n    " << m;
+        opts_ = saved;
+        res.detail = os.str();
+        return res;
       }
     }
   }
