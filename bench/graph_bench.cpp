@@ -32,8 +32,16 @@
 //                     capped to 40 blocks. Phase 3a measured that kernel at
 //                     88.7% of the measured DRAM bandwidth at ~6% occupancy.
 //
-//  D3's prediction, recorded before the run: 235.4/208.7 = ~1.13x is a rough
-//  CEILING ESTIMATE, NOT A FLOOR. That arithmetic assumes two concurrent
+//  D3's prediction, recorded before the run: ~1.13x as a rough CEILING ESTIMATE,
+//  NOT A FLOOR.
+//
+//  CORRECTED AFTER THE RUN (2026-09-10): that 1.13x came from 235.4/208.7,
+//  reading the vw1 row of section 3a's starvation sweep. Wrong row --
+//  BiasActOp is constructed with vector_width = 0 ("pick the widest legal"),
+//  which at 4096 columns resolves to vw4, whose starved figure is 224.6 GB/s.
+//  The correct estimate is 235.4/224.6 = ~1.048x. Measured: 1.01x. Right in
+//  kind, loose by ~2.6x in the headroom it claimed -- using a kernel's measured
+//  bandwidth means using the configuration that actually runs. That arithmetic assumes two concurrent
 //  kernels share DRAM cleanly and additively -- which is exactly the assumption
 //  under test, so treating it as a lower bound would be circular. BELOW 1.0x is
 //  a live possibility: two interleaved streams can thrash L2 or degrade the

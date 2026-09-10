@@ -219,10 +219,23 @@ see `PROJECT_LOG.md` Sessions 7 (2026-09-07) and 8 (2026-09-10) and
   shape is a smooth decay from ~1.45× to ~1.0× with a genuine, reproducible
   **noisy bump localized to 0.45–0.8 waves** (confirmed across 4 runs on 2
   different Colab VMs) — mechanism and full writeup in `RESULTS.md` §4.
-- Remaining before Phase 4 is fully closed: a clean `nsys` timeline on the
-  fixed binary (the one generated during Session 7 profiled the *pre-fix*
-  binary and is flagged non-compliant/profiling-only — see `PROJECT_LOG.md`
-  Session 7 "What's next"); no consolidated Phase 4 exit write-up yet (Phase 3
-  got one in §5b, Phase 4 hasn't — though Session 8's wave-sweep section is
-  most of the substance it would need). All timing/correctness numbers in
-  `RESULTS.md` §4 are exact and current as of Session 8.
+- **Phase 4 exit write-up is done**: `RESULTS.md` §5c, matching §5b's shape —
+  what overlap bought (1.94× on `fanout4x4`, ~1.00× on the other four, which was
+  the recorded prediction), the corrected event-count claim, the
+  memory-vs-parallelism tension, the design tradeoffs with rejected
+  alternatives, and the open items. `LEARNING_LOG.md` has the Phase 4
+  end-of-phase Q&A (Phases 1–3 still have none).
+- Remaining before Phase 4 is fully closed: **only** a clean `nsys` timeline on
+  the fixed binary — the one generated during Session 7 profiled the *pre-fix*
+  binary and is flagged non-compliant/profiling-only. Note the ROADMAP's
+  criterion is "showing actual overlap **or explaining its absence**", and the
+  absence on four of five graphs is already explained and quantified
+  (`launch_bound_ratio ≤ 0.029` — every run is device-bound by ≥34×), so what
+  the timeline adds is direct visual confirmation of `fanout4x4`'s 1.94×, which
+  is currently inferred from wall-clock plus event counts.
+- All timing/correctness numbers in `RESULTS.md` §4 are exact and current as of
+  Session 8. Two write-up errors were corrected in Session 9: the wave-sweep
+  bump is in **3 of 4 runs** (not all four — run 1 is the plain monotone curve),
+  and `diamond_starved`'s ceiling estimate was computed from §3a's **vw1** row
+  when `BiasActOp` actually runs **vw4**, making it 235.4/224.6 = ~1.048×, not
+  ~1.13×.

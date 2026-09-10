@@ -1134,3 +1134,92 @@ cell's bracket number or checkmark color.
   remaining is consolidating the design-tradeoff narrative already discussed
   live with the owner (SSA-DAG vs flat list, event vs stream-sync, the three
   schedule policies, liveness-based reuse).
+
+---
+
+## 2026-09-10 — Session 9: Phase 4 exit write-up, and two corrections to my own prose
+
+**Environment:** macOS host-only (no GPU). No benchmarks run; this session was
+documentation and review of numbers already measured in Sessions 7–8.
+
+### What was built
+
+- **`RESULTS.md` §5c — the Phase 4 exit write-up**, matching §5b's shape for
+  Phase 3. Covers: speedup per policy per graph and why four of five graphs
+  measured ~1.00×; the corrected event-count claim; the memory-vs-parallelism
+  tension; the design decisions with their rejected alternatives (SSA-DAG vs
+  declared edge list, events vs stream-synchronize, plan-time arena vs runtime
+  allocate/deallocate, three schedule policies); the topological-liveness
+  correctness result; and the open items.
+- **`LEARNING_LOG.md` — Phase 4 end-of-phase Q&A** (5 questions). Noted in it
+  that Phases 1–3 still have none.
+- **`CLAUDE.md` §8** updated: the exit write-up is no longer outstanding, so the
+  only item left before Phase 4 closes is the `nsys` regeneration.
+
+### What was learned — two errors in my own earlier prose, both found by re-reading against the data
+
+1. **The wave-sweep bump is in 3 of 4 runs, not all four.** §4 claimed it was
+   "visible across all four runs, even though the exact value varies." The table
+   does not support that. Interpolating the smooth decay between 0.20 waves
+   (1.35×) and 1.80 waves (1.02×) predicts ~1.22× at 0.45 waves and ~1.10× at
+   0.80; run 1's 1.13× / 1.09× sit at or just below that line, i.e. **run 1 is
+   the monotone curve the original prediction described** — no bump at all. The
+   bump appears in runs 2 and 3 (at N=1024) and run 4 (at N=768), always at
+   exactly one of the two adjacent points, never both.
+
+   This is a *weaker* claim about universality and a **stronger** one about
+   mechanism: a bump that migrates between adjacent sample points and sometimes
+   fails to appear is much better evidence for launch-order/residency
+   sensitivity than one reproducing at a fixed N would be. A fixed bump would
+   point at something structural about that block count; a mobile, intermittent
+   one is what jitter looks like.
+
+2. **`diamond_starved`'s ceiling estimate used the wrong row of §3a.**
+   `bench/graph_bench.cpp`'s banner computed ~1.13× from 235.4/208.7 — but
+   208.7 GB/s is §3a's **vw1** starved figure, and `BiasActOp` is constructed
+   with `vector_width = 0`, meaning "pick the widest legal width", which at 4096
+   columns resolves to **vw4**. The vw4 starved figure is 224.6 GB/s, so the
+   correct estimate is **235.4/224.6 = ~1.048×**. The measured 1.01× therefore
+   sits within 4% of the ceiling rather than 12% below a looser bound.
+
+   Lesson worth keeping: using a kernel's *measured* bandwidth as a denominator
+   means using the measurement for **the configuration that actually runs**. The
+   prediction was right in kind and loose by ~2.6× in the headroom it claimed.
+   Corrected in both `RESULTS.md` §5c and the bench banner, with the wrong
+   version named.
+
+The framing that made this recoverable: D3's prediction was deliberately
+recorded as a **ceiling estimate and not a floor**, because 235.4/224.6 assumes
+two concurrent kernels share DRAM cleanly and additively — the very assumption
+under test. Had it been written as a lower bound, the correct measured result
+(1.01×) would have read as a failure.
+
+### Design decisions taken
+
+None new — this session wrote up decisions already taken and discussed live in
+Sessions 5–8. The one judgement call: the future-dated Session 8 entry
+(2026-09-10, written while the clock read 2026-09-09) was **left alone** rather
+than "fixed" to 09-09, since the date has now rolled over to match and changing
+it would substitute one guess for another about when a Colab session spanning
+timezones actually ran.
+
+### Benchmarks run
+
+None. Both host suites re-verified unchanged on this machine:
+`test_host_core` 58,856 checks / 0 failures, `test_graph_host` 86,809 / 0
+failures (145,665 combined). `scripts/typecheck_cuda.sh` clean on all TUs
+including the NVTX pass.
+
+### What's next
+
+1. **Regenerate `reports/nsys_phase4.nsys-rep` on the fixed binary** — the only
+   thing still outstanding for Phase 4. Colab or Explorer; build with
+   `-DMCKE_USE_NVTX=ON`, then
+   `nsys profile --trace=cuda,nvtx --only=fanout4x4 --iters=5 --warmup=2`.
+   Delete the stale pre-fix report so it cannot be mistaken for current.
+   `fanout4x4` is the graph to profile: it is the only one with real overlap to
+   show (1.94×).
+2. Optionally, Phase 1–3 end-of-phase Q&A entries in `LEARNING_LOG.md`, which
+   were skipped at the time.
+3. Then Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
+   profiling/telemetry deliverable.

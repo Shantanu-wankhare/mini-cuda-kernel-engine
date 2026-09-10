@@ -1106,10 +1106,27 @@ doesn't matter; at N=1536+ each single GEMM already dominates a full wave on
 its own, so the marginal overlap is small and stable regardless of order.
 
 **Conclusion:** the original prediction's *wording* ("falls monotonically")
-was wrong — the real curve has a genuine, reproducible **noisy bump** in the
-0.45–0.8 wave range (visible across all four runs, even though the exact
-value varies) sitting on top of an otherwise smooth decay from ~1.45× (0.05
-waves) to ~1.0× (≥1.8 waves). Hypothesis (a) (concurrency raises per-kernel
+was wrong — the real curve has a **noisy bump** in the 0.45–0.8 wave range
+sitting on top of an otherwise smooth decay from ~1.45× (0.05 waves) to ~1.0×
+(≥1.8 waves).
+
+*Stated precisely, because an earlier version of this paragraph said the bump
+was "visible across all four runs" and the table does not support that.* The
+bump appears in **3 of 4 runs**, at **exactly one of the two adjacent sample
+points, never both** (runs 2 and 3 at N=1024; run 4 at N=768), and is
+**absent from run 1**: interpolating the smooth decay between 0.20 waves
+(1.35×) and 1.80 waves (1.02×) predicts roughly 1.22× at 0.45 waves and 1.10×
+at 0.80, and run 1's 1.13× / 1.09× sit at or just below that line — i.e. run 1
+*is* the monotone curve the original prediction described.
+
+That is a weaker claim about universality and a **stronger** one about
+mechanism. A bump that migrates between adjacent sample points and sometimes
+fails to appear at all is much better evidence for launch-order/residency
+sensitivity than a bump reproducing at a fixed N would be: a fixed bump would
+point at something structural about that specific block count, whereas a
+mobile, intermittent one is what jitter looks like.
+
+Hypothesis (a) (concurrency raises per-kernel
 efficiency in the sub-wave regime) is real but small (~16%) and does not
 alone explain any single run's peak; hypothesis (b) (the sequential
 measurement itself was anomalous) explains the specific 2026-09-07 data
@@ -1248,3 +1265,258 @@ required:**
 remaining gap is explained and cross-validated on two architectures; its exact
 *cause*, and how much of it an L2 swizzle would close, are not — and are not
 being guessed at here rather than measured.
+
+---
+
+### 5c. Phase 4 exit writeup: what the graph engine bought, and what it cost
+
+`docs/ROADMAP.md`'s Phase-4 exit criteria are: speedup per policy per graph;
+events recorded per iteration; peak memory with and without liveness reuse; and
+an `nsys` timeline showing actual overlap **or explaining its absence**. Three of
+the four are met and tabulated in §4. The fourth is explained below and
+partially open.
+
+#### The headline: overlap paid off on exactly one of five graphs, and that is the result
+
+| Graph | best speedup | why |
+|---|---|---|
+| `fanout4x4` | **1.94×** (chain_greedy) | four independent branches, each deliberately starved to 10 blocks — genuine idle SMs to interleave into |
+| `diamond_gemm_2048` | 1.01× | each GEMM alone is 3.2 waves; the machine is already full |
+| `diamond_starved` | 1.01× | SM-idle but **bandwidth**-saturated |
+| `transformer_block` | 0.99× | width 1 — there is nothing to overlap, and events cost a little |
+| `chain16` | 0.97× | width 1, same |
+
+The prediction recorded before any of this ran was *"overlap helps only if the
+individual kernels leave SMs idle. If B and C each already saturate the GPU,
+expect ~1.0× — and that non-result, with the timeline showing why, is a
+legitimate finding."* That is what happened, four times out of five.
+
+**`diamond_starved` is the row that carries the phase.** Its branches are
+`bias_act` kernels capped to 40 blocks — roughly 6% occupancy, so by every
+occupancy metric the machine is idle. It still measured **1.01×**. Phase 3a had
+already measured that same starved kernel, at the same 8192×4096 shape, at
+**224.6 GB/s — 95.4% of the 235.4 GB/s measured DRAM ceiling**. So the SMs were
+idle and the *memory system was not*, and overlap had nothing left to win.
+
+> **Correction to the prediction recorded in `bench/graph_bench.cpp`.** That
+> banner computed the ceiling as 235.4/208.7 = ~1.13×, reading the **vw1** row
+> of §3a's starvation sweep. That is the wrong row: `BiasActOp` is constructed
+> with `vector_width = 0`, which means "pick the widest legal width", and at
+> 4096 columns that resolves to **vw4** — whose starved figure is 224.6 GB/s,
+> not 208.7. The correct ceiling estimate is therefore **235.4/224.6 = 1.048×**,
+> and the measured 1.01× sits within 4% of it rather than 12% below a looser
+> bound. The prediction was right in kind and loose by a factor of ~2.6 in the
+> headroom it claimed; using a kernel's *measured* bandwidth means using the
+> configuration that actually runs.
+
+Set against `fanout4x4`'s 1.94×, the pair says the thing neither row says alone:
+**"SMs are idle" is not "the machine is idle."** Overlap pays only when the
+*bottleneck* resource is idle, and occupancy does not tell you which resource
+that is. This is the same lesson Phase 3d reached from the other direction, when
+`tiled_smem` at 100% occupancy lost to `tiled_regblock` at 50%.
+
+On D3's recorded prediction: the banner deliberately framed its number as a
+**ceiling estimate and not a floor**, on the grounds that the arithmetic assumes
+two concurrent kernels share DRAM cleanly and additively — which was the
+assumption under test. That framing is what makes the measured 1.01× readable as
+a confirmation rather than a miss; had ~1.13× (or the corrected ~1.048×) been
+recorded as a lower bound, a correct result would have looked like a failure.
+The band {≈ceiling, ≈1.0×, <1.0×} was stated in advance and 1.01× is in it.
+
+#### Event counts: the header's central claim, verified and narrowed
+
+`executor.hpp` originally claimed `kChainGreedy` "minimises event count." That is
+not defensible as stated, and the corrected version — asserted as exact integers
+by `tests/test_graph_host.cpp`, with no GPU — is:
+
+| Graph | width | sequential | level_parallel | chain_greedy |
+|---|---|---|---|---|
+| diamond | 2 | 0 / 0 | 2 rec / 2 wait | 2 / 2 |
+| chain16 | 1 | 0 / 0 | 0 / 0 | 0 / 0 |
+| fanout4×4 | 4 | 0 / 0 | **12 / 36** | **0 / 0** |
+
+**Chain-greedy's event count scales with the number of cross-stream EDGES;
+level-parallel's scales with LEVEL BOUNDARIES × STREAMS USED.** On the diamond
+they tie at 2/2 — so the original "minimises" claim is false on the very graph
+the header used to illustrate it. On `fanout4×4` chain-greedy pays nothing while
+level-parallel manufactures 12 records and 36 waits on a graph with **zero
+cross-stream data edges**, because its barrier is between levels rather than
+between dependencies. It is a greedy heuristic that happens to be optimal on
+every graph benchmarked here, not a proven minimum.
+
+Two costs are reported separately from those figures, and must stay separate:
+the per-iteration **fork/join** (K records + 2(K−1) waits) is a fixed cost of
+the `run_async`/`synchronize` contract rather than anything attributable to a
+policy, and folding it in would misattribute it.
+
+**The event cost turned out to be immeasurable here.** `launch_bound_ratio`
+(host enqueue time / device time) was **≤ 0.029 for every graph and every
+policy** — every run is device-bound by a factor of at least 34. That is why
+`chain16`'s and `transformer_block`'s parallel policies land at 0.97–0.99×
+rather than dramatically worse: the events genuinely cost something, but on
+these shapes the cost is a rounding error against the kernels. A launch-bound
+graph is where chain-greedy's zero-event schedule would actually show up as
+wall-clock, and none of the five graphs is launch-bound.
+
+#### Memory: liveness reuse, and its direct tension with parallelism
+
+| Graph | naive | reused | ratio |
+|---|---|---|---|
+| chain16 | 1,140,867,072 B | 268,451,840 B | **4.25×** |
+| fanout4×4 (K=1) | 285,220,864 B | 184,557,568 B | 1.55× |
+| fanout4×4 (K=4) | 285,220,864 B | 218,112,000 B | 1.31× |
+| transformer_block | 218,120,192 B | 201,342,976 B | 1.08× |
+| diamond_gemm / diamond_starved | — | — | 1.00× |
+
+`chain16`'s 4.25× is exactly the hand-computed figure asserted in a host unit
+test: 17 tensors of 64 MiB collapse to **four** buffers — the graph input (never
+dies: it is filled by an async H2D whose completion the planner does not track),
+the graph output (must outlive execution), and two ping-pong buffers for the 15
+intermediates, because `t_i` and `t_{i+1}` overlap while `t_i` and `t_{i+2}` do
+not.
+
+The 1.00× rows are correct, not failures: on a diamond, A's output is read by
+both branches so it spans both, and both branches' outputs live until the join.
+Five tensors, five buffers, nothing to reuse.
+
+**`fanout4x4` at 1.55× (K=1) versus 1.31× (K=4) is the measured form of a
+prediction made before the run:** peak memory rises with stream count, because
+concurrency destroys the *ordering* that makes reuse legal. Parallelism and
+memory reuse are in direct tension. The practical consequence, now recorded in
+the header: peak is a function of **(graph, schedule policy, memory policy,
+num_streams)** — not of (graph, memory policy), as the original accessor
+comments implied. A §4 row omitting the last two coordinates would be
+uninterpretable later.
+
+#### Design decisions, with the alternatives that were rejected
+
+**SSA DAG with derived edges, not a declared edge list.** Each tensor records
+its single producer and each node lists its input tensors; the dependency edge
+is *implied*. The alternative — asking the user to declare "node 5 depends on
+node 3" — permits an edge list that disagrees with the actual dataflow, and when
+it does the result is a race that appears only under load. Deriving edges makes
+that class of bug unrepresentable, and hands liveness def/use chains for free.
+
+The stronger consequence emerged while implementing `finalize()`: because
+`add_node` is the only way to create a non-input tensor, sets `producer` exactly
+once, and can only reference tensors that already exist, **cycles and
+multiple-producers are unrepresentable too.** `finalize()` cannot meaningfully
+"verify acyclicity" as its original comment claimed — Kahn will always succeed.
+Both checks remain, reclassified `kInternal` to say so, guarding a future
+alias/mutation API. Two of the seven documented failure modes turned out to be
+structurally impossible, which understates rather than overstates the design.
+
+**Events, not stream-synchronize, for cross-stream dependencies.** A
+`cudaStreamSynchronize` between dependent nodes would be correct and would
+destroy the entire point: it blocks the *host*, so the CPU cannot run ahead to
+enqueue the next node, and the runtime becomes synchronous while still looking
+asynchronous. `cudaEventRecord`/`cudaStreamWaitEvent` creates a device-side
+ordering the scheduler honours without the host waiting at all. Hence the
+invariant that `Op::launch` must not synchronise, and the deliberate restriction
+of host barriers to exactly two places (`GraphExecutor::synchronize()` and
+benchmark timing).
+
+That invariant also drove the workspace design. `OpContext` originally handed
+ops a `DeviceAllocator*`, inviting `allocate()` on the per-iteration path —
+where Phase 2 had already measured `cudaMalloc` at up to 720 µs with a
+`cudaFree` that **synchronises the whole device**. One such call inside
+`run_async` would silently undo the phase. It now carries a plain
+`{void*, size_t}` into a per-stream arena, safe with no analysis because
+same-stream issue is in order.
+
+**A plan-time arena with static offsets, not runtime allocate/deallocate.**
+This was the phase's largest decision and it was taken for a correctness reason
+first, not a performance one. `Storage::note_use()` records a single stream, and
+under a parallel schedule it records an *arbitrary* one — it is called by the
+host at **enqueue** time, and the last-issued consumer routinely finishes first.
+Feeding that to Phase 2's cross-stream reuse policies defeats `kCoarseStreamPoll`
+*and* `kPerFreeEvent` equally: precision in the reclaim policy buys nothing when
+its input is wrong. A static arena never asks the question. It also makes peak
+memory deterministic rather than a function of pool fragmentation, which is what
+makes the numbers above comparable across policies at all.
+
+The consequence for Phase 2 is worth stating plainly, since it looks like a
+demotion and is not: the pooling allocator's job becomes serving the arena, the
+per-stream workspaces, and graph I/O. `run_async()` makes **zero** allocator
+calls. That is precisely why production runtimes plan memory, and the project can
+now point at the mechanism rather than assert it.
+
+**Three schedule policies, all implemented, all measured.** `kSequential` exists
+as the bit-exact correctness baseline, not as a strawman — every other policy is
+compared against it by `memcmp`. `kLevelParallel`'s inter-level barrier is
+implemented as a *true* barrier rather than weakened to per-edge waits: its cost
+**is** the point of the policy, and softening it would turn it into
+chain-greedy-without-the-heuristic and destroy the comparison. `kChainGreedy`
+balances by **estimated roofline cost**, not node count — every graph here mixes
+a ~10 ms GEMM with a ~0.2 ms softmax, and counting nodes calls them equal.
+
+#### The correctness result that mattered more than any speedup
+
+Liveness computed over a **topological order is unsound** under a multi-stream
+schedule. A topological order is one arbitrary linear extension of the
+dependency partial order; the executor's happens-before is that partial order
+*plus stream-serialisation edges*. Both extend the dependencies, and they extend
+them **differently** — so interval non-overlap asserts an ordering the executor
+never established.
+
+The minimal case is two unequal chains joined at the end (the
+transformer-with-residual shape). Tensors `a` and `d` have disjoint live ranges
+by topological position, so a linear-scan planner shares their buffer — and under
+`kChainGreedy` nothing orders the two streams before the join, while under
+`kLevelParallel` the inter-level barrier orders the *producers* and leaves a
+reader and a writer unordered **inside the same level**. The barrier closes the
+write-after-write and leaves the read/write open, which is exactly why "put a
+barrier between levels" feels sufficient and is not.
+
+This was found and fixed **before any GPU time was spent on it**, and it is
+demonstrated rather than merely avoided: `kReuseTopoNaive` ships as a
+deliberately-unsafe arm, and a host-side happens-before race checker
+(Fidge–Mattern vector clocks, the ThreadSanitizer algorithm applied to a GPU
+schedule) flags it with the offending tensor pair, the shared byte range, and the
+two unordered clocks — on a laptop, deterministically. Across the fuzz matrix,
+4,050 sound plans verified race-free and the naive arm raced in 32 cases; that
+count is asserted `> 0`, because a demonstration that never fires is not a
+demonstration.
+
+**Why the static checker and the runtime numerics gate are both kept.** They
+catch different classes. The checker proves the *plan* is race-free,
+exhaustively and without hardware. The gate proves the *executor faithfully
+implements the plan*, and catches what the checker cannot model — and it did
+exactly that: the two real bugs of Session 7 (a use-after-free in `set_input()`'s
+replay path, and a raw-position-vs-`TensorId` mix-up in the gate's own
+diagnostic) were found by the gate, not the checker. Neither substitutes for the
+other.
+
+#### What is still open
+
+- **The `nsys` timeline.** The one report that exists profiled the **pre-fix**
+  binary and is flagged non-compliant/profiling-only in its own output; it must
+  be regenerated against the fixed build before it can be cited. The *absence*
+  of overlap on four of five graphs is nevertheless already explained above and
+  quantified by `launch_bound_ratio ≤ 0.029` — the ROADMAP's criterion allows
+  explaining the absence, and that part is met. What a clean timeline would add
+  is direct visual confirmation of `fanout4x4`'s 1.94×, which is currently
+  inferred from wall-clock plus event counts rather than seen.
+- **The 0.45–0.8-wave jitter bump** is characterised (3 of 4 runs, migrating
+  between adjacent sample points, absent from one run) but its mechanism —
+  block-to-SM residency order under near-full-wave conditions — is a hypothesis
+  consistent with the data, not a measurement. Confirming it needs per-SM
+  residency information that `ncu` would provide and Explorer currently refuses
+  (`ERR_NVGPUCTRPERM`, §5a).
+- **`kReuseWithSyncEdges`**, the memory-vs-parallelism knob, is deliberately not
+  built. Adding sync edges to make more reuse legal cannot be a post-pass:
+  it changes the schedule, which changes happens-before, which changes what
+  reuse is legal. Scheduling and allocation become a fixpoint — the
+  register-allocator/instruction-scheduler co-design problem — and an enum value
+  that always errors is worse than one that does not exist.
+- **Launch-bound behaviour is unmeasured** in the sense that matters: no graph
+  here is launch-bound, so chain-greedy's zero-event advantage never showed up
+  in wall-clock. The experiment that would expose it is a chain of many tiny
+  kernels; the tooling (`--gemm-n=`, per-node `--profile`) now exists for it.
+
+**Conclusion:** three of four exit criteria are fully met with measured numbers
+on real hardware. The fourth — the timeline — is met in its "or explaining its
+absence" form and open in its "showing actual overlap" form. The phase's most
+valuable output is not a speedup: it is that the central correctness trap was
+found by construction on a laptop, demonstrated with a shipped unsafe arm, and
+proven absent by two independent checkers before a GPU was involved.

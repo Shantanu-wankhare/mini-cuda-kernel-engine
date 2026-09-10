@@ -143,6 +143,76 @@ how people end up chasing phantom regressions.
 
 ---
 
+### End-of-phase Q&A — Phase 4 (Graph engine and async scheduling)
+
+*(Phases 1–3 never got one of these. Worth filling in eventually — the Phase 3
+material in `RESULTS.md` §5b is most of the substance for that one.)*
+
+**Q1. Your memory planner reuses a buffer when two tensors' live ranges don't
+overlap. Why is that wrong the moment you have more than one stream?**
+Because "live range" was computed over a *topological order*, and a topological
+order is only **one arbitrary linear extension** of the dependency partial
+order. The executor's happens-before relation is that same partial order plus
+**stream-serialisation edges**. Both are supersets of the dependencies, but they
+are *different* supersets — the gap in the topological order is Kahn's arbitrary
+tie-breaking, and the gap in happens-before is the stream assignment, and there
+is no reason for those to agree. So two intervals that don't overlap in
+topological position can be alive at the same instant in wall-clock time. The
+correct test is: the buffer holding T1 may be reused for T2 iff *every* access to
+T1 happens-before T2's **producer**. Note "accesses" is a set, not a "last use" —
+under a parallel schedule T1's consumers may be mutually unordered, so there is
+no single last use, and any formulation that computes a scalar and compares it
+has already lost.
+
+**Q2. `kLevelParallel` puts a full barrier between topological levels. Why
+doesn't that prevent the race?**
+Because the hazard isn't between levels. Take two chains joined at the end:
+`N0→N1` and `N2→N3`, joining at `N4`. The barrier does order `N0` before `N3`,
+so the write-after-write is gone — that's the part intuition gets right. But
+`N1` and `N3` sit in the **same level** on different streams, and nothing orders
+them: `N1` reads the buffer while `N3` writes it. The barrier closes WAW and
+leaves RAW/WAR open. The vector clocks show it exactly: `clock[N3][stream(N1)]`
+advances to `N0`'s issue index and stops, so `N3` has no knowledge of `N1` at
+all. "Put a barrier between levels" feels sufficient and is not.
+
+**Q3. Why use CUDA events for cross-stream dependencies instead of just calling
+`cudaStreamSynchronize` between dependent nodes?**
+Because `cudaStreamSynchronize` blocks the **host**. It would be perfectly
+correct and would destroy the entire point of the runtime: the CPU can no longer
+run ahead to enqueue the next node, so the pipeline drains at every dependency
+and the runtime becomes synchronous while still *looking* asynchronous.
+`cudaEventRecord`/`cudaStreamWaitEvent` creates a **device-side** ordering the
+GPU scheduler honours with the host never waiting. That's why `Op::launch` is
+forbidden from synchronising at all, and why host barriers are restricted to
+exactly two places in the whole codebase. The same reasoning banned
+`DeviceAllocator*` from `OpContext`: an allocator call on the per-iteration path
+means a `cudaFree`, and `cudaFree` synchronises the whole device.
+
+**Q4. Two `bias_act` kernels, each capped to 40 blocks — about 6% occupancy.
+The SMs are obviously idle. Why did running them concurrently buy essentially
+nothing (1.01×)?**
+Because occupancy tells you whether the *SMs* are idle, not whether the
+*machine* is. That starved kernel was already measured at 224.6 GB/s — **95.4%
+of the T4's measured DRAM ceiling**. The SMs were idle and the memory system was
+saturated, so there was no bottleneck resource left to overlap into. Set against
+`fanout4x4`, where four genuinely independent starved branches gave **1.94×**,
+the pair is the lesson: *"SMs are idle" is not "the machine is idle."* Overlap
+pays only when the **bottleneck** resource is idle, and occupancy does not tell
+you which resource that is. (Phase 3d reached the same conclusion from the other
+direction: `tiled_smem` at 100% occupancy lost to `tiled_regblock` at 50%.)
+
+**Q5. You measured peak memory rising as you added streams — 1.55× reuse at one
+stream, 1.31× at four. Why does more parallelism cost memory?**
+Because reuse is *licensed by ordering*, and concurrency is precisely the removal
+of ordering. A buffer can only be handed to a new tensor once every access to the
+old one provably happens-before the new producer; the more nodes run
+concurrently, the fewer pairs satisfy that, so fewer buffers can be shared.
+Parallelism and memory reuse are in direct tension. The practical consequence is
+that peak memory is a function of **(graph, schedule policy, memory policy,
+num_streams)** — not of (graph, memory policy), which is what the API's original
+accessor comments implied. Any recorded peak that omits the last two coordinates
+is uninterpretable later.
+
 ## Template for future sessions
 
 ```
