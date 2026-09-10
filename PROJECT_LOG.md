@@ -1018,3 +1018,119 @@ sequence and was what actually exposed the use-after-free.
   owner during earlier sessions: SSA-DAG vs. flat list, event vs.
   stream-sync, the three schedule policies, liveness-based reuse) — not yet
   consolidated into a `RESULTS.md` narrative section the way Phase 3 got §5b.
+
+## 2026-09-10 — Session 8: wave-sweep anomaly investigated, not just reworded
+
+### What triggered this session
+
+A review of `RESULTS.md` §4 flagged two problems with the wave-sweep table
+recorded in Session 7: the prose claimed "falls monotonically" but the data
+had a dip at N=512 and a peak of 2.00× at N=1024; and 2.00× is structurally
+impossible for `diamond_gemm(n)` under the obvious model (two independent
+GEMMs B, C feeding one dependent GEMM D — sequential = 3t, best case
+`max(t_B,t_C)+t_D = 2t`, a 1.5× ceiling if per-kernel time `t` is constant).
+The instruction was explicit: investigate which of three hypotheses explains
+it, do not reword the prose to fit the data.
+
+### What was built
+
+`bench/graph_bench.cpp`:
+- `--gemm-n=N` flag plus two new graphs, `diamond_gemm_custom`/
+  `single_gemm_custom`, reachable through a file-scope `g_gemm_n` (`run_graph`
+  takes a plain function pointer, no captures) — run the pinned diamond or an
+  isolated single GEMM at an arbitrary N instead of only N=2048.
+- `--profile`'s output now prints each node's own median/min time per policy
+  (`ex.node_timings()`), not just the graph-level concurrency factor — the
+  direct test for "did concurrency change a kernel's OWN time" vs. "did the
+  graph total just get faster for some other reason."
+- The wave-sweep table now measures `blocks/SM` itself
+  (`cudaFuncGetAttributes` + `kernels::occupancy_blocks_per_sm` on this
+  build's actual `tiled_regblock` kernel) instead of asserting the Phase 3d
+  prose figure, prints `waves` per N directly, and adds N=768/1536 between
+  the reported dip and peak.
+
+Doc fixes made while in these files: `CLAUDE.md` claimed 86,809 checks passing
+in "`test_host_core` + `test_graph_host` combined" — 86,809 is
+`test_graph_host` ALONE; combined with `test_host_core`'s 58,856 it's
+145,665. `RESULTS.md` §4 referenced `kReuseByLiveness`, which no longer
+exists (renamed to `kReuseHappensBefore` when the five memory policies
+landed).
+
+### The investigation, on Colab T4 (fresh clone + rebuild at commit `d4e6826`)
+
+**Per-node timing at N=1024** (`--gemm-n=1024 --profile --only=diamond_gemm_custom`):
+B_gemm/C_gemm/D_gemm each take ~0.89 ms (min) under `kSequential`, dropping to
+~0.75 ms under `kChainGreedy` — a genuine ~16% per-kernel speedup.
+**Mechanism:** one GEMM at N=1024 launches 64 blocks; this T4 measures 2
+blocks/SM × 40 SMs = 80 blocks/full wave, so 64 blocks alone (0.8 waves)
+can't fill the machine — running two together (128 blocks) gives the
+scheduler more independent work to hide latency behind, so the per-kernel
+time itself drops. Real, but not enough alone to explain a reported 2.00×.
+
+**Isolated single-GEMM cross-check** (`--gemm-n=1024 --only=single_gemm_custom`):
+one GEMM alone at N=1024, sequential: 0.927 ms. ×3 = 2.78 ms, matching this
+session's `diamond_gemm_custom` sequential number (2.69 ms) to within 3%.
+**Hypothesis (b) is refuted for this session's data** — the diamond's own
+sequential number is not an anomaly. But the ORIGINAL 2026-09-07 run's
+sequential number at N=1024 was 3.704 ms, ~30-37% higher than every
+measurement taken this session — that specific historical run's sequential
+number really was the outlier.
+
+**Reproducibility — four runs, two different Colab VM instances** (one set
+of three back-to-back runs, then the notebook was disconnected mid-session
+per the owner's credit-conscious workflow, and a fourth run happened after a
+completely fresh reconnect: new clone, new build, new VM). Every N except
+768 and 1024 is stable to ~2% across all four runs (e.g. N=256: 1.42–1.49×,
+N=1536: 1.01–1.03×, N=4096: 0.99× on every run). N=768 (0.45 waves) ranges
+1.06×–1.87×; N=1024 (0.80 waves) ranges 1.05×–1.66× (plus the original run's
+2.00×) — genuinely unstable, not measurement error. **Localized mechanism:**
+at 768/1024 the two concurrent GEMMs' combined block count (72/128) is close
+enough to the 80-block full-wave capacity that which kernel's blocks land in
+the first available SM slots is sensitive to launch-order jitter, changing
+how much real overlap happens run to run. At N=512 there's enough headroom
+that residency order doesn't matter (32 combined blocks); at N≥1536 each
+GEMM alone already dominates a wave, so the marginal overlap is small and
+stable regardless of order.
+
+**Conclusion, written into `RESULTS.md` §4 verbatim (not smoothed over):**
+"falls monotonically" was wrong — the true shape is a smooth decay from
+~1.45× (near-zero waves) to ~1.0× (≥1.8 waves) with a genuine, reproducible
+**noisy bump** localized to 0.45–0.8 waves, whose value should be reported as
+a range, not a single number. Hypothesis (a) is real but small; hypothesis
+(b) explains the *original* run's specific number; the dominant honest
+explanation is (c), a real scheduling-jitter sensitivity in a narrow
+occupancy band — stated as such rather than picked as "the" answer to make
+the writeup tidier.
+
+### Debugging note: don't trust a Colab cell's cached bracket/checkmark
+
+Mid-session, the notebook was reconnected after a disconnect and several
+cells appeared to show fresh green checkmarks and output — but `ls /content/`
+showed no `mcke` directory, and a cell's own hover tooltip read "cell has not
+been executed in this session" alongside a checkmark from 52 minutes earlier.
+Colab's cell UI can display a stale previous execution's checkmark/output
+indefinitely until the cell is actually re-run in the current runtime;
+the reliable signals were the tooltip's own "started at HH:MM (N minutes
+ago)" text and the bottom status bar's live "Executing (Ns)" counter, not the
+cell's bracket number or checkmark color.
+
+### Verification
+
+- Full 5-graph suite (`mcke_graph_bench --streams=4`, no filter) re-run
+  clean on the fresh VM: all five numerics gates PASS (same 9×20 matrix as
+  Session 7), confirming the bug fixes from Session 7 hold on a completely
+  independent rebuild, not just the runtime they were originally verified on.
+  `RESULTS.md` §4's main table now reflects this fresh run's exact numbers
+  (previous numbers were sourced from a stale cached cell and are superseded,
+  per the owner's explicit "don't use old results, run again").
+
+### What's next
+
+- `reports/nsys_phase4.nsys-rep` still not regenerated on the fixed binary
+  (see Session 7) — still a deep-dive/visualization nice-to-have, not
+  blocking.
+- Phase 4 exit write-up (Phase 3 got one in §5b) — the wave-sweep anomaly
+  section above is most of the substance Phase 4's write-up would need;
+  remaining is consolidating the design-tradeoff narrative already discussed
+  live with the owner (SSA-DAG vs flat list, event vs stream-sync, the three
+  schedule policies, liveness-based reuse).

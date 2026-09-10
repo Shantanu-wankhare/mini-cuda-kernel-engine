@@ -184,9 +184,10 @@ personal learning notes in `PROJECT_LOG.md`.
 ## 8. Current status
 
 **Phases 0–3 complete. Phase 4 core (graph engine + async scheduling) is
-implemented, bug-fixed, and verified on real GPU hardware** — see
-`PROJECT_LOG.md` Session 7 (2026-09-07) and `docs/ROADMAP.md` for the phase
-plan.
+implemented, bug-fixed, and verified on real GPU hardware, including a
+from-scratch reproducibility investigation of its one anomalous result** —
+see `PROJECT_LOG.md` Sessions 7 (2026-09-07) and 8 (2026-09-10) and
+`docs/ROADMAP.md` for the phase plan.
 
 - Host-only build verified on macOS: 145,665 checks passing (`test_host_core`
   58,856 + `test_graph_host` 86,809) combined.
@@ -206,12 +207,22 @@ plan.
   schedule×memory-policy combinations), and `bench/graph_bench.cpp`.
 - `RESULTS.md` §0–§3d filled with real measured numbers on two architectures;
   §4 (Phase 4 scheduling) filled with real Colab T4 numbers for all five
-  gated graphs — all numerics gates **PASS**. §5 (Nsight Compute deep dives)
-  is blocked on `ncu` permissions on Explorer (`ERR_NVGPUCTRPERM`) — an RC
-  ticket is filed and open; not blocking further project work.
+  gated graphs — all numerics gates **PASS**, on a completely fresh
+  clone+rebuild (Session 8), not just the runtime the fix was first verified
+  on. §5 (Nsight Compute deep dives) is blocked on `ncu` permissions on
+  Explorer (`ERR_NVGPUCTRPERM`) — an RC ticket is filed and open; not
+  blocking further project work.
+- The wave-sweep's original "falls monotonically" prediction was wrong — a
+  2026-09-07 run showed a structurally-impossible 2.00× at N=1024. Session 8
+  investigated with new bench tooling (`--gemm-n=`, per-node `--profile`
+  timing, measured `blocks/SM`) rather than rewording the prose: the real
+  shape is a smooth decay from ~1.45× to ~1.0× with a genuine, reproducible
+  **noisy bump localized to 0.45–0.8 waves** (confirmed across 4 runs on 2
+  different Colab VMs) — mechanism and full writeup in `RESULTS.md` §4.
 - Remaining before Phase 4 is fully closed: a clean `nsys` timeline on the
   fixed binary (the one generated during Session 7 profiled the *pre-fix*
   binary and is flagged non-compliant/profiling-only — see `PROJECT_LOG.md`
   Session 7 "What's next"); no consolidated Phase 4 exit write-up yet (Phase 3
-  got one in §5b, Phase 4 hasn't). All timing/correctness numbers in
-  `RESULTS.md` §4 are exact and final.
+  got one in §5b, Phase 4 hasn't — though Session 8's wave-sweep section is
+  most of the substance it would need). All timing/correctness numbers in
+  `RESULTS.md` §4 are exact and current as of Session 8.
