@@ -103,6 +103,30 @@ Built diamond_gemm(std::int64_t n) {
   return b;
 }
 
+// Isolated single GEMM, no diamond around it -- the cross-check for whether a
+// diamond's own SEQUENTIAL time (which runs B then C then D, i.e. 3x one
+// GEMM) is consistent with 3x this number. If it isn't, the diamond's
+// sequential measurement is the anomaly, not whatever the parallel policies
+// report.
+Built single_gemm(std::int64_t n) {
+  Built b;
+  auto a = b.g.add_input(Shape{n, n}, DType::kF32, "A"); a.status().throw_if_error();
+  auto w = b.g.add_input(Shape{n, n}, DType::kF32, "W"); w.status().throw_if_error();
+  b.input = *a;
+  auto l = b.g.add_node(gemm_op(n), {*a, *w}, "single_gemm"); l.status().throw_if_error();
+  b.g.mark_output((*l)[0]).throw_if_error();
+  b.outputs.push_back((*l)[0]);
+  b.g.finalize().throw_if_error();
+  return b;
+}
+
+// run_graph() below takes a plain function pointer (no captures), so a custom
+// N picked at the command line has to reach diamond_gemm()/single_gemm()
+// through a file-scope variable rather than a lambda capture.
+std::int64_t g_gemm_n = 0;
+Built make_diamond_gemm_custom() { return diamond_gemm(g_gemm_n); }
+Built make_single_gemm_custom()  { return single_gemm(g_gemm_n); }
+
 // D3: diamond whose two middle nodes are DELIBERATELY STARVED bias_act kernels
 // -- SM-idle but bandwidth-saturated. The starvation lever is Phase 3a's own.
 Built diamond_starved(std::int64_t rows, std::int64_t cols, int blocks) {
@@ -193,6 +217,7 @@ struct Args {
   bool skip_gate = false;
   bool profile = false;
   std::string only;     // graph name filter
+  std::int64_t gemm_n = 0;  // 0 = disabled; >0 adds diamond_gemm_custom/single_gemm_custom at this N
 };
 
 bool starts_with(const char* s, const char* p) {
@@ -209,13 +234,14 @@ Args parse_args(int argc, char** argv) {
     else if (starts_with(s, "--only="))    a.only    = s + 7;
     else if (std::strcmp(s, "--skip-gate") == 0) a.skip_gate = true;
     else if (std::strcmp(s, "--profile") == 0)   a.profile = true;
+    else if (starts_with(s, "--gemm-n="))  a.gemm_n  = std::atoll(s + 9);
     else if (starts_with(s, "--peak-gb-s=") || starts_with(s, "--peak-tflops=")) {}
     else {
       std::fprintf(stderr,
           "[mcke] FATAL: unrecognised argument '%s'.\n"
           "  usage: mcke_graph_bench [--streams=K] [--warmup=W] [--iters=I]\n"
           "                          [--only=<graph>] [--skip-gate] [--profile]\n"
-          "                          [--peak-gb-s=X] [--peak-tflops=X]\n", s);
+          "                          [--gemm-n=N] [--peak-gb-s=X] [--peak-tflops=X]\n", s);
       std::exit(2);
     }
   }
@@ -375,9 +401,15 @@ int main(int argc, char** argv) {
       std::printf("  %-15s peak %zu B vs naive %zu B (%.2fx)%s\n", "", r.peak, r.naive,
                   r.peak ? double(r.naive) / double(r.peak) : 0.0,
                   args.profile ? "" : "");
-      if (args.profile)
+      if (args.profile) {
         std::printf("  %-15s concurrency factor %.2f (>1.0 = real overlap)\n", "",
                     r.concurrency);
+        // Per-node breakdown: the direct test for "did concurrency change any
+        // individual kernel's own time", not just the graph total.
+        for (const auto& nt : ex.node_timings())
+          std::printf("      node %-12s stream %d  median %8.3f ms  min %8.3f ms  (n=%d)\n",
+                      nt.name.c_str(), nt.stream_idx, nt.median_ms, nt.min_ms, nt.samples);
+      }
       // The launch-bound signal, one number, no profiler needed.
       std::printf("  %-15s launch_bound_ratio %.3f (enqueue/device; >1 = launch-bound)\n",
                   "", r.median_ms > 0 ? (r.enqueue_us / 1000.0) / r.median_ms : 0.0);
@@ -419,12 +451,52 @@ int main(int argc, char** argv) {
   run_graph("diamond_starved",   [] { return diamond_starved(8192, 4096, 40); }, true);
   run_graph("transformer_block", [] { return transformer_block(4096, 1024, 4096); }, true);
 
+  // --- Ad hoc: diamond_gemm/single_gemm at an arbitrary N, for the wave-sweep
+  //     anomaly investigation (RESULTS.md sec 4: N=1024's 2.00x chain_greedy
+  //     speedup beats the 1.5x structural ceiling for a 3-equal-cost-GEMM
+  //     diamond). run_graph() always runs all three policies in order
+  //     (kSequential first, always at 1 stream, then the two parallel
+  //     policies at --streams); with --profile it prints each node's own
+  //     time under EACH policy, so comparing B_gemm/C_gemm's median under
+  //     kSequential vs kChainGreedy is the direct test for hypothesis (a):
+  //     "concurrency raises each GEMM's own per-kernel efficiency". If those
+  //     per-node times barely move, (a) is refuted and the speedup comes from
+  //     somewhere else. single_gemm_custom is the hypothesis-(b) cross-check:
+  //     does 3x this graph's own sequential number match the diamond's.
+  if (args.gemm_n > 0) {
+    g_gemm_n = args.gemm_n;
+    run_graph("diamond_gemm_custom", make_diamond_gemm_custom, /*want_gate=*/false);
+    run_graph("single_gemm_custom",  make_single_gemm_custom,  /*want_gate=*/false);
+  }
+
   // --- D2: the wave sweep. The speedup-vs-waves CURVE is the deliverable; a
   //     single point at either end would only confirm what is already believed.
+  //
+  //     blocks/SM below is MEASURED here (cudaFuncGetAttributes on this
+  //     build's actual tiled_regblock kernel, fed through the same
+  //     occupancy_blocks_per_sm() hand calculation gemm_bench uses), not
+  //     copy-pasted from a Phase 3d prose claim -- so if this build's
+  //     occupancy ever differs from "2 blocks/SM", the wave arithmetic in
+  //     this table catches it instead of silently asserting a stale number.
   if (args.only.empty() || args.only == "wave_sweep") {
+    int blocks_per_sm = 0;
+    {
+      const kernels::GemmTile tile{};  // same default tile diamond_gemm() uses
+      auto at = kernels::gemm_kernel_attrs(kernels::GemmVariant::kTiledRegBlock, tile);
+      if (at.ok()) {
+        const auto occ = kernels::occupancy_blocks_per_sm(*dev, at->threads_per_block,
+                                                           at->regs_per_thread,
+                                                           at->static_smem_bytes);
+        blocks_per_sm = occ.blocks_per_sm;
+      }
+    }
+    const int full_wave_blocks = blocks_per_sm * dev->sm_count;
     std::printf("=== wave sweep (diamond of GEMMs, chain_greedy vs sequential) ===\n");
-    std::printf("  %6s %10s %12s %12s %8s\n", "N", "blocks", "seq ms", "greedy ms", "speedup");
-    for (std::int64_t n : {256, 512, 1024, 2048, 4096}) {
+    std::printf("  occupancy: %d blocks/SM (measured) x %d SMs = %d blocks/full wave\n",
+                blocks_per_sm, dev->sm_count, full_wave_blocks);
+    std::printf("  %6s %10s %8s %12s %12s %8s\n", "N", "blocks", "waves", "seq ms",
+                "greedy ms", "speedup");
+    for (std::int64_t n : {256, 512, 768, 1024, 1536, 2048, 4096}) {
       double t[2] = {0, 0};
       int idx = 0;
       for (auto pol : {SchedulePolicy::kSequential, SchedulePolicy::kChainGreedy}) {
@@ -456,12 +528,16 @@ int main(int argc, char** argv) {
         t[idx++] = ms[ms.size() / 2];
       }
       const std::int64_t blocks = ((n + 127) / 128) * ((n + 127) / 128);
-      std::printf("  %6lld %10lld %12.3f %12.3f %8.2fx\n", (long long)n,
-                  (long long)blocks, t[0], t[1], t[1] > 0 ? t[0] / t[1] : 0.0);
+      const double waves = full_wave_blocks > 0
+                                ? double(blocks) / double(full_wave_blocks)
+                                : 0.0;
+      std::printf("  %6lld %10lld %8.2f %12.3f %12.3f %8.2fx\n", (long long)n,
+                  (long long)blocks, waves, t[0], t[1], t[1] > 0 ? t[0] / t[1] : 0.0);
     }
-    std::printf("  ^ tiled_regblock measured 2 blocks/SM on both T4 and V100, so a full\n"
-                "    wave is 80 blocks (T4) / 160 (V100). Speedup should fall monotonically\n"
-                "    and cross ~1.5x near one wave.\n\n");
+    std::printf("  ^ waves = grid blocks / (measured blocks/SM x SM count) above.\n"
+                "    See RESULTS.md sec 4 for the shape this curve actually takes and\n"
+                "    which hypothesis explains it -- the prediction here was falsified,\n"
+                "    do not assume monotonic falloff.\n\n");
   }
 
   // --- CSV. A NEW file, not a widened phase3 schema: Phase 3 rows depend on

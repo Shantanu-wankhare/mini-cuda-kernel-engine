@@ -896,3 +896,125 @@ overlap numbers and `nsys` timelines need Explorer. The numerics gate
 (`kLevelParallel`/`kChainGreedy` must be bit-identical to `kSequential`, any
 difference is a race not rounding) should be automated from the start, not
 added after a bug is found.
+
+## 2026-09-07 — Session 7: Phase 4 numerics-gate failure, two real bugs, closed on Colab T4
+
+### What was built / changed
+
+- `CMakeLists.txt`: fixed two related link-order bugs surfaced by
+  `mcke_test_graph_host` (then `mcke_graph_bench`) failing to link on a fresh
+  Colab CUDA build: `undefined reference` to kernel launchers. Root cause 1
+  (test target only linked `mcke_core`, not the `mcke` umbrella — Itanium ABI
+  emits a class's vtable in the TU with its first out-of-line virtual method,
+  so constructing an `Op` subclass in a host test pulls in that kernel's `.o`
+  at link time even though the virtual `launch()` is never called). Root
+  cause 2, found when the fix reappeared on `mcke_graph_bench` (which already
+  linked `mcke`): the `mcke` INTERFACE library only declared
+  `mcke_kernels PUBLIC mcke_core` (for header/define propagation), so CMake
+  was free to place `mcke_kernels` before `mcke_core` on the link line — the
+  opposite of what `mcke_core`'s `src/graph/ops_*.cpp` actually needs. Fixed
+  with `$<LINK_GROUP:RESCAN,mcke_core,mcke_kernels>` (CMake ≥ 3.24), which
+  wraps both in a `--start-group/--end-group` idiom so link order stops
+  mattering, rather than reordering by hand (a real fix, not a workaround).
+- `include/mcke/graph/executor.hpp` / `src/graph/executor.cpp`: two real bugs
+  found while diagnosing a genuine numerics-gate failure on `fanout4x4`
+  (Colab T4): `sequential x alloc_per_tensor differs from golden at tensor 5
+  word 0: golden -0.168422 vs -0`.
+  1. **Use-after-free in `GraphExecutor::set_input()`.** The numerics gate's
+     replay loop calls `set_input(id, cache[id].data(), cache[id].size())` —
+     so `host_data` routinely points *into* `input_cache_`'s own buffer for
+     that tensor. The old code updated the cache first
+     (`kv.second = std::move(copy)`), which frees the old backing buffer —
+     the exact buffer `host_data` still points into — then read through that
+     now-dangling pointer to do the device copy. The "wrong" value read back
+     wasn't garbage, it was real (stale/reused) heap content, which is why it
+     looked like a plausible logic bug rather than an obvious crash. Fixed by
+     doing the device copy *before* touching the cache.
+  2. **Mismatched-index comparison**, found immediately after fixing bug 1 and
+     re-testing (same host-only repro, different failure). The new
+     "check every bound tensor, report every mismatch" diagnostic compared
+     tensors by raw loop position `k`, but `kAllocPerTensor` enumerates *every*
+     tensor with a buffer while any reuse policy only captures the *declared
+     outputs* — different lists, different lengths, different order. Fixed by
+     mapping both sides through `TensorId` (`golden_by_id`, `tensors_to_check`)
+     instead of position. Added `GraphExecutor::any_bound_tensor()` (reads any
+     bound tensor, not just declared outputs; documented as unsafe to expose
+     publicly, used only by this diagnostic under `kAllocPerTensor`).
+  - Removed a stray uncommitted backup file, `src/graph/executor.cpp.bak`
+    (the pre-fix, still-buggy version of the file, left over from live
+    debugging) — not tracked, not needed once the real fix was committed.
+
+### Debugging technique that mattered
+
+`std::printf` (stdout) is fully buffered when piped, `std::fprintf(stderr,
+...)` is not; combining `2>&1` in one pipe scrambled the apparent order of
+interleaved debug prints across `plan()`/`set_input()`/the replay loop badly
+enough to suggest a race that wasn't there. Capturing stdout and stderr to
+*separate* files (`>out.txt 2>err.txt`) immediately clarified the true
+sequence and was what actually exposed the use-after-free.
+
+### Verification
+
+- Host-only (`MCKE_WITH_CUDA=0`, no GPU): `test_numerics_gate_on_host` went
+  FAIL (1/9 configs) → FAIL (2/9 configs, the second bug) → **PASS (9/9
+  configs, 40,960 elements)**. Full host suite: 86,809 checks, 0 failures.
+- Real hardware, Colab Tesla T4, driver 580.82.07, after `git pull` to
+  `4e60fe5` and incremental rebuild (~20s): `mcke_test_graph_host` — 86,798
+  checks, 0 failures. `mcke_graph_bench --streams=4` — all five gated graphs
+  (`fanout4x4`, the originally-failing one; `diamond_starved`;
+  `transformer_block`; `diamond_gemm_2048`; `chain16`) numerics gate **PASS**,
+  9 configs × 20 repeats each. Full numbers in `RESULTS.md` §4. Wave-sweep
+  section also completed and matches the predicted shape (speedup falls
+  monotonically, crosses ~1.5× near one full SM wave). Notebook disconnected
+  after (idle-timed-out on its own while unattended, not explicitly clicked —
+  confirmed "Not connected to runtime" / 0 active sessions on return).
+
+### Design decisions taken (and alternatives rejected)
+
+- `LINK_GROUP:RESCAN` over manually reordering `target_link_libraries` calls:
+  the real dependency is bidirectional (core calls kernel launchers; kernels
+  target needs core's headers/defines), so any single fixed order is fragile
+  against the next new `Op`. The group wrapper is the property that's
+  actually true, not just a link line that happens to work today.
+- Fixed the use-after-free by reordering (copy-then-cache) rather than by
+  deep-copying `host_data` defensively at the top of `set_input()`: the
+  caller's contract for a `copy_from_host`-shaped function is that the
+  pointer is valid for the duration of the call, same as every other
+  `copy_from_host` call site — the bug was this function violating its own
+  contract internally, not the contract being insufficient.
+
+### What was learned — including things that turned out to be wrong
+
+- Initial hypotheses ruled out in order before finding the real bug: kernel
+  grid-stride coverage gaps (`bias_act.cu`'s `grid_2d()` guarantees ≥1 block
+  each axis — not it), uninitialized shared memory (kernel uses zero shared
+  memory — not it), poisoning clobbering live inputs (a separate bug, already
+  fixed in a prior session — not it), and a real cross-stream race (already
+  proven impossible by the host-side happens-before checker — not it). The
+  actual bug was in the *test harness's own caching code*, not in graph
+  execution, scheduling, or any kernel — worth remembering that a "numerics
+  gate" bug can be a bug in the gate itself.
+- Colab's UI can show stale cached cell output from a previous runtime after
+  a silent reset; only real markers (`%cd` failing with `[Errno 2]`, or the
+  Resources panel's "Not connected to runtime" / active-session count) are
+  trustworthy state, not what's displayed.
+
+### What's next
+
+- ~~`diamond_gemm_2048` and `chain16`'s exact per-policy numbers~~ — resolved
+  same day: found intact in the notebook's own cached cell output (no rerun
+  needed) and transcribed verbatim into `RESULTS.md` §4.
+- `reports/nsys_phase4.nsys-rep` exists on a since-disconnected Colab
+  instance's ephemeral disk, generated by profiling `fanout4x4` against the
+  **pre-fix** binary (explicitly flagged `*** NON-COMPLIANT WITH RESULTS.md
+  RULE 3 ***`, profiling-only, not for `RESULTS.md`) — so even if it could be
+  recovered it wouldn't be usable as-is. A clean Nsight Systems timeline on
+  the fixed binary, meeting the ≥5 warmup/≥20 timed rule, would need a fresh
+  `nsys profile` run and a real download step (`files.download(...)` or Drive)
+  — not yet done, not urgent since it's a deep-dive/visualization aid, not a
+  correctness or timing question (both already answered by the gate + bench
+  numbers already in hand).
+- Phase 4 exit write-up (design tradeoffs already explained live to the
+  owner during earlier sessions: SSA-DAG vs. flat list, event vs.
+  stream-sync, the three schedule policies, liveness-based reuse) — not yet
+  consolidated into a `RESULTS.md` narrative section the way Phase 3 got §5b.

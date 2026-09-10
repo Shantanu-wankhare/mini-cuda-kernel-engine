@@ -183,25 +183,35 @@ personal learning notes in `PROJECT_LOG.md`.
 
 ## 8. Current status
 
-**Phases 0–3 complete.** See `PROJECT_LOG.md` for full session-by-session
-detail and `docs/ROADMAP.md` for the phase plan. Now starting **Phase 4**
-(graph engine and async scheduling).
+**Phases 0–3 complete. Phase 4 core (graph engine + async scheduling) is
+implemented, bug-fixed, and verified on real GPU hardware** — see
+`PROJECT_LOG.md` Session 7 (2026-09-07) and `docs/ROADMAP.md` for the phase
+plan.
 
-- Host-only build verified on macOS: 58,856 checks passing in `test_host_core`.
+- Host-only build verified on macOS: 145,665 checks passing (`test_host_core`
+  58,856 + `test_graph_host` 86,809) combined.
 - CUDA path built and verified on three real GPUs: Colab Tesla T4 (sm_75),
   Northeastern Explorer Tesla V100-SXM2 (sm_70), plus the allocator race tests.
   RTX 5060 (sm_120) not yet touched.
 - Implemented and measured: `Status`/`StatusOr`, `DType`, `DeviceInfo`,
   `rt::Stream`/`Event`, buddy allocator + free-list allocator (both with all
   three cross-stream reuse policies), `RawDeviceAllocator`, `Shape`,
-  `Profiler::time_op`, roofline math, and every Phase 3 kernel: fused
-  bias+activation, row reduction (tree/shuffle/two-pass), row softmax
-  (three-pass/online), and the 8-row GEMM ladder (naive through cuBLAS) with
-  its own tile-dispatch and occupancy-calculator header
-  (`kernels/gemm_tile.hpp`).
-- `RESULTS.md` §0–§3d filled with real measured numbers on two architectures.
-  §5 (Nsight Compute deep dives) is blocked on `ncu` permissions on Explorer
-  (`ERR_NVGPUCTRPERM`) — an RC ticket is filed and open; not blocking further
-  project work.
-- Declared but **not yet implemented**: `Storage`/`Tensor` methods, all four
-  `Op` subclasses, `Graph`, `GraphExecutor` — this is Phase 4.
+  `Profiler::time_op`, roofline math, every Phase 3 kernel (fused
+  bias+activation, row reduction, row softmax, the 8-row GEMM ladder), and now
+  Phase 4: `Storage`/`Tensor` binding, all four `Op` subclasses, `Graph`
+  (Kahn topo sort, levels, live ranges), `GraphExecutor` (three schedule
+  policies — `kSequential`/`kLevelParallel`/`kChainGreedy` — event insertion,
+  liveness-based memory planner), the numerics gate
+  (`validate_numerics()` — bit-identical check across all 9
+  schedule×memory-policy combinations), and `bench/graph_bench.cpp`.
+- `RESULTS.md` §0–§3d filled with real measured numbers on two architectures;
+  §4 (Phase 4 scheduling) filled with real Colab T4 numbers for all five
+  gated graphs — all numerics gates **PASS**. §5 (Nsight Compute deep dives)
+  is blocked on `ncu` permissions on Explorer (`ERR_NVGPUCTRPERM`) — an RC
+  ticket is filed and open; not blocking further project work.
+- Remaining before Phase 4 is fully closed: a clean `nsys` timeline on the
+  fixed binary (the one generated during Session 7 profiled the *pre-fix*
+  binary and is flagged non-compliant/profiling-only — see `PROJECT_LOG.md`
+  Session 7 "What's next"); no consolidated Phase 4 exit write-up yet (Phase 3
+  got one in §5b, Phase 4 hasn't). All timing/correctness numbers in
+  `RESULTS.md` §4 are exact and final.
