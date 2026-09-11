@@ -1489,14 +1489,13 @@ other.
 
 #### What is still open
 
-- **The `nsys` timeline.** The one report that exists profiled the **pre-fix**
-  binary and is flagged non-compliant/profiling-only in its own output; it must
-  be regenerated against the fixed build before it can be cited. The *absence*
-  of overlap on four of five graphs is nevertheless already explained above and
-  quantified by `launch_bound_ratio ≤ 0.029` — the ROADMAP's criterion allows
-  explaining the absence, and that part is met. What a clean timeline would add
-  is direct visual confirmation of `fanout4x4`'s 1.94×, which is currently
-  inferred from wall-clock plus event counts rather than seen.
+- ~~The `nsys` timeline~~ — **resolved (Session 10, 2026-09-11).** Regenerated
+  against the fixed build on Colab T4 (the machine the §4 numbers come from,
+  not Explorer — Nsight Systems traces via CUPTI activity/callback APIs and
+  does not touch the GPU performance counters `ERR_NVGPUCTRPERM` blocks, so it
+  was never actually gated on that ticket). `reports/nsys_phase4_fanout4x4.nsys-rep`
+  is committed. See "nsys timeline: what it confirms" below for the direct,
+  quantified overlap evidence it provides for `fanout4x4`'s 1.94×.
 - **The 0.45–0.8-wave jitter bump** is characterised (3 of 4 runs, migrating
   between adjacent sample points, absent from one run) but its mechanism —
   block-to-SM residency order under near-full-wave conditions — is a hypothesis
@@ -1514,9 +1513,57 @@ other.
   in wall-clock. The experiment that would expose it is a chain of many tiny
   kernels; the tooling (`--gemm-n=`, per-node `--profile`) now exists for it.
 
-**Conclusion:** three of four exit criteria are fully met with measured numbers
-on real hardware. The fourth — the timeline — is met in its "or explaining its
-absence" form and open in its "showing actual overlap" form. The phase's most
-valuable output is not a speedup: it is that the central correctness trap was
-found by construction on a laptop, demonstrated with a shipped unsafe arm, and
-proven absent by two independent checkers before a GPU was involved.
+**Conclusion:** all four exit criteria are now met with measured numbers on
+real hardware. The phase's most valuable output is not a speedup: it is that
+the central correctness trap was found by construction on a laptop,
+demonstrated with a shipped unsafe arm, and proven absent by two independent
+checkers before a GPU was involved.
+
+#### nsys timeline: what it confirms about `fanout4x4`'s 1.94×
+
+`reports/nsys_phase4_fanout4x4.nsys-rep` — **Colab Tesla T4, 2026-09-11,
+driver 580.82.07, commit `13ef269`** (the fixed build; NVTX on):
+
+```
+nsys profile --trace=cuda,nvtx,osrt --stats=true \
+  -o reports/nsys_phase4_fanout4x4 \
+  ./build/bin/mcke_graph_bench --only=fanout4x4 --iters=5 --warmup=2
+```
+
+(`--iters=5 --warmup=2` triggers `graph_bench`'s own `*** NON-COMPLIANT WITH
+RESULTS.md RULE 3 ***` banner, correctly — this run is for the *timeline*
+artifact only; none of its printed timings appear anywhere in this document.)
+
+No GUI is available in this headless environment to render the timeline
+visually, so the trace was queried directly with `nsys stats
+--report cuda_gpu_trace` instead — a stronger form of confirmation than a
+screenshot, because it gives exact per-kernel start/end timestamps and stream
+IDs rather than asking a reader to eyeball overlapping bars. Sweeping the
+5,684-kernel trace for cross-stream overlapping `[start, end]` windows finds
+**4,404 overlapping kernel pairs** and a **measured maximum of 4 concurrently
+active streams** — exactly `fanout4x4`'s own reported `streams 4/4`, not
+merely 4 streams *used* but 4 genuinely *resident at once*.
+
+One concrete window (all four are the same `bias_act` fused kernel — the
+graph's four independent branches):
+
+| Stream | Start (ns) | End (ns) | Duration (µs) |
+|---|---|---|---|
+| 14 | 799,727,180 | 800,191,268 | 464.1 |
+| 15 | 799,751,052 | 800,239,683 | 488.6 |
+| 16 | 799,768,203 | 800,281,858 | 513.7 |
+| 17 | 799,792,715 | 800,296,226 | 503.5 |
+
+Sum of the four kernels' own durations: 1,969,885 ns. Wall-clock span they
+actually occupy: 569,046 ns. **Local concurrency factor: 3.46×** — close to
+the ideal 4× for four equal-cost branches, confirming these four kernels
+genuinely overlapped on the GPU rather than merely being enqueued to
+different streams and executed back-to-back.
+
+This 3.46× local figure is higher than the graph's overall 1.94× because the
+overall number amortizes this parallel region against the graph's serial
+parts (the initial input distribution and the final join/reduce that must
+run after all four branches complete, per the fan-out topology) — exactly
+the sequential-fraction cost Amdahl's law predicts. The timeline resolves the
+open item cleanly: `fanout4x4`'s 1.94× is real, physical, multi-stream
+overlap, not an artifact of event bookkeeping or measurement noise.

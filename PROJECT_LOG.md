@@ -1223,3 +1223,113 @@ including the NVTX pass.
    were skipped at the time.
 3. Then Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
    profiling/telemetry deliverable.
+
+## 2026-09-11 — Session 10: the nsys timeline, Phase 4's last exit criterion
+
+**Environment:** Colab Tesla T4, driver 580.82.07, fresh clone + rebuild at
+commit `13ef269` (`-DMCKE_USE_NVTX=ON`).
+
+### What was built / done
+
+- Regenerated the Nsight Systems timeline the Session 7 attempt failed to
+  preserve, this time avoiding all three of that attempt's mistakes: built
+  from current HEAD (post-fix, not the use-after-free build), accepted the
+  `*** NON-COMPLIANT WITH RESULTS.md RULE 3 ***` banner as correct for a
+  profiling-only run (and kept its timings out of `RESULTS.md`/`§4` entirely),
+  and downloaded/committed the artifact in the same working session instead of
+  leaving it on ephemeral `/content`.
+- `nsys` was not on `PATH`; located at
+  `/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys` (bundled
+  with the installed `nsight-compute` package — no separate `nsight-systems`
+  package exists on this image, contrary to what the hardcoded Session 7 path
+  might have suggested was a guess; it was actually correct).
+  `nsys profile --trace=cuda,nvtx,osrt --stats=true -o
+  reports/nsys_phase4_fanout4x4 ./build/bin/mcke_graph_bench
+  --only=fanout4x4 --iters=5 --warmup=2` produced
+  `reports/nsys_phase4_fanout4x4.nsys-rep` (998 KB) and a `.sqlite` export.
+- `reports/` is `.gitignore`d (correctly, for CSV/log noise); force-added just
+  this one file (`git add -f`) as a deliberate, narrow exception — the exit
+  criterion explicitly wants it committed. Committed and pushed directly from
+  the Colab instance (reusing the `GITHUB_TOKEN` auth already in the kernel's
+  Python state from the clone cell, via `git -c http.extraHeader=...`), rather
+  than relying on `google.colab.files.download()`, which triggered no
+  visible error but also produced no evidence of a completed browser download
+  in this automated environment — committing directly is the more reliable
+  path when driving Colab non-interactively.
+- No GUI is available to open the `.nsys-rep` visually here, so the trace was
+  queried directly instead: `nsys stats --force-export=true --report
+  cuda_gpu_trace --format csv` gives exact per-kernel start/end timestamps and
+  stream IDs, which were swept in pandas for cross-stream overlapping
+  windows. This is arguably *better* evidence than a screenshot of timeline
+  bars, since it's an exact, reproducible number rather than an eyeballed
+  visual — 4,404 overlapping kernel pairs, a measured max of 4 concurrently
+  resident streams (matching `fanout4x4`'s own reported `streams 4/4`
+  exactly), and one worked example: four `bias_act` kernels on streams
+  14/15/16/17 spanning a combined wall-clock window of 569,046 ns while their
+  own durations sum to 1,969,885 ns — a **3.46× local concurrency factor**.
+  Full writeup and the table are in `RESULTS.md` §5c.
+- Fixed the two stale docs named in the assignment: `docs/PROFILING.md`'s
+  nsys example command used a `--policy=chain_greedy` flag that does not
+  exist (graph_bench runs all three policies per graph; `--only=` selects the
+  graph) — replaced with the actual working command. `docs/ROADMAP.md`
+  assigned "the overlap numbers and nsys timelines" to Explorer, which was
+  simply wrong for `nsys` (it needs no GPU performance counters, unlike `ncu`)
+  and was the actual reason this task looked blocked on the `ERR_NVGPUCTRPERM`
+  ticket for two sessions running — split the line: `nsys` → Colab (the
+  machine `RESULTS.md` §4's numbers already come from), `ncu` → Explorer,
+  pending the RC ticket.
+
+### What was learned
+
+- **Colab's "Run all" is one click away from a real accident.** Reaching for
+  the Resources panel toggle at the end of this session, a misclick landed on
+  "Run all" instead, and it began re-executing the entire notebook top to
+  bottom — including the clone, build, and git-commit-and-push cells already
+  used earlier. Interrupted via Runtime → Interrupt execution (took two tries;
+  the first interrupt let the in-flight cell finish before stopping). Checked
+  local git history afterward: no duplicate or corrupted commits, because
+  every cell in this notebook happens to be idempotent by construction (clone
+  no-ops if the dir exists, `git add -f` on an unchanged file produces "nothing
+  to commit", `git push` on a fresh remote says "Everything up-to-date").
+  That idempotence was luck from how the notebook was built, not a designed
+  safety property — worth being more careful about which cell has focus before
+  invoking a whole-notebook command.
+- **Cell UI state (bracket number, checkmark, tooltip text) can lag the
+  runtime's real state by an entire disconnect/reconnect cycle.** Confirmed
+  again this session: a cell showing a green check and old output can still
+  say, on hover, "cell has not been executed in this session." The only
+  trustworthy live signals are the tooltip's own "started at HH:MM (N minutes
+  ago)" and the bottom status bar's "Executing (Ns)" counter — both were
+  needed repeatedly this session to tell a genuinely-running cell apart from
+  a stale display.
+- Programmatically driving Colab's Monaco-based cell editor by clicking
+  coordinates is fragile in one specific way: clicking anywhere on an EMPTY
+  cell's "Start coding or **generate** with AI" placeholder routes typed text
+  into a Gemini side-panel chat box instead of the cell, silently. Clicking on
+  non-empty text is safe; for empty cells, either click clear of the
+  "generate" hyperlink specifically, or (far more reliable) set the cell's
+  content directly via `monaco.editor.getModels()[i].setValue(...)` through
+  the browser's JS console — sidesteps ghost-autocomplete-suggestion overlays
+  and placeholder-link hijacking entirely. Used this for the rest of the
+  session once discovered.
+
+### Verification
+
+- `mcke_test_graph_host` run fresh on this same build before profiling:
+  86,798 checks, 0 failures (must pass before a profiling run counts, per the
+  task's own instructions).
+- `reports/nsys_phase4_fanout4x4.nsys-rep` confirmed present in the pushed
+  commit (`9e38af0`) and pulled successfully back to the Mac working copy.
+
+### What's next
+
+**Phase 4 is closed.** All four `docs/ROADMAP.md` exit criteria are met with
+measured numbers on real hardware: speedup per policy per graph, event counts,
+peak memory with/without liveness reuse, and now the `nsys` timeline
+confirming actual overlap on the one graph (`fanout4x4`) the wall-clock numbers
+show (1.94×).
+
+1. Optionally, Phase 1–3 end-of-phase Q&A entries in `LEARNING_LOG.md`, which
+   were skipped at the time.
+2. Then Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
+   profiling/telemetry deliverable.

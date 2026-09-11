@@ -183,11 +183,11 @@ personal learning notes in `PROJECT_LOG.md`.
 
 ## 8. Current status
 
-**Phases 0–3 complete. Phase 4 core (graph engine + async scheduling) is
-implemented, bug-fixed, and verified on real GPU hardware, including a
-from-scratch reproducibility investigation of its one anomalous result** —
-see `PROJECT_LOG.md` Sessions 7 (2026-09-07) and 8 (2026-09-10) and
-`docs/ROADMAP.md` for the phase plan.
+**Phases 0–4 complete.** Phase 4 (graph engine + async scheduling) closed in
+Session 10 — all four `docs/ROADMAP.md` exit criteria met with measured
+numbers on real GPU hardware. See `PROJECT_LOG.md` Sessions 7–10
+(2026-09-07 to 2026-09-11) and `docs/ROADMAP.md` for the phase plan. Next up
+is Phase 5 (Google Benchmark + profiling/telemetry).
 
 - Host-only build verified on macOS: 145,665 checks passing (`test_host_core`
   58,856 + `test_graph_host` 86,809) combined.
@@ -225,14 +225,17 @@ see `PROJECT_LOG.md` Sessions 7 (2026-09-07) and 8 (2026-09-10) and
   memory-vs-parallelism tension, the design tradeoffs with rejected
   alternatives, and the open items. `LEARNING_LOG.md` has the Phase 4
   end-of-phase Q&A (Phases 1–3 still have none).
-- Remaining before Phase 4 is fully closed: **only** a clean `nsys` timeline on
-  the fixed binary — the one generated during Session 7 profiled the *pre-fix*
-  binary and is flagged non-compliant/profiling-only. Note the ROADMAP's
-  criterion is "showing actual overlap **or explaining its absence**", and the
-  absence on four of five graphs is already explained and quantified
-  (`launch_bound_ratio ≤ 0.029` — every run is device-bound by ≥34×), so what
-  the timeline adds is direct visual confirmation of `fanout4x4`'s 1.94×, which
-  is currently inferred from wall-clock plus event counts.
+- **The `nsys` timeline is done (Session 10).** Regenerated against the fixed
+  build on Colab T4 (not Explorer — `nsys` traces via CUPTI and needs no GPU
+  performance counters, so it was never actually blocked by
+  `ERR_NVGPUCTRPERM`; `docs/ROADMAP.md` previously mis-assigned it to
+  Explorer, now fixed). `reports/nsys_phase4_fanout4x4.nsys-rep` is committed.
+  Queried directly via `nsys stats --report cuda_gpu_trace` (no GUI available
+  headless) for exact per-kernel timestamps: 4,404 cross-stream overlapping
+  kernel pairs, a measured max of 4 concurrently resident streams matching
+  `fanout4x4`'s own `streams 4/4`, and one worked example showing a **3.46×
+  local concurrency factor** — direct, quantified confirmation that the
+  1.94× is real overlap. Full detail in `RESULTS.md` §5c.
 - All timing/correctness numbers in `RESULTS.md` §4 are exact and current as of
   Session 8. Two write-up errors were corrected in Session 9: the wave-sweep
   bump is in **3 of 4 runs** (not all four — run 1 is the plain monotone curve),

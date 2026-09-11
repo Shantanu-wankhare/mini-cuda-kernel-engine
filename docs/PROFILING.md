@@ -45,9 +45,14 @@ add gets one.
 
 ```bash
 nsys profile --trace=cuda,nvtx,osrt --stats=true \
-  --output=reports/nsys_graph_$(date +%Y%m%d_%H%M) \
-  ./build/bin/mcke_graph_bench --policy=chain_greedy
+  -o reports/nsys_graph_$(date +%Y%m%d_%H%M) \
+  ./build/bin/mcke_graph_bench --only=fanout4x4 --iters=5 --warmup=2
 ```
+
+(there is no `--policy=` flag: `graph_bench` runs all three schedule policies
+per graph in one process and `--only=` selects which graph(s) to run;
+unknown flags are fatal by design, so a typo like `--policy=` exits 2 before
+anything is profiled.)
 
 What to look for, in order:
 1. **Gaps between kernels.** A gap with a busy CPU means launch-bound: the host

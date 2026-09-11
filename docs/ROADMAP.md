@@ -120,7 +120,11 @@ it removes a `__syncthreads` bubble; numerical stability of softmax.
 
 ## Phase 4 — Graph engine and async scheduling
 **Env: [Mac]** for graph logic (topo sort, liveness, planner — all host code,
-all unit-testable), **[Explorer]** for the overlap numbers and `nsys` timelines.
+all unit-testable); **[Colab]** for the overlap numbers and `nsys` timelines —
+`nsys` traces via CUPTI activity/callback APIs and does not touch the GPU
+performance counters that `ERR_NVGPUCTRPERM` blocks, so it runs fine on the
+same machine the §4 numbers come from; **[Explorer]** only for `ncu`, once the
+RC ticket on counter access is resolved.
 
 - `src/graph/graph.cpp` — `finalize()`, Kahn sort, levels, live ranges,
   `to_dot()`.
