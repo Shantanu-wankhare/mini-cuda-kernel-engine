@@ -397,6 +397,12 @@ int main(int argc, char** argv) {
         for (const auto& nt : ex.node_timings()) sum += nt.median_ms;
         // > 1.0 means real overlap: the per-node times add up to more than the
         // graph took. The cleanest overlap evidence available without nsys.
+        // CAVEAT: the numerator (sum) is CONTENDED per-node time -- each
+        // node's own time while sharing the GPU with the others, which can
+        // itself be inflated by that contention (see RESULTS.md sec 5c: a
+        // measured 1.87x per-node slowdown on fanout4x4 under 4-way DRAM
+        // contention). So this factor measures TIME-PACKING, not speedup --
+        // do not read it as, or compare it directly to, r.speedup.
         r.concurrency = r.median_ms > 0 ? sum / r.median_ms : 0.0;
       }
       rows.push_back(r);

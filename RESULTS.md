@@ -1560,10 +1560,70 @@ the ideal 4× for four equal-cost branches, confirming these four kernels
 genuinely overlapped on the GPU rather than merely being enqueued to
 different streams and executed back-to-back.
 
-This 3.46× local figure is higher than the graph's overall 1.94× because the
-overall number amortizes this parallel region against the graph's serial
-parts (the initial input distribution and the final join/reduce that must
-run after all four branches complete, per the fan-out topology) — exactly
-the sequential-fraction cost Amdahl's law predicts. The timeline resolves the
-open item cleanly: `fanout4x4`'s 1.94× is real, physical, multi-stream
-overlap, not an artifact of event bookkeeping or measurement noise.
+> **Caveat on this metric, recorded where it is defined
+> (`bench/graph_bench.cpp`) so it cannot be misread again:** the concurrency
+> factor's numerator is the sum of *contended* per-node durations — the time
+> each kernel actually took while sharing the GPU with the other three, which
+> (see below) is itself inflated relative to running alone. So 3.46×/4 = 87%
+> measures **time-packing** — how tightly the four launches are packed into
+> the wall-clock window, limited mainly by ~65 µs of launch skew across the
+> four start timestamps above — not 87% of *useful* parallelism. A number
+> above 1.0× here proves overlap happened; it is not a speedup and must not
+> be compared to one directly, which the paragraph below did incorrectly.
+
+**Correction to an earlier version of this paragraph.** It originally
+explained the gap between 3.46× and the graph's overall 1.94× speedup as
+Amdahl's-law amortization against "the initial input distribution and the
+final join/reduce that must run after all four branches complete, per the
+fan-out topology." **That mechanism does not exist for this graph.**
+`fanout4x4` is built by `bench/graph_bench.cpp`'s `fanout()`: one input feeds
+four independent chains of `depth` `bias_act` nodes, and each chain ends in
+its own `mark_output()` call — four separate graph outputs, nothing that runs
+*after* them. There is no join node, and `set_input()`'s one H2D copy happens
+once before the warmup loop, not inside the timed region. The real serial
+cost per iteration is just the fork/join events and `synchronize()` —
+microseconds against a 2.2 ms kernel-dominated run — nowhere near enough to
+explain a 1.94×-vs-4× gap. Amdahl's law is not the mechanism here.
+
+**The real mechanism is per-kernel slowdown under DRAM contention**, and it
+is already measured, both in this section and in §3a:
+
+```
+sequential per-node time   = 4.222 ms / 16 nodes            = 263.9 us
+contended per-node time    = mean(464.1, 488.6, 513.7, 503.5) = 492.5 us
+per-node slowdown under contention                            = 1.87x
+
+predicted wall time: 4 depth-levels x 569.0 us/level (one "wave" of
+4 concurrent branch-kernels per level, matching the table above) = 2.276 ms
+measured chain_greedy median                                    = 2.175 ms  (close)
+
+ideal speedup from 4-way parallelism alone            = 4.00x
+speedup after the measured 1.87x per-node slowdown     = 4 / 1.87 = 2.14x
+measured speedup                                       = 1.94x  (close)
+```
+
+Each `bias_act` kernel takes **1.87× longer** when four run at once than it
+does alone. That slowdown — not a serial fraction — is what turns 4× of
+available parallelism into 1.94×. And it has the same cause §3a already
+diagnosed for `diamond_starved`: `fanout4x4`'s branches are built with
+`fanout(4, 4, 2048, 2048, 10)` — 10 blocks per branch, so four concurrent
+branches occupy 40 blocks total, the same block count §3a measured this exact
+kernel hitting **224.6 GB/s, 95.4% of the 235.4 GB/s DRAM ceiling** (that §3a
+row is a different shape, 8192×4096 vs. `fanout4x4`'s 2048×2048 per branch,
+so its exact GB/s figure doesn't transfer directly — but the mechanism, a
+fixed block count starving the DRAM controller regardless of tensor size,
+is the same one). Recomputing the ideal-bytes formula from §3a
+(`(2N+cols)·4` per fused node, `N = rows·cols`) directly for `fanout4x4`'s
+own shape and duration data: the four concurrent kernels move
+4 × 33,562,624 = 134,250,496 bytes over the measured 569,046 ns window, for
+an achieved **235.9 GB/s** — matching the 235.4 GB/s ceiling to within 0.2%.
+These four branches are not merely SM-idle (10 blocks/branch is ~6%
+occupancy); together they saturate DRAM, and DRAM saturation is what slows
+each kernel down. This is `diamond_starved`'s lesson — **"SMs are idle" is
+not "the machine is idle"** — appearing a second time, quantitatively, on the
+one graph where overlap actually paid off.
+
+The timeline still resolves the open item cleanly: `fanout4x4`'s 1.94× is
+real, physical, multi-stream overlap, not an artifact of event bookkeeping or
+measurement noise. What was wrong was only the explanation of why it isn't
+the full 4×.

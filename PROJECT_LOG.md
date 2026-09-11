@@ -1333,3 +1333,80 @@ show (1.94×).
    were skipped at the time.
 2. Then Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
    profiling/telemetry deliverable.
+
+## 2026-09-11 — Session 11: fixed a wrong mechanism in the Session 10 write-up
+
+**Environment:** macOS host-only, no GPU. Documentation-only fix — no code
+changes except one clarifying comment; nothing was re-run.
+
+### What was wrong
+
+`RESULTS.md` §5c's nsys-timeline subsection explained the gap between the
+measured 3.46× local concurrency factor and `fanout4x4`'s overall 1.94×
+speedup as Amdahl's-law amortization against "the initial input distribution
+and the final join/reduce that must run after all four branches complete."
+**That mechanism doesn't exist.** `bench/graph_bench.cpp`'s `fanout()` builds
+one input feeding four independent chains, each ending in its own
+`mark_output()` — four separate graph outputs, no join node, nothing that
+runs after them. `set_input()`'s one H2D copy happens once before the warmup
+loop, not inside the timed region. The actual per-iteration serial cost is
+microseconds of fork/join events against a 2.2 ms run.
+
+### What was found instead, and how it was checked
+
+The real mechanism is **per-kernel slowdown under DRAM contention**, computed
+from numbers already recorded in the same section and in §3a — nothing new
+was measured:
+
+- Sequential per-node time: 4.222 ms / 16 nodes = 263.9 µs. Contended
+  per-node time (mean of the four durations already in the nsys table):
+  492.5 µs. **Per-node slowdown under contention: 1.87×.**
+- 4 depth-levels × 569.0 µs/level (one "wave" of 4 concurrent kernels per
+  level) predicts 2.276 ms; measured `chain_greedy` median is 2.175 ms —
+  close.
+- Ideal parallelism (4×) divided by the measured 1.87× slowdown predicts
+  2.14×; measured speedup is 1.94× — close. The 1.87× slowdown, not a serial
+  fraction, is what turns 4× of available parallelism into 1.94×.
+- This is the exact mechanism §3a already diagnosed for `diamond_starved`:
+  `fanout(4, 4, 2048, 2048, 10)` gives 10 blocks/branch, so four concurrent
+  branches occupy 40 blocks total — the same block count §3a measured this
+  kernel hitting 224.6 GB/s / 95.4% of the 235.4 GB/s DRAM ceiling at (a
+  different shape, 8192×4096, so that exact GB/s figure doesn't transfer
+  directly, only the mechanism does). Recomputing §3a's own ideal-bytes
+  formula directly for `fanout4x4`'s shape and the measured 569,046 ns
+  window gives an achieved 235.9 GB/s — matching the ceiling to within 0.2%,
+  a shape-matched, directly-computed confirmation stronger than citing the
+  §3a row by analogy. `diamond_starved`'s lesson — "SMs are idle" is not "the
+  machine is idle" — reappears here quantitatively, on the one graph where
+  overlap paid off.
+- Secondary correction: 3.46× and 1.94× were being read as directly
+  comparable, and they aren't. The concurrency factor's numerator is
+  *contended* durations (inflated by the 1.87× slowdown itself); the
+  speedup's numerator is *uncontended* sequential time. 3.46×/4 = 87%
+  correctly measures **time-packing** (how tightly the four launches land in
+  the wall-clock window, limited by ~65 µs of launch skew visible in the
+  table's own start timestamps) — not 87% of useful parallelism. Recorded
+  both in `RESULTS.md` (next to the 3.46× figure) and at the metric's actual
+  definition in `bench/graph_bench.cpp` (the `r.concurrency` computation),
+  so a future reader hits the caveat at the source, not just in the prose.
+
+All arithmetic above was checked against the repo's own numbers before
+writing anything (the §4 fanout4x4 row, the nsys table's four durations and
+569,046 ns span, §3a's starved-bandwidth rows and ideal-bytes formula) rather
+than taken on faith from the request that flagged the error.
+
+### What was learned
+
+A plausible, tidy-sounding explanation (Amdahl / join-node overhead) can be
+wrong in a way that only shows up when someone actually reads the graph
+builder it claims to describe. The corrected version is less tidy (it needed
+three separate numbers pinned down, not one clean ratio) but ties back to a
+result already in the document (§3a's DRAM-saturation finding) instead of
+inventing a new one — which is itself a sign it's more likely right.
+
+### What's next
+
+Same as end of Session 10: Phase 4 remains closed. Optionally, Phase 1–3
+end-of-phase Q&A entries in `LEARNING_LOG.md` (skipped at the time). Then
+Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
+profiling/telemetry deliverable.
