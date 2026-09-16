@@ -76,14 +76,30 @@ cmake --build build-host -j
 ctest --test-dir build-host --output-on-failure
 ```
 
+**CMake IS installed on the MacBook** as of 2026-09-16 (Homebrew, cmake 4.4.3) —
+Phase 5's Google Benchmark wiring cannot be verified without it. Plan for the
+MacBook accordingly: `cmake` + `ctest` work here now.
+
+The clang++ escape hatch below is kept for *minimal environments* (a fresh
+container, a login node with no CMake module), not because this machine lacks
+CMake. Re-verified 2026-09-16: still compiles warning-free and still passes.
+Note its one limitation — it builds **`test_host_core` only** (58,856 checks).
+`test_graph_host` (86,809 checks) needs more sources and is not in this
+one-liner, so the fallback covers ~40% of the host suite, not all of it.
+
 ```bash
-# --- No CMake installed? One-command host test (this is verified to work):
+# --- No CMake available? One-command host test (verified 2026-09-16):
 clang++ -std=c++20 -Wall -Wextra -I include -I tests -DMCKE_WITH_CUDA=0 \
   tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp \
   src/core/host_timer.cpp \
   src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp \
   -o /tmp/mcke_tests && /tmp/mcke_tests
 ```
+
+Run it from the **repo root**. `tests/data/reference_vectors.txt` is found by
+probing `tests/data/`, `../tests/data/`, `../../tests/data/` — so an in-repo
+build dir (`build-host/`) works, but a build dir outside the repo silently
+loses those 39 reference-vector checks and reports a failure.
 
 ```bash
 # --- GPU machine (Colab / GCP / 5060 / Explorer)

@@ -1410,3 +1410,142 @@ Same as end of Session 10: Phase 4 remains closed. Optionally, Phase 1–3
 end-of-phase Q&A entries in `LEARNING_LOG.md` (skipped at the time). Then
 Phase 5 (`docs/ROADMAP.md`) — Google Benchmark integration and the
 profiling/telemetry deliverable.
+
+## 2026-09-16 — Session 12: Phase 5 opens — Google Benchmark build wiring (stage 5a)
+
+**Environment:** MacBook Air (Apple Silicon), host-only. AppleClang 21.0.0,
+**CMake 4.4.3 — newly installed via Homebrew this session** (see below). No GPU
+work; nothing in `RESULTS.md` changed.
+
+### Environment change: CMake is now installed on the Mac
+
+Worth its own heading because it invalidates a standing assumption. Until today
+this machine had no `cmake` at all, and `CLAUDE.md` §4 documented a one-line
+`clang++` fallback as the way to run host tests. Phase 5 stage 5a is *entirely*
+CMake work, and its central property — "an offline machine with no Google
+Benchmark configures cleanly and just skips the `_gb` targets" — is a
+**Mac-specific** property that Colab structurally cannot test, because Colab
+always has network. So the choice was install CMake or ship the tri-state
+design unverified.
+
+`CLAUDE.md` §4 is updated to say so. The `clang++` fallback is **kept**, not
+deleted — it is still the right answer for a fresh container or a login node
+with no CMake module — and was re-run verbatim this session to confirm it has
+not rotted: compiles warning-free, **58,856 checks, 0 failures**. Two
+limitations of it are now written down that were not before: it builds
+`test_host_core` only (~40% of the host suite; `test_graph_host`'s 86,809
+checks are not in the one-liner), and it must be run from the repo root.
+
+### What was built
+
+`CMakeLists.txt` only. Two blocks:
+
+1. **`MCKE_GOOGLE_BENCHMARK` — a tri-state cache variable, not an `option()`.**
+   `AUTO` (default) / `ON` / `OFF`. A bool cannot express what three machines
+   need. `AUTO` uses Google Benchmark if it is *already* available and otherwise
+   **silently skips the `_gb` targets without ever touching the network**.
+2. **The acquisition block** — `find_package(benchmark QUIET CONFIG)` first,
+   FetchContent only on explicit `ON` or when `FETCHCONTENT_SOURCE_DIR_BENCHMARK`
+   points at a local checkout.
+
+### What was learned
+
+**`FetchContent`'s `FIND_PACKAGE_ARGS` is the wrong tool here, despite being
+exactly what the roadmap bullet implies.** It exists at our 3.24 floor, so the
+obvious move is `FetchContent_Declare(benchmark ... FIND_PACKAGE_ARGS)`. But
+`FetchContent_MakeAvailable` **falls through to the clone** when `find_package`
+misses, and on a machine with no route to github.com that is a configure-time
+`FATAL_ERROR` for the *whole project* — not just the bench targets. Two of our
+five environments have that property routinely: the MacBook offline, and
+Explorer's compute nodes. The zero-dependency "configures on a laptop with no
+network" property has held since Phase 0 and is worth more than the convenience,
+so absence degrades to *skip*, not to *fail*.
+
+**Every claim about Google Benchmark's CMake was verified against the actual
+v1.9.5 source rather than assumed.** This mattered — the first draft of the
+comment block got the GTest gating structure wrong. Verified facts:
+
+- `BENCHMARK_ENABLE_TESTING` defaults **ON** and is the **outer** gate
+  (`CMakeLists.txt:348`). `BENCHMARK_ENABLE_GTEST_TESTS` (also ON) is *nested
+  inside* it at `:350`, and `find_package(GTest CONFIG REQUIRED)` at `:356` is
+  nested inside that. The original comment described GTEST_TESTS as the
+  independently dangerous one; it isn't, it's unreachable with TESTING off.
+  Corrected in the file.
+- `BENCHMARK_ENABLE_WERROR` defaults **ON** — the genuinely dangerous default.
+  Google Benchmark builds *its own* sources with `-Werror`, so a future compiler
+  emitting one new warning inside a dependency we don't control breaks *our*
+  build. Forced OFF.
+- `CMakeLists.txt:144` does an **unguarded `set(CMAKE_CXX_STANDARD 17)`** and GB
+  declares **no `target_compile_features` anywhere**. Two consequences, and they
+  point opposite ways: (good) `benchmark::benchmark` imposes nothing on our
+  C++20; (bad) `libbenchmark.a` compiles as C++17 while *our* TUs compile
+  `benchmark.h` as C++20 — the header's inline functions and templates compiled
+  twice under two standards, an **ODR violation with no diagnostic**.
+  `-DCMAKE_CXX_STANDARD=20` on the command line does *not* fix it (GB's
+  unguarded `set()` clobbers it); `set_property(TARGET benchmark PROPERTY
+  CXX_STANDARD 20)` afterwards does, and was **confirmed by reading the actual
+  compile flags**: `-std=c++20`.
+- The `SYSTEM` keyword on `FetchContent_Declare` is CMake **3.25**; our floor is
+  3.24. So the hand-rolled `INTERFACE_SYSTEM_INCLUDE_DIRECTORIES` is *required*,
+  not defensive — without it our `-Wall -Wextra -Wpedantic` apply to GB's headers.
+
+**`find build -name '*gtest*'` is the wrong acceptance test**, and it failed on
+the first try for the wrong reason. GB's clone *always* contains
+`test/*_gtest.cc` source files; their presence proves nothing. The real checks
+are that no `googletest-*` directory appears in `_deps` and that zero gtest
+targets exist — both verified.
+
+### Verification — five configurations, all passing
+
+| # | Configuration | Result |
+|---|---|---|
+| 1 | `AUTO`, no GB, **network poisoned**, **fresh** build dir | configures clean, `_gb` skipped, **no `_deps` created** |
+| 2 | `MCKE_GOOGLE_BENCHMARK=ON`, network, fresh dir | fetched at pinned SHA `192ef100`; **no googletest in `_deps`**, 0 gtest targets; `libbenchmark.a` built `-std=c++20` |
+| 3a | `AUTO` + `FETCHCONTENT_SOURCE_DIR_BENCHMARK`, **network poisoned** | used local checkout (the Explorer recipe) |
+| 3b | `AUTO` + installed package, **network poisoned** | `find_package` found 1.9.5, **no `_deps`** |
+| 4 | existing host suite, in-repo `build-host/` | **145,665 checks, 0 failures, 0 warnings** (58,856 + 86,809) |
+
+Config 1 and 3a/3b were run with `HTTPS_PROXY=http://127.0.0.1:1` and
+`GIT_TERMINAL_PROMPT=0` so that any network attempt *fails fast* rather than
+silently succeeding — asserting the offline property instead of assuming it.
+All from **fresh** build directories: once FetchContent populates `_deps` it
+will not re-fetch, so an offline configure over a warm build dir passes for the
+wrong reason and proves nothing.
+
+### A non-bug worth recording, because it looked like a bug
+
+The first `ctest` run reported **58,817 checks and 1 failure** where the binary
+run directly reported **58,856 and 0**. Deterministic, not flaky. Cause:
+`test_reference_vectors` locates `tests/data/reference_vectors.txt` by probing
+three relative paths (`tests/data/`, `../tests/data/`, `../../tests/data/`), and
+the build dir was `/tmp/mcke_cfg1` — outside the repo, so none resolved and 39
+reference-vector checks silently vanished. With the documented in-repo
+`build-host/`, `../tests/data/` resolves and it passes. So: my artifact, not a
+regression, and **not** caused by the CMake change. Now documented in
+`CLAUDE.md` §4 rather than left to be rediscovered.
+
+### Design decisions
+
+Logged live to `DECISIONS.md` as **Q7/Q8/Q9** before any code was written.
+Q7 (Google Benchmark's role) is the one that shapes the phase: **wrap, don't
+replace** — GB owns repetitions and reporting, `Profiler::time_op` keeps owning
+the measurement. The reasoning is that GB computes its statistics **over
+repetitions, of per-repetition means**, so the per-launch median and min that
+`RESULTS.md` rule 3 publishes are averaged away *inside* each repetition before
+GB ever sees them. GB is therefore strictly *less* informative about kernel
+timing than what we already have. Adopting it as a measurement tool would have
+invalidated every §1–§4 number for a downgrade.
+
+Q9 went **against** the recommendation: the owner chose to keep `ncu` on the
+"write the script, validate on Colab, leave §5a blocked" path rather than open
+the RTX 5060 as a new environment. Recorded as such.
+
+### What's next
+
+Stage 5b — `bench/gb_adapter.hpp` and `bench/alloc_bench_gb.cpp`. The adapter is
+the correctness seam: `SetIterationTime` takes **seconds** while
+`rt::Event::elapsed_ms` returns **milliseconds**, and forgetting
+`->UseManualTime()` silently discards the manual timing and reports host
+wall-clock launch latency instead. `alloc_bench_gb` is host-only, so the whole
+thing is verifiable on this machine with no GPU — deliberately, so the `* 1e-3`
+bug cannot survive to burn a Colab session. Stage 5g is the Colab run.

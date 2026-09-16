@@ -242,3 +242,119 @@ memory controller's access pattern" — **not as a floor.** The 1.13× comes fro
 assumption is exactly what the experiment tests. Baking it in as a lower bound
 would be circular. Any of {≈1.13×, ≈1.0×, <1.0×} is a real result; the mechanism
 is the deliverable, not the direction.
+
+## 2026-09-15 — Phase 5 benchmark/profiling planning (main chat)
+
+### Q7. What role should Google Benchmark actually play?
+
+**Question:** Google Benchmark's timing loop uses host wall-clock, which is the
+wrong instrument for async CUDA launches — so "adopt Google Benchmark" has to
+mean something more specific. What role should it play relative to the existing
+`Profiler::time_op` + CUDA-event harness that every `RESULTS.md` §1–§4 number
+came from?
+
+**Options offered:**
+1. **Wrap: GB owns repetitions, Profiler owns timing (Recommended).** New
+   `bench/gb_adapter.hpp` registers benchmarks with `->UseManualTime()` and feeds
+   `state.SetIterationTime()` from our CUDA-event deltas. GB contributes what
+   Profiler genuinely lacks: `--benchmark_repetitions=N` with run-to-run
+   stddev/CV, and JSON output. Profiler's 13-column CSV stays the source of truth
+   for `RESULTS.md`, so no existing number is invalidated. The delta between the
+   two harnesses (one sync at the end vs per-iteration sync) gets measured and
+   written up as a Phase 5 result.
+2. **Replace: rewrite all 6 CUDA benches on GB.** One harness, no duplication,
+   closest to the roadmap bullet's plain reading. Cost: every §1–§4 number
+   becomes non-comparable and needs re-measuring on both T4 and V100;
+   `%peak`/`bound`/ideal-bytes derivation must be reimplemented as
+   `benchmark::Counter`s; and `RESULTS.md` rule 3 ("median AND min over ≥20
+   iterations") is not what GB natively reports.
+3. **Alongside: GB for new benches only, leave the 6 alone.** Lowest risk and
+   least work. But the roadmap's stated motivation — "now we genuinely need its
+   statistics" — goes unmet precisely where the statistics are needed, i.e. the
+   wave-sweep-style run-to-run variance in §4.
+4. **Decline GB; add repetitions + stddev to Profiler instead.** Honest if GB's
+   real value-add is mostly duplicated by ~120 lines in `profiler.cpp`. Keeps the
+   zero-external-dependency, builds-offline property that `CMakeLists.txt:310`
+   currently brags about. Costs: no JSON, no standard tooling, and a deliberate
+   roadmap deviation that has to be argued for in writing.
+
+**Picked:** Option 1.
+
+**Why recommended:** GB's statistics are computed over *repetitions, of
+per-repetition means*. The within-run per-launch distribution that
+`Profiler::time_op` reports a median and a min over is averaged away inside each
+repetition before GB ever sees it — so GB is *strictly less informative* about
+kernel timing than what we already have, and it structurally cannot produce the
+`min` that rule 3 publishes. What GB does add is run-to-run variance, a
+self-describing JSON artifact, and `tools/compare.py`'s Mann–Whitney U
+regression test. That is a harness and a comparison tool, not a measurement tool,
+and the design should say so rather than let the roadmap bullet imply otherwise.
+
+### Q8. What does "one command regenerates every table" mean?
+
+**Question:** The Phase 5 exit criterion is "one command regenerates every table
+in `RESULTS.md`." It reads light but isn't: there are ~28 tables, only ~13 are
+bench-generated, 5 come from unit tests, 3 are hand-authored predictions, 1 is
+blocked on `ncu` perms, and §3d interleaves Colab T4 and Explorer V100 rows under
+different denominators — so no single machine can regenerate it.
+
+**Options offered:**
+1. **Auto-stitch the generated tables, mark the rest (Recommended).**
+   `scripts/regen_results.sh` runs everything runnable on the current machine into
+   `reports/<machine>/*.json`; `tools/render_results.py` rewrites only tables
+   inside `<!-- BEGIN GENERATED: §3a -->` fences, merging per-machine JSON so
+   §3d's T4+V100 rows stitch from two runs. The ~15 prose/derived/test/blocked
+   tables stay hand-written and get an explicit `<!-- AUTHORED -->` marker so it's
+   visible which is which.
+2. **Artifacts only: one command produces every number, not every table.**
+   `regen_results.sh` emits every CSV/JSON/plot plus a `manifest.json` recording
+   GPU, driver, clocks and exact argv. `RESULTS.md` stays entirely hand-edited.
+   Much less machinery and zero risk of a script clobbering hand-written analysis
+   — but the exit criterion is being reinterpreted, which needs saying out loud.
+3. **Full auto: every table generated, including test- and prose-derived ones.**
+   Most faithful to the criterion as written. Requires teaching
+   `test_host_core`/`test_graph_host`/`test_stream_safety` to emit
+   machine-readable output, and committing §3d's prediction/verdict columns as
+   data. Largest surface, and the authored analysis in §2c/§5b/§5c is the part of
+   `RESULTS.md` with the most value per line — putting a generator anywhere near
+   it is the main risk.
+
+**Picked:** Option 1.
+
+**Why recommended:** the fence protocol makes the generated/authored split a
+property of the file rather than tribal knowledge, and it is the only option that
+handles §3d's two-machine merge without one machine's run deleting the other's
+rows. Option 3's cost lands entirely on the prose that is hardest to reconstruct.
+
+### Q9. Where should the `ncu` work run?
+
+**Question:** `scripts/profile_ncu.sh` is a Phase 5 deliverable, but `RESULTS.md`
+§5a is 8 empty rows blocked on `ERR_NVGPUCTRPERM` on Explorer, with the RC ticket
+still open. Where should the ncu work actually run?
+
+**Options offered:**
+1. **RTX 5060 laptop — the owner has admin there (Recommended).**
+   `ERR_NVGPUCTRPERM` is a driver setting (`NVreg_RestrictProfilingToAdminUsers`)
+   changeable on a machine you own. And §5a's columns — sectors/request, bank
+   conflicts, stall reasons, dram_bytes vs compulsory — are *ratios*, which
+   `docs/PROFILING.md` §4 already argues are shape-insensitive and are likewise
+   largely throttle-insensitive, so the laptop's thermal problem doesn't
+   disqualify it for counters the way it does for timings. Cost: sm_120 bring-up
+   (CUDA ≥ 12.8) is a fresh environment this project has never touched.
+2. **Write the script, validate on Colab, keep §5a blocked.** Colab's ncu
+   permissions are documented as unavailable too, so the script would likely ship
+   syntactically checked but never actually executed end-to-end. Honest, cheap,
+   and leaves §5a exactly as blocked as it is today.
+3. **Explorer only — wait on the RC ticket.** Keeps the roadmap's "Env:
+   [Explorer]" as written and keeps all authoritative numbers on one machine with
+   locked clocks. But it makes a Phase 5 deliverable depend on a third party's
+   response time with no known ETA.
+
+**Picked:** Option 2 — the owner chose **not** to take the recommendation.
+
+**What this means for the plan:** §5a stays blocked and stays visibly blocked.
+`scripts/profile_ncu.sh` gets written to the metric set in `docs/PROFILING.md`
+§4, is run on Colab, and the expected `ERR_NVGPUCTRPERM` failure is detected
+explicitly and recorded rather than buried in driver output. Phase 5 does **not**
+open the RTX 5060 as a new environment; that stays available for Phase 6's arch
+A/B, where sm_120 is the point rather than a side effect.

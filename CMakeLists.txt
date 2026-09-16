@@ -42,6 +42,27 @@ option(MCKE_USE_NVTX           "Emit NVTX ranges for Nsight Systems timelines" O
 set(MCKE_CUDA_ARCH "native" CACHE STRING
     "CUDA architectures: 'native', or e.g. '75;80;89;120'")
 
+# Google Benchmark (Phase 5). A TRI-STATE, not an option(), and deliberately so:
+# option() is a bool, and a bool cannot express what three machines need.
+#
+#   AUTO (default) : use it if it is ALREADY available (system package, module,
+#                    or FETCHCONTENT_SOURCE_DIR_BENCHMARK). Otherwise silently
+#                    skip the *_gb targets. NEVER touches the network.
+#   ON             : require it; fetch if necessary; failure is fatal.
+#   OFF            : never, even if installed.
+#
+# WHY AUTO is the default, rather than just always calling FetchContent:
+# FetchContent clones at CONFIGURE time. With no route to github.com,
+# `cmake -B build` aborts -- and not just the bench targets, the WHOLE PROJECT.
+# Two machines here have that property routinely: the MacBook offline, and
+# Explorer's compute nodes, which have no outbound network (you configure on the
+# login node). The zero-dependency, works-on-a-laptop-with-no-network property
+# this project has had since Phase 0 is worth more than the convenience of an
+# unconditional fetch, so absence degrades to "skip" rather than to "fail".
+set(MCKE_GOOGLE_BENCHMARK "AUTO" CACHE STRING
+    "Google Benchmark: AUTO (use if present, else skip) | ON (require/fetch) | OFF")
+set_property(CACHE MCKE_GOOGLE_BENCHMARK PROPERTY STRINGS AUTO ON OFF)
+
 # -----------------------------------------------------------------------------
 # Language standards
 # -----------------------------------------------------------------------------
@@ -230,6 +251,139 @@ target_link_libraries(mcke_device_query PRIVATE mcke)
 if(MCKE_ENABLE_CUDA)
   add_executable(mcke_smoke tools/smoke_vector_add.cpp)
   target_link_libraries(mcke_smoke PRIVATE mcke)
+endif()
+
+# -----------------------------------------------------------------------------
+# Google Benchmark acquisition (Phase 5)
+#
+# Adopted as a HARNESS and a regression-comparison tool, NOT as a measurement
+# tool -- see DECISIONS.md Q7. GB's iteration loop times with host wall-clock,
+# which for an async CUDA launch measures launch latency, and its statistics are
+# computed over REPETITIONS, of per-repetition MEANS. The per-launch median and
+# min that RESULTS.md rule 3 publishes are averaged away inside each repetition
+# before GB ever sees them. So Profiler::time_op keeps doing the measuring;
+# bench/gb_adapter.hpp feeds GB our CUDA-event numbers via SetIterationTime().
+#
+# Deliberately NOT FetchContent's FIND_PACKAGE_ARGS, even though it exists at our
+# 3.24 floor: FetchContent_MakeAvailable FALLS THROUGH to the clone when
+# find_package misses, so on an offline machine it is a configure-time
+# FATAL_ERROR for the whole project. The explicit find_package below cannot do
+# that. FETCHCONTENT_SOURCE_DIR_BENCHMARK=<path> is the documented offline path.
+# -----------------------------------------------------------------------------
+set(MCKE_HAVE_GOOGLE_BENCHMARK OFF)
+
+if(MCKE_BUILD_BENCH AND NOT MCKE_GOOGLE_BENCHMARK STREQUAL "OFF")
+  # Every knob forced OFF *before* the subproject is added. All defaults below
+  # verified against google/benchmark v1.9.5 (192ef100), not assumed:
+  #   BENCHMARK_ENABLE_TESTING       ON  -> the OUTER gate (CMakeLists.txt:348).
+  #                                         This is the one that actually matters:
+  #                                         the GTest acquisition is NESTED inside
+  #                                         it, so OFF here makes the rest
+  #                                         unreachable. Forced anyway, below.
+  #   BENCHMARK_ENABLE_GTEST_TESTS   ON  -> nested at :350; reaching it runs
+  #                                         find_package(GTest CONFIG REQUIRED)
+  #                                         at :356 -- a HARD configure failure
+  #                                         on a box with no GTest.
+  #   BENCHMARK_USE_BUNDLED_GTEST    ON  -> nested at :353; pulls the vendored
+  #                                         googletest tree via include(GoogleTest)
+  #   BENCHMARK_ENABLE_WERROR        ON  -> the genuinely dangerous one: GB
+  #                                         builds ITS OWN sources with -Werror,
+  #                                         so one new warning from a future
+  #                                         AppleClang breaks OUR build inside a
+  #                                         dependency we do not control.
+  #   BENCHMARK_ENABLE_INSTALL/_DOCS/_TOOLS  ON -> we never install(); these
+  #                                         would graft GB's install rules onto
+  #                                         ours.
+  # The rest already default OFF and are pinned so nobody flips them later.
+  # LTO is pinned OFF on principle: link-time optimisation of a MEASUREMENT
+  # library changes what is being measured. LIBPFM is pinned OFF because it
+  # reports HOST CPU counters, which for a GPU benchmark is worse than nothing --
+  # it is plausible-looking noise.
+  #
+  # CACHE ... FORCE rather than a plain set(): GB v1.9.5 declares
+  # cmake_minimum_required(3.13...3.22), so CMP0077 is NEW and a normal variable
+  # WOULD be honoured today. Pinning an older GB tag later would silently
+  # re-enable GTest. CACHE...FORCE is correct under both policy behaviours.
+  set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+  foreach(_bmopt BENCHMARK_ENABLE_TESTING BENCHMARK_ENABLE_GTEST_TESTS
+                 BENCHMARK_USE_BUNDLED_GTEST BENCHMARK_DOWNLOAD_DEPENDENCIES
+                 BENCHMARK_ENABLE_INSTALL BENCHMARK_INSTALL_DOCS
+                 BENCHMARK_INSTALL_TOOLS BENCHMARK_ENABLE_WERROR
+                 BENCHMARK_FORCE_WERROR BENCHMARK_ENABLE_LTO
+                 BENCHMARK_ENABLE_LIBPFM BENCHMARK_ENABLE_DOXYGEN
+                 BENCHMARK_ENABLE_ASSEMBLY_TESTS)
+    set(${_bmopt} OFF CACHE BOOL "" FORCE)
+  endforeach()
+
+  # Path 1 -- already available. `brew install google-benchmark`, a `module load`
+  # on Explorer, or -Dbenchmark_DIR=<dir>. Zero network, zero build time.
+  find_package(benchmark QUIET CONFIG)
+
+  if(benchmark_FOUND)
+    set(MCKE_HAVE_GOOGLE_BENCHMARK ON)
+    message(STATUS "MCKE: Google Benchmark ${benchmark_VERSION} found (system package)")
+
+  elseif(MCKE_GOOGLE_BENCHMARK STREQUAL "ON" OR DEFINED FETCHCONTENT_SOURCE_DIR_BENCHMARK)
+    # Path 2 -- fetch. Only on explicit opt-in, or when the user has pointed
+    # FETCHCONTENT_SOURCE_DIR_BENCHMARK at a local checkout (the offline recipe).
+    include(FetchContent)
+    FetchContent_Declare(benchmark
+      GIT_REPOSITORY https://github.com/google/benchmark.git
+      # A full 40-char SHA, not the tag name. A tag is mutable, and this
+      # project's whole thesis is that a number is only meaningful with its
+      # exact provenance -- "which benchmark library" is part of that. This is
+      # v1.9.5. Cost of a raw SHA: GIT_SHALLOW is unreliable with one, so this
+      # is a full ~25 MB clone, once, cached in the build tree thereafter.
+      GIT_TAG        192ef10025eb2c4cdd392bc502f0c852196baa48
+      GIT_PROGRESS   TRUE
+      UPDATE_DISCONNECTED TRUE)      # do not re-fetch on every reconfigure
+    FetchContent_MakeAvailable(benchmark)
+    set(MCKE_HAVE_GOOGLE_BENCHMARK ON)
+
+    # GB's CMakeLists.txt:144 does an UNGUARDED `set(CMAKE_CXX_STANDARD 17)` in
+    # its own directory scope, and declares no target_compile_features anywhere.
+    # Two consequences, both real:
+    #   (good) benchmark::benchmark imposes NOTHING on us; our
+    #          target_compile_features(mcke_core PUBLIC cxx_std_20) stands.
+    #   (bad)  libbenchmark.a is compiled as C++17 while OUR TUs compile
+    #          benchmark.h as C++20 -- every inline function and class template
+    #          in that header is compiled twice under two different standards.
+    #          That is an ODR violation with no diagnostic.
+    # -DCMAKE_CXX_STANDARD=20 on the command line does NOT fix it; GB's
+    # unguarded set() clobbers it. Overriding the target property afterwards
+    # does, because CXX_STANDARD is merely INITIALISED from the variable at
+    # target-creation time.
+    set_property(TARGET benchmark PROPERTY CXX_STANDARD 20)
+
+    # The SYSTEM keyword on FetchContent_Declare/add_subdirectory is CMake 3.25;
+    # our floor is 3.24 (see the top of this file -- CUDA_ARCHITECTURES native
+    # and LINK_GROUP:RESCAN set it). So this hand-rolled equivalent is REQUIRED,
+    # not defensive: without it, benchmark.h is a normal include and the
+    # -Wall -Wextra -Wpedantic that every bench target sets explicitly (because
+    # mcke_core's are PRIVATE and not inherited) apply to GB's headers too.
+    get_target_property(_bm_inc benchmark INTERFACE_INCLUDE_DIRECTORIES)
+    set_target_properties(benchmark PROPERTIES
+      INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_bm_inc}")
+    # Distinguish the two ways we get here: a real clone vs a local checkout
+    # supplied by FETCHCONTENT_SOURCE_DIR_BENCHMARK. Saying "fetched" for the
+    # latter would be a small lie in exactly the place someone reads to answer
+    # "where did this library come from?" -- which is provenance, and provenance
+    # is the point.
+    if(DEFINED FETCHCONTENT_SOURCE_DIR_BENCHMARK)
+      message(STATUS "MCKE: Google Benchmark from local checkout "
+                     "${FETCHCONTENT_SOURCE_DIR_BENCHMARK} (offline path)")
+    else()
+      message(STATUS "MCKE: Google Benchmark fetched (v1.9.5, 192ef100)")
+    endif()
+
+  else()
+    message(STATUS
+      "MCKE: Google Benchmark not found -- *_gb bench targets skipped. "
+      "This is the AUTO path and is NOT an error. To enable: "
+      "-DMCKE_GOOGLE_BENCHMARK=ON (fetches), or "
+      "-DFETCHCONTENT_SOURCE_DIR_BENCHMARK=<path> (offline), or "
+      "install it (brew install google-benchmark).")
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------
