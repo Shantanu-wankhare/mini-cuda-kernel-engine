@@ -1782,3 +1782,78 @@ Stage 5g — **the Colab run**. First real GPU exercise of everything built in
 same kernel to within noise. If it does not agree, stop and fix the adapter
 before doing anything else in 5g — everything downstream (the cross-check
 itself, the nsys work, the roofline) assumes `kBurst` is trustworthy.
+
+## 2026-09-22 — Session 15: the "untouched" artifacts, and three corrections they forced
+
+**Environment:** MacBook Air, host-only. No benchmarks run; no `RESULTS.md` number changed.
+
+### What happened
+
+The Phase 5 handoff said three untracked files "predate this work and are not to be
+touched", so stages 5a–5c never opened them. The owner suspected a misunderstanding.
+Reading them showed it was one:
+
+- **`phase3_gemm.csv` + `gemm_run.log`** are the CSV and full stdout of Session 5's
+  Colab T4 GEMM run (2026-08-30). Every value matches `RESULTS.md` §3d's nine T4 rows
+  exactly. They were the **only surviving raw evidence behind any published table**
+  (the other four phase CSVs were never kept) and were one `git clean` from gone.
+  Now committed as `reports/colab-t4/phase3_gemm.csv` and
+  `reports/colab-t4/phase3_gemm_stdout.log` (sha256-verified byte-identical), with a
+  provenance `README.md`. Not at the root: `gemm_bench` writes `phase3_gemm.csv` to
+  its CWD, so the next run there would have silently overwritten the evidence.
+- **`HPC docs/`** is a 97 MB local copy of Explorer's own user documentation
+  (`northeastern-rc/rc-public-documentation`; 58 MB of it `.mp4`). **Not committed** —
+  third-party, public upstream, and 97 MB in git history is permanent. Now
+  gitignored explicitly and referenced from `docs/ENVIRONMENTS.md`.
+- A fourth file surfaced: a root-level `nsys_phase4_fanout4x4.nsys-rep`,
+  **byte-identical** to the committed `reports/` copy and hidden from `git status` by
+  `*.nsys-rep`. Moved to `~/.Trash` (recoverable), not deleted.
+
+### Corrections — named and kept, per this project's convention
+
+**1. Session 12 was wrong that "Explorer's compute nodes have no outbound network."**
+Explorer's own docs (`software/systemwide/modules.md:44`): the default `explorer`
+module *sets the HTTP proxy nodes use to reach the internet*, and `module purge`
+removes it. So FetchContent works on Explorer; the real hazard is a `module purge` in
+a job script. **The `MCKE_GOOGLE_BENCHMARK=AUTO` design is unchanged** — the offline
+MacBook alone justifies it, and `module purge` is a documented variant of the same
+failure — but its written justification was false. Corrected in `CMakeLists.txt`.
+The same claim appears in the messages of commits `9d64ea0`/`6ebad54`; those are
+corrected here and in the next commit message rather than by rewriting history.
+
+**2. `CMakeLists.txt` listed "a `module load` on Explorer" as a way to find Google
+Benchmark.** Explorer has no such module. On Explorer it is FetchContent (via the
+proxy) or `FETCHCONTENT_SOURCE_DIR_BENCHMARK`.
+
+**3. `docs/ENVIRONMENTS.md` said `module load cuda/12.4` and "`ncu` normally works
+here".** Both pre-date this phase and both were false: Explorer has `cuda/12.1.1`,
+`12.3.0`, `12.8.0` (no 12.4), and `ncu` fails with `ERR_NVGPUCTRPERM` on this account
+(measured 2026-08-31). Now pinned to `cmake/3.30.2 cuda/12.3.0` — 12.3.0 being what
+every V100 row in `RESULTS.md` used.
+
+**Found, deferred to stage 5h:** `scripts/explorer_gpu.sbatch`'s commented bench
+lines use flags that don't exist (`--sizes=`, `--out=`, `--trace=`, `--policies=`,
+`--policy=`) — `gemm_bench`/`graph_bench` exit 2 on them — its `ncu` line uses
+`--kernel-name regex:gemm`, which also matches cuBLAS (`docs/PROFILING.md` §4), and
+its partition differs from the `gpu-interactive` + `--gres=gpu:v100-sxm2:1` that
+produced §3d.
+
+**Unresolved inconsistency, for the owner:** `CLAUDE.md` §8 says the RC ticket for
+`ERR_NVGPUCTRPERM` "is filed and open"; `RESULTS.md` §5a says fixing it "needs an RC
+ticket". One of them is stale.
+
+### What was learned
+
+A handoff instruction was treated as a constraint on *reading*, when at most it was
+about *modifying*. The cost was concrete: three claims about Explorer were written
+into `CMakeLists.txt`, `PROJECT_LOG.md`, the plan and two commit messages, and the
+cluster's own documentation — sitting in the working tree the whole time — refuted
+two of them in one `grep`. None of the wrong claims had reached code, only comments
+and docs, so nothing needed re-verifying beyond a configure. The rule taken from it:
+an unexplained "don't touch" means ask what it protects, not skip looking.
+
+### What's next
+
+Unchanged: stage 5d (`scripts/profile_nsys.sh`, `scripts/profile_ncu.sh`,
+`tools/nsys_overlap.py`), then 5e (`tools/plot_roofline.py`, which now reads the
+committed `reports/colab-t4/phase3_gemm.csv`), then the combined Colab run, 5g.

@@ -93,21 +93,39 @@ alongside the run and say "laptop, throttled" in the results row.
 
 ```bash
 module avail cuda
-module load cuda/12.4          # or whatever is current — record the version
-srun -p gpu --gres=gpu:1 --pty /bin/bash    # interactive node for quick checks
+# Pin both. There is no cuda/12.4 on Explorer (an earlier version of this file
+# said to load it) -- available: 12.1.1, 12.3.0, 12.8.0. 12.3.0 is what every
+# RESULTS.md V100 row was measured with, so keep it for comparability.
+module load cmake/3.30.2 cuda/12.3.0
+srun -p gpu-interactive --gres=gpu:v100-sxm2:1 --pty /bin/bash   # what §3d used
 ```
 
-Batch job: see `scripts/explorer_gpu.sbatch`.
+Batch job: see `scripts/explorer_gpu.sbatch` (its commented bench lines are
+stale — nonexistent flags — and get rewritten in Phase 5 stage 5h).
+
+**Reference:** Explorer's own user documentation is mirrored locally at
+`HPC docs/source/` (gitignored, 97 MB); upstream is
+<https://github.com/northeastern-rc/rc-public-documentation>. Check claims about
+the cluster there before designing around them.
 
 Notes:
+- **Network: compute nodes DO reach the internet, via an HTTP proxy set by the
+  default `explorer` module** (`HPC docs/source/software/systemwide/modules.md`).
+  `module purge` removes it, after which anything that fetches at build time —
+  e.g. `-DMCKE_GOOGLE_BENCHMARK=ON`'s FetchContent clone — fails at configure.
+  Never `module purge` in a job script; if you must, `module load explorer`
+  straight after. There is **no** Google Benchmark module, so FetchContent (or
+  `-DFETCHCONTENT_SOURCE_DIR_BENCHMARK=<checkout>`) is the path here.
 - Request the specific GPU type when you need comparability:
   `--gres=gpu:a100:1` vs `--gres=gpu:v100:1`. Mixing V100 and A100 numbers in one
   table is the easiest way to draw a wrong conclusion.
 - Exclusive nodes (`--exclusive`) matter for timing: a co-tenant kernel will show
   up as timing variance you spend an hour chasing.
-- `ncu` normally works here. If it reports
-  `ERR_NVGPUCTRPERM`, profiling counters are restricted — ask RC support, or fall
-  back to `nsys` + event timing.
+- `ncu` does **not** currently work for this account: it ships inside the CUDA
+  module (no separate Nsight Compute module) and fails with `ERR_NVGPUCTRPERM`
+  (measured 2026-08-31 — driver restricts counters to admins). Fix needs RC
+  (`rchelp@northeastern.edu`); status in `RESULTS.md` §5a. `nsys` is unaffected (it needs no GPU counters), and an
+  Nsight Systems module (2024.7.1) also exists.
 - Long runs: this is where GEMM tile sweeps and multi-size scaling studies belong.
 
 ---

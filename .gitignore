@@ -27,3 +27,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Local copy of Northeastern RC's public docs (Explorer's user manual), kept as a
+# reference -- it is what corrected this repo's "compute nodes have no network"
+# claim in 2026-09. NOT committed: third-party, 97 MB (58 MB of it .mp4), and
+# public upstream at https://github.com/northeastern-rc/rc-public-documentation.
+# Ignored explicitly so a stray `git add -A` cannot put 97 MB into history.
+HPC docs/

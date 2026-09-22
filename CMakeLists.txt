@@ -54,9 +54,13 @@ set(MCKE_CUDA_ARCH "native" CACHE STRING
 # WHY AUTO is the default, rather than just always calling FetchContent:
 # FetchContent clones at CONFIGURE time. With no route to github.com,
 # `cmake -B build` aborts -- and not just the bench targets, the WHOLE PROJECT.
-# Two machines here have that property routinely: the MacBook offline, and
-# Explorer's compute nodes, which have no outbound network (you configure on the
-# login node). The zero-dependency, works-on-a-laptop-with-no-network property
+# The MacBook offline hits that directly. Explorer is subtler: its compute nodes
+# DO reach the internet, but only through an HTTP proxy that the default
+# `explorer` module sets -- and `module purge`, a common first line of a job
+# script, silently removes it (Explorer's docs, software/systemwide/modules.md).
+# (Corrected 2026-09-22: an earlier version of this comment claimed Explorer's
+# compute nodes have no outbound network at all. They do; the proxy is the
+# catch.) The zero-dependency, works-on-a-laptop-with-no-network property
 # this project has had since Phase 0 is worth more than the convenience of an
 # unconditional fetch, so absence degrades to "skip" rather than to "fail".
 set(MCKE_GOOGLE_BENCHMARK "AUTO" CACHE STRING
@@ -315,8 +319,11 @@ if(MCKE_BUILD_BENCH AND NOT MCKE_GOOGLE_BENCHMARK STREQUAL "OFF")
     set(${_bmopt} OFF CACHE BOOL "" FORCE)
   endforeach()
 
-  # Path 1 -- already available. `brew install google-benchmark`, a `module load`
-  # on Explorer, or -Dbenchmark_DIR=<dir>. Zero network, zero build time.
+  # Path 1 -- already available: `brew install google-benchmark`, or
+  # -Dbenchmark_DIR=<dir>. Zero network, zero build time. (Explorer has NO
+  # Google Benchmark module -- checked against its module list 2026-09-22 -- so
+  # there it is path 2: FetchContent through the `explorer` module's proxy, or
+  # FETCHCONTENT_SOURCE_DIR_BENCHMARK.)
   find_package(benchmark QUIET CONFIG)
 
   if(benchmark_FOUND)
