@@ -489,6 +489,28 @@ if(MCKE_BUILD_BENCH AND MCKE_HAVE_GOOGLE_BENCHMARK)
   )
 endif()
 
+# Pilot GPU _gb targets (Phase 5, stage 5c). Only reduce and bias_act -- NOT
+# gemm or graph, whose bespoke tables (the wave sweep, fork/join event counts,
+# enqueue_us) ARE the Phase 3d/4 deliverables and Google Benchmark's
+# row-per-benchmark output cannot express them.
+#
+# Gated on BOTH MCKE_ENABLE_CUDA and MCKE_HAVE_GOOGLE_BENCHMARK, unlike
+# alloc_bench_gb: these call the launchers declared in kernels.hpp, which do
+# not exist in a host-only build. Link the `mcke` UMBRELLA (not mcke_core
+# alone) for the same LINK_GROUP:RESCAN reason bias_act_bench/reduce_bench
+# above do -- mcke_core calls into mcke_kernels.
+if(MCKE_BUILD_BENCH AND MCKE_ENABLE_CUDA AND MCKE_HAVE_GOOGLE_BENCHMARK)
+  foreach(_b bias_act reduce)
+    add_executable(mcke_${_b}_bench_gb bench/${_b}_bench_gb.cpp)
+    target_link_libraries(mcke_${_b}_bench_gb PRIVATE mcke benchmark::benchmark)
+    target_include_directories(mcke_${_b}_bench_gb PRIVATE
+      ${MCKE_TESTS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    target_compile_options(mcke_${_b}_bench_gb PRIVATE
+      $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+      $<$<CXX_COMPILER_ID:MSVC>:/W4>)
+  endforeach()
+endif()
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------

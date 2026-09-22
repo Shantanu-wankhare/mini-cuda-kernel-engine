@@ -1699,3 +1699,86 @@ Deliberately *not* `gemm_bench`/`graph_bench`: their bespoke tables (wave sweep,
 fork/join counts, `enqueue_us`) *are* the Phase 3/4 deliverables and GB's output
 format cannot express them. Stage 5g is the Colab run, where `kBurst` must agree
 with `Profiler::time_op` to within noise — if it does not, the adapter is wrong.
+
+## 2026-09-22 — Session 14: Phase 5 stage 5c — pilot GPU targets
+
+**Environment:** MacBook Air (Apple Silicon), host-only. No GPU, so these two
+targets are typechecked but not run — real execution is stage 5g on Colab.
+Nothing in `RESULTS.md` changes.
+
+### What was built
+
+- **`bench/reduce_bench_gb.cpp`** (new) — GB pilot for row-reduce (Phase 3b),
+  both timing modes (`kBurst`/`kPerIter`) at the same two shapes
+  `reduce_bench.cpp` uses (`8192×4096` saturated, `64×524288` starved).
+- **`bench/bias_act_bench_gb.cpp`** (new) — GB pilot for fused bias+GELU-tanh
+  (Phase 3a), both modes at the primary `8192×4096` shape and the L2-resident
+  `512×512` control.
+- **`CMakeLists.txt`** — `mcke_reduce_bench_gb` / `mcke_bias_act_bench_gb`,
+  gated on `MCKE_ENABLE_CUDA AND MCKE_HAVE_GOOGLE_BENCHMARK`, linking the
+  `mcke` umbrella (not `mcke_core`) since these call into `mcke_kernels`.
+
+Neither `reduce_bench.cpp` nor `bias_act_bench.cpp` was touched — both new
+files are pilots alongside them, not replacements.
+
+### Why these two shapes, deliberately
+
+The 512×512 L2-resident shape and the 64×524288 starved shape are the two
+**shortest** kernels anywhere in Phase 3. Short kernels are exactly where
+`kPerIter`'s per-iteration host sync (see `gb_adapter.hpp`'s banner) costs the
+most as a fraction of the measurement — which is what makes stage 5g's
+`kBurst`-vs-`kPerIter` cross-check informative rather than academic. Between
+the two pilot files, the registered shapes span roughly three orders of
+magnitude in kernel duration.
+
+### A design problem worth recording: GB registers before main() can set up a device
+
+Google Benchmark's `BENCHMARK_CAPTURE` macros run at **static-init time** —
+before `main()` even parses argv — but device setup (query, allocate, upload,
+the one-time correctness check) can only happen inside `main()`. Solved with a
+plain `std::unique_ptr<Fixture> g_fx`, set once in `main()` before
+`RunSpecifiedBenchmarks()` and only read by the registered benchmark functions.
+Not a Google Benchmark `Fixture` class: every other bench in this project uses
+free functions and captured state, and matching that style keeps
+`gb_adapter.hpp` usable without pulling in GB's class-based API as well.
+
+**Correctness runs exactly once, in `main()`, before any GB benchmark
+executes** — not inside a registered benchmark function. GB has no "verify
+once, then time" notion; verifying inside a registered function would pay a
+device→host copy and a CPU-side compare on *every* iteration, which is not what
+`reduce_bench.cpp`/`bias_act_bench.cpp` measure and would make the pilot's
+numbers incomparable to the originals for a reason that has nothing to do with
+Google Benchmark.
+
+### Verification
+
+Full compilation requires an actual CUDA installation, so this stage's
+verification is necessarily partial on the Mac:
+
+- **`scripts/typecheck_cuda.sh`**: `ok bench/reduce_bench_gb.cpp`,
+  `ok bench/bias_act_bench_gb.cpp` — both typecheck clean under
+  `MCKE_WITH_CUDA=1` via `scripts/fakecuda`, including the `Fixture` aggregate
+  construction and the `gb_adapter.hpp` template instantiations. This is real
+  coverage (it catches signature mismatches, missing includes, and template
+  errors) but it is not a compile against real `cuda_runtime_api.h`/`nvcc`.
+- CMake conditional gating confirmed by reconfiguring with
+  `-DMCKE_ENABLE_CUDA=OFF`: `mcke_reduce_bench_gb` / `mcke_bias_act_bench_gb`
+  correctly **absent** from the target list (they call `mcke_kernels`
+  launchers, which don't exist in a host-only build).
+- `mcke_alloc_bench_gb` and the host suite unaffected: `build-gb` builds with
+  0 warnings, `ctest --test-dir build-host` still 100% pass, 145,665 checks.
+
+**Not yet verified, and cannot be from this machine:** that either file
+actually compiles under real `nvcc`, links against real `cublas`/`cudart`, or
+produces sane numbers. That is stage 5g's job, and it is the first real test of
+whether `kBurst` agrees with `Profiler::time_op` — if it does not, the adapter
+is wrong regardless of how clean the typecheck is.
+
+### What's next
+
+Stage 5g — **the Colab run**. First real GPU exercise of everything built in
+5a–5c: build with `-DMCKE_ENABLE_CUDA=ON -DMCKE_GOOGLE_BENCHMARK=ON`, run both
+`_gb` pilots, and check that `kBurst` agrees with `Profiler::time_op` on the
+same kernel to within noise. If it does not agree, stop and fix the adapter
+before doing anything else in 5g — everything downstream (the cross-check
+itself, the nsys work, the roofline) assumes `kBurst` is trustworthy.
