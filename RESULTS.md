@@ -1178,9 +1178,17 @@ NVIDIA GPU Performance Counters on the target device 0.
 A driver-level restriction (`NVreg_RestrictProfilingToAdminUsers`), not fixable
 from inside a job — Explorer's own documentation does not mention Nsight
 Compute at all (only Nsight *Systems*), and does not address this permission
-model either. Fixing it needs an RC ticket (`rchelp@northeastern.edu`), which
-has not been filed yet — deliberately deferred (see `DECISIONS.md`,
-2026-08-31) rather than blocking Phase 3's writeup on it. **Not attempted on
+model either. **An RC ticket was filed 2026-08-31** (`rchelp@northeastern.edu`,
+account `wankhare.s`, citing the exact `ERR_NVGPUCTRPERM` error, job details —
+V100 node `d1007`, `--gres=gpu:v100-sxm2:1`, `cuda/12.3.0`, `ncu` 2023.3.0.0 —
+and asking for per-account counter access or
+`NVreg_RestrictProfilingToAdminUsers=0` cluster-wide; see `PROJECT_LOG.md`
+Session 4). **Still open, no reply as of 2026-09-22** — not blocking further
+work per the decision below. (This paragraph previously said the ticket "has
+not been filed yet"; that was stale the moment it was written — the ticket was
+filed the same day, per `DECISIONS.md`'s "revisited 2026-08-31, later the same
+day" entry — and stayed uncorrected until noticed in Phase 5 stage 5d.)
+**Not attempted on
 Colab** — `docs/ENVIRONMENTS.md` already documents that Colab's container
 lacks the profiling permissions this needs. **Not yet attempted on the RTX
 5060.**

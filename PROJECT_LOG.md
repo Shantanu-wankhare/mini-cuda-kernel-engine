@@ -1857,3 +1857,137 @@ an unexplained "don't touch" means ask what it protects, not skip looking.
 Unchanged: stage 5d (`scripts/profile_nsys.sh`, `scripts/profile_ncu.sh`,
 `tools/nsys_overlap.py`), then 5e (`tools/plot_roofline.py`, which now reads the
 committed `reports/colab-t4/phase3_gemm.csv`), then the combined Colab run, 5g.
+
+## 2026-09-22 — Session 16: Phase 5 stage 5d — profiling scripts
+
+**Environment:** MacBook Air, host-only. No `nsys`, no `ncu`, no GPU anywhere on
+this machine — which shaped the whole stage, see below. Nothing in `RESULTS.md`
+changed except the RC-ticket wording fixed in Session 15's tail (§5a now reads
+"filed 2026-08-31 … still open as of 2026-09-22", confirmed correct by the owner).
+
+### What was built
+
+- **`scripts/machine_tag.sh`** (new) — one `mcke_machine_tag()` function, sourced
+  by the other scripts (and meant for stage 5f's `regen_results.sh` too), so
+  "which machine produced this" isn't copy-pasted three times and drifts.
+  `MCKE_MACHINE_TAG` env override for forcing a name (e.g. `explorer-v100`)
+  over whatever `nvidia-smi`'s name string would slug to.
+- **`scripts/profile_nsys.sh`** (new) — parameterises the nsys command
+  `RESULTS.md` §5c documents as having been run once, by hand. Warns (doesn't
+  block) if the target binary lacks `nvtxRangePush*` symbols; immediately runs
+  the `nsys stats --report cuda_gpu_trace --format csv` post-processing step so
+  `tools/nsys_overlap.py` has ready input without a human remembering a second
+  command — that missing second step is exactly why the original analysis was
+  ad-hoc shell work instead of a script.
+- **`scripts/profile_ncu.sh`** (new) — one `ncu` invocation per GEMM variant,
+  per `docs/PROFILING.md` §4's already-established recipe (small shape, one
+  invocation per variant because `--kernel-name regex:gemm` also matches
+  cuBLAS). Detects `ERR_NVGPUCTRPERM` explicitly and **stops after the first
+  variant** rather than repeating the same driver-level error seven times,
+  since the restriction is machine-wide, not per-kernel.
+- **`tools/nsys_overlap.py`** (new) — the analysis that produced `RESULTS.md`
+  §5c's three headline numbers (4,404 overlapping pairs / max 4 concurrent
+  streams / 3.46× local concurrency factor), which until now existed only as
+  unrecorded shell work. A real sweep-line algorithm, not a placeholder.
+- **`scripts/explorer_gpu.sbatch`** — the stale ncu/nsys lines replaced with
+  calls to the two new scripts; the equally-stale `module load cuda` fixed to
+  pin `cmake/3.30.2 cuda/12.3.0`; the bench-flag lines left as commented-out
+  `TODO`s naming the real flags each bench actually has today, rather than
+  inventing new ones ahead of stage 5f's design.
+
+### A design constraint that shaped the whole stage: no `nsys`, no `ncu`, on this machine
+
+Every prior GPU-adjacent stage (5b, 5c) at least had a *typecheck* path via
+`scripts/fakecuda`. This stage has no equivalent — `nsys`/`ncu` are binary CLI
+tools, not headers, so there is nothing to typecheck against. Two consequences,
+handled by splitting each piece of work into a **verifiable core** and an
+**unverifiable shell**, rather than writing the whole thing on faith:
+
+- **`nsys_overlap.py`** separates `extract_csv_via_nsys()` (shells out to the
+  real `nsys` binary — genuinely untestable here) from `parse_gpu_trace_csv()`
+  and `compute_overlaps()` (pure Python, fully testable). The column-name
+  candidates for the CSV parser are an **informed guess**, not a verified
+  schema — checked against NVIDIA's own User Guide (does not publish it) and by
+  web search (inconclusive) before writing the guess down as a guess rather
+  than presenting it as fact. The parser fails loudly with the actual header
+  printed if none of the candidates match, by design, so a wrong guess is a
+  one-line fix on Colab rather than a silently wrong number.
+- **`scripts/profile_nsys.sh` / `scripts/profile_ncu.sh`** were still smoke-tested
+  for real, just not on the paths that need the missing binaries: every
+  argument-validation and "tool not found" failure path is exercised directly,
+  because this machine genuinely lacking `nsys`/`ncu` makes those *real* test
+  cases, not simulated ones (same shape as stage 5b's host-only GB target).
+
+### Verification: the overlap algorithm reproduces RESULTS.md's own numbers
+
+`compute_overlaps()`'s self-tests aren't just synthetic sanity checks — one of
+them **reconstructs the exact four (start, end) timestamp pairs printed in
+`RESULTS.md` §5c's worked-example table** (streams 14–17, the `fanout4x4` run)
+and re-derives, independently:
+
+- duration sum: **1,969,885 ns** — matches the document exactly
+- wall-clock span: **569,046 ns** — matches the document exactly
+- local concurrency factor: **3.4617×** — matches the document's stated 3.46×
+  to its own precision
+
+This is a stronger check than a synthetic unit test: it confirms the
+*algorithm*, not just its arithmetic, agrees with a number this project already
+published and stands behind.
+
+**A real bug was caught by the first synthetic case, before the reconstruction
+even ran.** The sweep-line's event tuples used `kind=0` for END and `kind=1`
+for START (correct for the *sort order* — ends must sort before starts on a
+tie), but the loop then wrote `if is_end:` testing `kind` directly — which is
+backwards, since `1` (START) is truthy. Every self-test failed with a
+`KeyError` on the very first case (`disjoint`, the simplest possible input).
+Fixed by computing `is_end = (kind == 0)` explicitly rather than treating the
+sort key as a boolean. Left in the file as a comment, because it's a shape of
+mistake ("the sort key and the semantic flag look like the same thing and
+aren't") worth flagging for whoever next touches this function.
+
+**`docs/PROFILING.md`'s own account of the nsys workflow was the best source of
+ground truth available**, better than web search: `nsys stats --output <name>`'s
+exact semantics couldn't be confirmed (NVIDIA's docs describe per-format,
+comma-separated output targets, not a plain basename), so `profile_nsys.sh`
+uses shell redirection (`nsys stats ... > file.csv`) instead — confirmed safe
+because `RESULTS.md` §5c's own account describes querying the trace exactly
+that way ("queried directly via `nsys stats --report cuda_gpu_trace`").
+
+**One planning error caught before it became a wrong doc edit.** The Session 15
+corrections plan assumed `scripts/explorer_gpu.sbatch`'s `--partition=gpu`
+should become `gpu-interactive` to match the sessions that produced the V100
+`RESULTS.md` rows. Checking Explorer's own docs first
+(`HPC docs/source/gpus/quickstart-h200.md`) showed `gpu` is a real, separate,
+documented **batch** partition — `gpu-interactive` is for `srun` sessions
+specifically. Left `--partition=gpu` alone; pinned `--gres=gpu:v100-sxm2:1`
+instead, which is the actual source of comparability with existing rows.
+
+### Verification
+
+- `python3 tools/nsys_overlap.py --self-test`: **6/6 pass**, including the
+  RESULTS.md §5c reconstruction above.
+- CSV parsing tested end-to-end with a synthetic `cuda_gpu_trace`-shaped CSV
+  (Start+Duration form and Start+End form), and the missing-column failure path
+  prints the actual header and a specific fix instruction, exit 1, no traceback.
+- `shellcheck` (freshly installed) clean on all four shell scripts, sanity-
+  checked against the *existing* `typecheck_cuda.sh`/`build.sh` to confirm the
+  tool itself isn't silently no-op'ing.
+- Every real failure path exercised directly: no-args usage (exit 2), missing
+  binary (exit 1), missing `nsys` (exit 1), missing `ncu` (exit 1),
+  `machine_tag.sh`'s no-`nvidia-smi` fallback (`unknown-gpu`) and its
+  `MCKE_MACHINE_TAG` override.
+- Host suite and `typecheck_cuda.sh` unaffected (145,665 checks; all clean) —
+  expected, since this stage touches no C++/CMake, but checked rather than assumed.
+- **Not yet verified, and cannot be from here:** that `extract_csv_via_nsys()`
+  actually shells out correctly, or that the column-name guesses match real
+  `nsys` output. That is stage 5g's job, against the already-committed
+  `reports/nsys_phase4_fanout4x4.nsys-rep` — the target is reproducing 4,404 /
+  4 / ~3.46×, the same numbers this stage's self-test already reconstructed
+  from the *published* timestamps.
+
+### What's next
+
+Stage 5e — `tools/plot_roofline.py`, reading the now-committed
+`reports/colab-t4/phase3_gemm.csv`. Then the combined Colab session (5g), which
+is where this stage's genuinely untested half — the real `nsys`/`ncu` shell-outs
+and the CSV column-name guess — gets its first real exercise.
