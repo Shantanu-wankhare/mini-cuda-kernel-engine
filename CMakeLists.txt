@@ -323,7 +323,13 @@ if(MCKE_BUILD_BENCH AND NOT MCKE_GOOGLE_BENCHMARK STREQUAL "OFF")
     set(MCKE_HAVE_GOOGLE_BENCHMARK ON)
     message(STATUS "MCKE: Google Benchmark ${benchmark_VERSION} found (system package)")
 
-  elseif(MCKE_GOOGLE_BENCHMARK STREQUAL "ON" OR DEFINED FETCHCONTENT_SOURCE_DIR_BENCHMARK)
+  # NOTE the test is "non-empty", NOT "DEFINED". FetchContent_Declare itself
+  # creates FETCHCONTENT_SOURCE_DIR_<name> as an EMPTY cache entry, so once any
+  # configure in this build dir has reached the fetch path, DEFINED is true
+  # forever after -- and AUTO would silently start fetching in a build dir that
+  # had once been configured with =ON. A bare if(VAR) is false for an empty
+  # string, which is exactly the question we mean to ask.
+  elseif(MCKE_GOOGLE_BENCHMARK STREQUAL "ON" OR FETCHCONTENT_SOURCE_DIR_BENCHMARK)
     # Path 2 -- fetch. Only on explicit opt-in, or when the user has pointed
     # FETCHCONTENT_SOURCE_DIR_BENCHMARK at a local checkout (the offline recipe).
     include(FetchContent)
@@ -369,7 +375,7 @@ if(MCKE_BUILD_BENCH AND NOT MCKE_GOOGLE_BENCHMARK STREQUAL "OFF")
     # latter would be a small lie in exactly the place someone reads to answer
     # "where did this library come from?" -- which is provenance, and provenance
     # is the point.
-    if(DEFINED FETCHCONTENT_SOURCE_DIR_BENCHMARK)
+    if(FETCHCONTENT_SOURCE_DIR_BENCHMARK)
       message(STATUS "MCKE: Google Benchmark from local checkout "
                      "${FETCHCONTENT_SOURCE_DIR_BENCHMARK} (offline path)")
     else()
@@ -451,6 +457,33 @@ if(MCKE_BUILD_BENCH)
   # This file does substantial pointer and size arithmetic, where -Wextra earns
   # its keep, so opt in explicitly rather than silently building unwarned.
   target_compile_options(mcke_alloc_bench PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  )
+endif()
+
+# Google Benchmark bench targets (Phase 5, stage 5b).
+#
+# alloc_bench_gb is the ONLY Google Benchmark target that builds without a GPU,
+# and that is its job as much as the allocator numbers are: stage 5b's failure
+# modes are all silent (a missing `* 1e-3` reports 1000x; a missing
+# ->UseManualTime() reports launch latency as kernel time), so the guards are
+# tested HERE, on the MacBook, rather than discovered on Colab. See the
+# bm_unit_conversion self-check in that file.
+#
+# Links mcke_core, NOT the `mcke` umbrella -- same reason as mcke_alloc_bench
+# directly above: the umbrella pulls in mcke_kernels, which does not exist in a
+# host-only build. Ungated on MCKE_ENABLE_CUDA for the same reason.
+if(MCKE_BUILD_BENCH AND MCKE_HAVE_GOOGLE_BENCHMARK)
+  add_executable(mcke_alloc_bench_gb bench/alloc_bench_gb.cpp)
+  # benchmark::benchmark, NOT benchmark::benchmark_main: gb_adapter.hpp requires
+  # our own main() so that argv can be snapshotted BEFORE benchmark::Initialize
+  # strips the --benchmark_* flags out of it (RESULTS.md rule 2).
+  target_link_libraries(mcke_alloc_bench_gb PRIVATE mcke_core benchmark::benchmark)
+  target_include_directories(mcke_alloc_bench_gb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+  # As with every other bench target: mcke_core's warning flags are PRIVATE and
+  # are not inherited, so opt in explicitly.
+  target_compile_options(mcke_alloc_bench_gb PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
   )

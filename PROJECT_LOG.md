@@ -1549,3 +1549,153 @@ the correctness seam: `SetIterationTime` takes **seconds** while
 wall-clock launch latency instead. `alloc_bench_gb` is host-only, so the whole
 thing is verifiable on this machine with no GPU — deliberately, so the `* 1e-3`
 bug cannot survive to burn a Colab session. Stage 5g is the Colab run.
+
+## 2026-09-22 — Session 13: Phase 5 stage 5b — the Google Benchmark adapter
+
+**Environment:** MacBook Air (Apple Silicon), host-only, AppleClang 21.0.0,
+CMake 4.4.3, Google Benchmark v1.9.5 (`192ef100`). No GPU. Nothing in
+`RESULTS.md` changed — these are host allocator microbenchmarks, not a
+replacement for anything published.
+
+### What was built
+
+- **`bench/gb_adapter.hpp`** (new) — the seam between Google Benchmark's
+  iteration loop and CUDA-event timing. Two named modes: `kBurst` (one GB
+  iteration = one `Profiler::time_op` burst, identical code path to every
+  existing `RESULTS.md` row) and `kPerIter` (GB's native model, one host sync
+  per iteration — present *on purpose* as the instrument for stage 5g's
+  cross-check, never for a published timing).
+- **`bench/alloc_bench_gb.cpp`** (new) — host-only allocator microbenchmarks
+  plus the unit-conversion self-check. `bench/alloc_bench.cpp` was **not**
+  touched; its stdout is transcribed into §2a/2b/2c.
+- **`CMakeLists.txt`** — `mcke_alloc_bench_gb` target, gated on
+  `MCKE_HAVE_GOOGLE_BENCHMARK`, linking `mcke_core` (not the `mcke` umbrella)
+  and `benchmark::benchmark` (not `benchmark_main`).
+- **`scripts/typecheck_cuda.sh`** — Google Benchmark header discovery.
+
+### Benchmarks run — actual numbers (macOS host, 5 repetitions each)
+
+| Allocator | 4 KiB | 1 MiB | 8 MiB |
+|---|---|---|---|
+| raw (host `malloc`, **not** `cudaMalloc`) | 34.5 ns | 158 ns | 95.2 ns |
+| buddy (coarse poll) | 84.6 ns | 47.4 ns | 31.3 ns |
+| freelist (coarse poll) | 48.8 ns | 49.1 ns | — |
+
+Policy sweep at 4 KiB: buddy `same_stream_only` 101 ns / `coarse_poll` 84.6 ns
+/ `per_free_event` 103 ns; freelist 54.9 / 48.8 / 56.3 ns. All `_cv` under
+3.6%, most under 1%.
+
+### What was learned
+
+**Two of those numbers look like they refute Phase 2, and neither does.**
+
+*"raw" beats both pools at 4 KiB.* Only because this is a host-only build: with
+`MCKE_WITH_CUDA=0`, `RawDeviceAllocator` never calls `cudaMalloc` — it calls the
+system allocator, a fast cached user-space free list. The pools exist to
+amortise a ~10–100 µs driver round trip that does not occur here, so this is a
+different experiment wearing the same name. Documented at the top of the file so
+nobody reads it as a pool-vs-driver result.
+
+*Buddy gets **faster** as blocks get **bigger*** (84.6 → 47.4 → 31.3 ns). This
+one is real and is buddy structure showing through: cost tracks **levels
+traversed**, not bytes. The slab is 16 MiB = 2²⁴, so a 2^k request costs 24−k
+splits down and the same number of merges back: 4 KiB → 12 levels, 1 MiB → 4,
+8 MiB → 1. **Tested rather than asserted:** fitting a line through *only* the
+two extremes gives `cost ≈ 26.5 ns + 4.85 ns/level`, which predicts the
+held-out middle point (1 MiB) at **45.8 ns against a measured 47.4 ns — 3.3%
+error**. A bytes-based model cannot even produce that ordering. Freelist is flat
+(48.8 vs 49.1 ns), exactly as a segregated size-class design predicts. So the
+two allocators' cost *curves differ in shape*, not just height, and cross near
+1 MiB — which is a sharper statement than Phase 2c's aggregate comparison made.
+
+**Both silent failure modes were deliberately triggered, not just guarded
+against.** This is why `alloc_bench_gb` is host-only: it is the one GB target
+that runs without a GPU, so the guards get tested here in a second rather than
+on Colab, where a wrong number costs a session and may not look wrong.
+
+- Deleting the `* 1e-3`: the 2 ms self-check reported **2,000,000 µs instead of
+  2,000 µs** — exactly 1000×.
+- Dropping `->UseManualTime()`: **0.292 µs instead of 2,000 µs** — a ~6,850×
+  *understatement*, i.e. it makes a kernel look spectacular rather than broken,
+  which is the dangerous direction.
+
+That second experiment turned up **the one detection tell**, now recorded in the
+adapter: GB appends `/manual_time` to the reported benchmark *name* when manual
+timing is active. `.../iterations:16/manual_time` is wired correctly;
+`.../iterations:16` is not. It is the sole visible difference.
+
+**Three bugs of my own, all found by verification rather than by reading.**
+
+1. **`DEFINED` vs non-empty in CMake.** `FetchContent_Declare` itself creates
+   `FETCHCONTENT_SOURCE_DIR_<name>` as an **empty cache entry**, so
+   `if(DEFINED FETCHCONTENT_SOURCE_DIR_BENCHMARK)` is true forever after any
+   configure that reached the fetch path — meaning `AUTO` would silently start
+   fetching in a build dir that had once been configured `=ON`. Found because
+   the status line printed "from local checkout" with an *empty path*. A bare
+   `if(VAR)` is false for the empty string and is the question actually meant.
+2. **`set -u` in `typecheck_cuda.sh`.** `"$MCKE_BENCHMARK_INCLUDE"` on an unset
+   variable aborts the script. Worse, my first "the skip path works" test passed
+   only because I had *set* that variable in the test — the default path was
+   broken the whole time. Same shape as the warm-`_deps` trap from stage 5a:
+   a test that passes for the wrong reason.
+3. **Banner on stdout corrupted the JSON artifact.** `--benchmark_format=json`
+   writes to stdout, so the `# mcke_...` header made the document unparseable —
+   and it failed at the *consumer*, which is the worst place to find it. Moved
+   to stderr. Stage 5f's `regen_results.sh` parses this JSON, so stdout must
+   stay machine-clean.
+
+**`typecheck_cuda.sh` caught the new file automatically**, exactly as its own
+comment intended ("glob `bench/*.cpp` … so a new bench is covered the moment it
+exists"). The fix was to give it Google Benchmark's headers via `-isystem`
+(not `-I`: GB's headers are not ours to keep warning-clean, the same reasoning
+as the `INTERFACE_SYSTEM_INCLUDE_DIRECTORIES` fixup in CMake), with absence
+degrading to a **per-file announced SKIP** rather than a failure — mirroring
+`MCKE_GOOGLE_BENCHMARK=AUTO`, since with GB absent CMake does not build these
+targets either. Announced per file, never silent: a silent skip is how coverage
+rots, which is the exact failure the `src/*/*.cpp` glob was widened to fix in
+Phase 4.
+
+### Design decisions
+
+**The unit conversion is a named function, not an inline `* 1e-3`.** In a
+host-only build `rt::Event::elapsed_ms` returns `0.0f` unconditionally
+(`stream.hpp:280`), so the GPU paths cannot exercise the conversion on a machine
+with no GPU. Extracting `set_iteration_time_from_ms()` makes it callable with a
+*known* value, which is the only reason the 1000× guard is testable here at all.
+Rejected alternative: leave it inline and verify on Colab — which defeats the
+entire purpose of having a host-only GB target.
+
+**The `Profiler` inside `run_burst` is function-local.** `Profiler` has no
+`clear()` and `time_op` appends to `records_` on every call, so a hoisted one
+would accumulate (repetitions × variants) duplicate rows and `write_csv` would
+emit every repetition as a separate measurement. Function-local needs **zero**
+changes to `profiler.hpp`. Commented so nobody "optimises" it by hoisting.
+
+**No `SetBytesProcessed`.** It installs its counter with `kIs1024` (verified,
+`benchmark.h:892`), so it prints GiB/s where `KernelRecord::gb_per_s()` divides
+by `1e9` — a silent 7.4% disagreement on the number rule 5 exists to pin down.
+Explicit `Counter`s with `kIs1000` instead.
+
+**Dropped the `bytes` counter** from the allocator rows: GB aggregates every
+counter across repetitions, so a constant renders as `bytes=0` on `_stddev` and
+`bytes=0.00%` on `_cv` — which reads like a measurement and is not one.
+
+### Verification
+
+- `mcke_alloc_bench_gb` builds and runs on macOS with **no GPU**, 0 warnings.
+- Self-check reads **exactly 2000 µs / 500 µs**; both break-tests confirmed above.
+- `--benchmark_format=json` produces a valid document carrying
+  `mcke_cmdline`, `mcke_timing`, `mcke_with_cuda`, `mcke_caveat`.
+- `scripts/typecheck_cuda.sh`: **all clean** in both states — GB present
+  (`ok bench/alloc_bench_gb.cpp`, under `MCKE_WITH_CUDA=1`, so it will compile
+  on Colab) and GB absent (announced SKIP).
+- Host suite unchanged: **145,665 checks, 0 failures** (58,856 + 86,809).
+
+### What's next
+
+Stage 5c — `bench/reduce_bench_gb.cpp` and `bench/bias_act_bench_gb.cpp`, the
+pilot GPU targets. Pattern application of the adapter; Sonnet/medium is enough.
+Deliberately *not* `gemm_bench`/`graph_bench`: their bespoke tables (wave sweep,
+fork/join counts, `enqueue_us`) *are* the Phase 3/4 deliverables and GB's output
+format cannot express them. Stage 5g is the Colab run, where `kBurst` must agree
+with `Profiler::time_op` to within noise — if it does not, the adapter is wrong.

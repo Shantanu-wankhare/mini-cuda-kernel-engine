@@ -23,7 +23,47 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 CXX="${CXX:-clang++}"
+
+# ---------------------------------------------------------------------------
+# Google Benchmark headers (Phase 5). bench/*_gb.cpp include <benchmark/...>,
+# and this script's whole point is to compile bench/ WITHOUT a CMake build, so
+# it has to find them itself.
+#
+# Optional, and degrades to SKIP rather than to FAIL -- deliberately mirroring
+# MCKE_GOOGLE_BENCHMARK=AUTO in CMakeLists.txt. If Google Benchmark is absent
+# then CMake does not build the *_gb targets either, so failing here would
+# report a problem that cannot exist in any buildable configuration.
+#
+# Header-only for our purposes: we are running -fsyntax-only, so no library is
+# needed, just the include path.
+# ---------------------------------------------------------------------------
+GB_INC=""
+for cand in \
+    "${MCKE_BENCHMARK_INCLUDE:-}" \
+    build-gb/_deps/benchmark-src/include \
+    build/_deps/benchmark-src/include \
+    build-host/_deps/benchmark-src/include \
+    /opt/homebrew/include \
+    /usr/local/include; do
+  if [ -n "$cand" ] && [ -f "$cand/benchmark/benchmark.h" ]; then
+    GB_INC="$cand"
+    break
+  fi
+done
+
 FLAGS=(-std=c++20 -Wall -Wextra -fsyntax-only -I include -I tests -I bench -I kernels -I "$FAKE" -DMCKE_WITH_CUDA=1)
+if [ -n "$GB_INC" ]; then
+  # -isystem, not -I: Google Benchmark's headers are not ours to keep warning
+  # -clean, and -Wall -Wextra -Wpedantic above would otherwise apply to them.
+  # Same reasoning as the INTERFACE_SYSTEM_INCLUDE_DIRECTORIES fixup in
+  # CMakeLists.txt, and for the same reason.
+  FLAGS+=(-isystem "$GB_INC")
+  echo "  (Google Benchmark headers: $GB_INC)"
+else
+  echo "  (Google Benchmark headers not found -- bench/*_gb.cpp will be SKIPPED."
+  echo "   Set MCKE_BENCHMARK_INCLUDE=<dir> or configure with"
+  echo "   -DMCKE_GOOGLE_BENCHMARK=ON to cover them.)"
+fi
 # Second pass with NVTX on. profiler.hpp's NvtxRange gains a member field under
 # MCKE_USE_NVTX, and src/graph/executor.cpp wraps every node launch in one, so
 # without this pass the entire Nsight-Systems path -- Phase 4's exit criterion --
@@ -46,6 +86,21 @@ fi
 
 fail=0
 for f in "${targets[@]}"; do
+  # A *_gb translation unit cannot compile without Google Benchmark's headers.
+  # Skipping is correct rather than lenient: with GB absent, CMake does not
+  # build these targets either (MCKE_GOOGLE_BENCHMARK=AUTO), so a failure here
+  # would report a problem unreachable in any buildable configuration. Announced
+  # per file, never silent -- a silent skip is how coverage rots, which is the
+  # exact failure the src/*/*.cpp glob above was widened to fix.
+  case "$f" in
+    *_gb.cpp|*_gb.cu)
+      if [ -z "$GB_INC" ]; then
+        echo "  SKIP  $f  (no Google Benchmark headers)"
+        continue
+      fi
+      ;;
+  esac
+
   case "$f" in
     *.cu)
       # Strip the <<<grid,block,smem,stream>>> launch syntax, which no host
