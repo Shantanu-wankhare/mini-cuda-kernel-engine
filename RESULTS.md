@@ -23,12 +23,16 @@ holds the numbers in comparable tables.
 
 Fill one row per machine, from `./build/bin/mcke_device_query`.
 
+<!-- BEGIN GENERATED id=s0-hardware source=PENDING,PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Machine | GPU | CC | SMs | smem/SM | Peak BW (spec formula) | Measured BW | Measured FMA f32 peak | Driver / CUDA |
 |---|---|---|---|---|---|---|---|---|
 | MacBook Air (M-series) | — | — | — | — | — | — | — | host-only build |
 | Colab | Tesla T4 | 7.5 | 40 | 64 KiB | 320.1 GB/s | 235.4 GB/s | 8.130 TFLOP/s | driver 580.82.07 / nvcc 12.8.93 |
 | RTX 5060 laptop | _TBD_ | 12.0 | | | | | | needs CUDA ≥ 12.8 |
 | Explorer | Tesla V100-SXM2-32GB | 7.0 | 80 | 96 KiB | 898.0 GB/s | 636.3 GB/s | 15.601 TFLOP/s | driver 545.23.08 / nvcc 12.3 |
+
+<!-- END GENERATED id=s0-hardware -->
 
 > Explorer's clocks are effectively locked for the purposes of this project:
 > the GEMM ladder's cuBLAS first-vs-last check (§3d) measured **+0.03% drift**
@@ -64,10 +68,19 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 
 ## 1. Phase 1 — Elementwise / bandwidth baseline
 
+<!-- BEGIN GENERATED id=s1-elementwise source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Kernel | Variant | n | Ideal bytes | median ms | min ms | GB/s | % measured BW | Machine |
 |---|---|---|---|---|---|---|---|---|
-| stream_triad | grid_stride_256t | 64Mi | 768 MiB | 3.421 | 3.417 | 235.4 | 100.0% (this IS the baseline) | Colab T4 |
+| stream_triad | grid_stride_256t | 64Mi | 768 MiB | 3.421 | 3.417 | 235.4 | 100.0% | Colab T4 |
 | vector_add | grid_stride_256t | 64Mi | 768 MiB | 3.348 | 3.344 | 240.5 | 102.2% | Colab T4 |
+
+<!-- END GENERATED id=s1-elementwise -->
+
+`stream_triad`'s own row is the baseline: its GB/s is the denominator of the
+% column, so it reads 100.0% by construction. *(This note sat inside the table
+cell until 2026-09-22; generated tables carry data only, so it moved here --
+DECISIONS.md Q13.)*
 
 Median and min sit within 0.1-0.2% of each other for both kernels — a clean,
 idle, unthrottled T4 (41 degC at session start, no other tenants), not a wide
@@ -108,6 +121,8 @@ are not, so this is what makes a macOS run and a Colab run the *same* workload.
 That is not thoroughness for its own sake: it is the only way the deallocate
 column stays interpretable on a GPU.
 
+<!-- AUTHORED: explanatory: what each reuse policy's deallocate pays for -- not a measurement -->
+
 | Policy | What its deallocate pays for |
 |---|---|
 | `same_stream` | **pure allocator bookkeeping** — never probes for completion |
@@ -134,6 +149,8 @@ is actually demonstrable.
 
 **Trace `uniform_pow2`** (99,816 allocs, small blocks 256 B – 1 MiB):
 
+<!-- BEGIN GENERATED id=s2a-lat-uniform source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | allocate | 2913 | 5415 | 11098 | 78140 | 719836 | 3978.0 | 99816 | 99816 |
@@ -151,8 +168,12 @@ is actually demonstrable.
 | freelist/event | allocate | 125 | 187 | 286 | 515 | 307205 | 538.3 | 99816 | 5 |
 | freelist/event | deallocate | 656 | 1214 | 1737 | 8430 | 525543 | – | – | – |
 
+<!-- END GENERATED id=s2a-lat-uniform -->
+
 **Trace `dl_transformer`** (26,010 allocs, GPT-2-small shapes, multi-MiB tensors
 dominate):
+
+<!-- BEGIN GENERATED id=s2a-lat-dl source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
 |---|---|---|---|---|---|---|---|---|---|
@@ -171,8 +192,12 @@ dominate):
 | freelist/event | allocate | 166 | 241 | 327 | 592 | 104856 | 604.6 | 26010 | 5 |
 | freelist/event | deallocate | 1055 | 1167 | 1327 | 13401 | 1879240 | – | – | – |
 
+<!-- END GENERATED id=s2a-lat-dl -->
+
 **Trace `dl_transformer_bypass`** (26,011 allocs, same shapes + one 147 MiB
 embedding table taking the bypass path):
+
+<!-- BEGIN GENERATED id=s2a-lat-bypass source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | Op | median ns | p90 | p99 | p999 | max ns | amortised ns | alloc_calls | raw_mallocs |
 |---|---|---|---|---|---|---|---|---|---|
@@ -190,6 +215,8 @@ embedding table taking the bypass path):
 | freelist/coarse_poll | deallocate | 565 | 606 | 641 | 9481 | 222100 | – | – | – |
 | freelist/event | allocate | 94 | 138 | 164 | 304 | 72531 | 323.7 | 26011 | 6 |
 | freelist/event | deallocate | 546 | 626 | 652 | 5768 | 195660 | – | – | – |
+
+<!-- END GENERATED id=s2a-lat-bypass -->
 
 `*` = at or below **2×** the 25 ns instrument floor, i.e. ≤ 50 ns — the test
 `ClockCalibration::is_below_floor` actually applies
@@ -247,11 +274,15 @@ policies produced identical figures).
 so buddy's internal waste **must** be exactly zero; any other value is an
 allocator bug, not a result.
 
+<!-- BEGIN GENERATED id=s2b-frag-uniform source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
+
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 29.80 MiB | 29.80 MiB | 29.80 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
 | buddy | 48.00 MiB | 29.80 MiB | 29.80 MiB | **100.0%** | 62.1% | 62.1% | **0 B** | 32.00 MiB | no |
 | freelist | 80.00 MiB | 36.38 MiB | 29.04 MiB | 79.8% | 45.5% | 36.3% | 7.34 MiB | 8.00 MiB | no |
+
+<!-- END GENERATED id=s2b-frag-uniform -->
 
 Buddy's 0 B is the control assertion holding. Freelist's 7.34 MiB comes from its
 own ladder: `small_class_granularity = 512` cannot represent the 256 B class, so
@@ -261,22 +292,30 @@ one.
 
 **Trace `dl_transformer`** — GPT-2-small shapes, f32, batch 1 × seq 512.
 
+<!-- BEGIN GENERATED id=s2b-frag-dl source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
+
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 45.04 MiB | 45.04 MiB | 45.04 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
 | buddy | 80.00 MiB | 68.05 MiB | 43.54 MiB | **64.0%** | 85.1% | 54.4% | 24.51 MiB | **32.00 MiB** | no |
 | freelist | 80.00 MiB | 68.04 MiB | 43.54 MiB | **64.0%** | 85.0% | 54.4% | 24.50 MiB | **16.00 MiB** | no |
 
+<!-- END GENERATED id=s2b-frag-dl -->
+
 **Trace `dl_transformer_bypass`** — the same workload with a 147 MiB embedding
 table (50257 × 768 × f32) folded in, so the bypass-to-driver path is exercised
 amid real churn. Kept as its own trace so its extra permanent driver allocation
 never muddies the clean traces' flatline.
+
+<!-- BEGIN GENERATED id=s2b-frag-bypass source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 192.27 MiB | 192.27 MiB | 192.27 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
 | buddy | 227.24 MiB | 215.28 MiB | 190.77 MiB | 88.6% | 94.7% | 84.0% | 24.51 MiB | 32.00 MiB | no |
 | freelist | 227.24 MiB | 215.27 MiB | 190.77 MiB | 88.6% | 94.7% | 84.0% | 24.50 MiB | 16.00 MiB | no |
+
+<!-- END GENERATED id=s2b-frag-bypass -->
 
 The bypassed tensor is served exactly (zero reported waste, matching
 `RawDeviceAllocator` for comparability), which is what lifts `block_eff` from
@@ -317,6 +356,8 @@ From `test_freelist_external_fragmentation`, with both allocators given an
 identical request sequence — fill a 64 KiB arena with 512 B blocks, free **all**
 of them, then request 8 KiB:
 
+<!-- AUTHORED: values from the unit test test_freelist_external_fragmentation (tests/test_host_core.cpp), not a benchmark -->
+
 | Allocator | free bytes held | largest contiguous free block | 8 KiB request |
 |---|---|---|---|
 | buddy | 65,536 B | 65,536 B (fully coalesced) | **succeeds** |
@@ -329,6 +370,8 @@ external fragmentation, stated as three numbers instead of a sentence.
 **The tradeoff, in one pair of rows.** The coalescing that wins buddy the row
 above is the same mechanism it pays for on the free path. Both directions are
 measured, and neither allocator is categorically better:
+
+<!-- AUTHORED: a qualitative trade-off matrix, not data -->
 
 | | buddy | freelist |
 |---|---|---|
@@ -366,6 +409,8 @@ The reader is gated on a host-released mapped-pinned flag, not a timed spin: the
 host only sets it after `cudaStreamSynchronize(S2)` proves the corrupting write
 already landed, so the ordering is structural rather than probabilistic. Every
 arm ran 20 trials.
+
+<!-- AUTHORED: transcribed from `ctest -R stream_safety` (tests/test_stream_safety.cu), which prints pass/fail, not a data file -->
 
 | Arm | Expected | Observed | Aliased? | Refused cross-stream reclaim? | Result |
 |---|---|---|---|---|---|
@@ -436,6 +481,8 @@ Ideal bytes: fused `(2N + cols)·4` = 268,451,840; unfused pair `(4N + cols)·4`
 the formula because rule 4 requires the count to be reconstructible, not because
 it moves any number.
 
+<!-- BEGIN GENERATED id=s3a-bias-act source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Kernel | Activation | vector_width | median ms | min ms | Ideal bytes | GB/s | % measured BW | Machine |
 |---|---|---|---|---|---|---|---|---|
 | bias_relu fused | relu | vw4 | 1.102 | 1.100 | 268,451,840 | 243.7 | 103.5% | Colab T4 |
@@ -451,6 +498,8 @@ it moves any number.
 | bias_gelu_tanh fused, starved (40 blocks) | gelu_tanh | vw4 | 1.2 | 1.2 | 268,451,840 | 224.6 | 95.4% | Colab T4 |
 | bias_gelu_tanh fused, L2 control | gelu_tanh | vw4 | 0.008 | 0.0 | 2,099,200 | 271.1 | 115.2% | Colab T4 |
 | bias_gelu_tanh unfused, L2 control | gelu_tanh | vw4 | 0.011 | 0.0 | 4,196,352 | 391.5 | 166.3% | Colab T4 |
+
+<!-- END GENERATED id=s3a-bias-act -->
 
 Shape 8192×4096 unless noted; L2-control rows are 512×512 (256 KiB per array,
 fits the T4's 4 MiB L2). All correctness checks passed at this shape,
@@ -517,17 +566,21 @@ Shape **8192 × 4096**. Ideal bytes `(rows·cols + rows)·4` = 134,250,496
 partial-staging traffic (~512 KiB, +0.4%) is *algorithmic*, not compulsory, and
 belongs in a footnote rather than the denominator.
 
+<!-- BEGIN GENERATED id=s3b-reduce source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | __syncthreads | Machine |
 |---|---|---|---|---|---|---|---|---|---|
-| row_reduce_sum | smem_tree_256t | 8192 × 4096 | 0.519 | 0.517 | 128.03 MiB | 258.5 | 109.8% | **9** | Colab T4 |
+| row_reduce_sum | smem_tree_256t | 8192 × 4096 | 0.519 | 0.517 | 128.03 MiB | 258.5 | 109.8% | 9 | Colab T4 |
 | row_reduce_max | smem_tree_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 256.4 | 108.9% | 9 | Colab T4 |
 | row_reduce_mean | smem_tree_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 257.5 | 109.4% | 9 | Colab T4 |
-| row_reduce_sum | warp_shuffle_256t | 8192 × 4096 | 0.523 | 0.5 | 128.03 MiB | 256.9 | 109.1% | **1** | Colab T4 |
+| row_reduce_sum | warp_shuffle_256t | 8192 × 4096 | 0.523 | 0.5 | 128.03 MiB | 256.9 | 109.1% | 1 | Colab T4 |
 | row_reduce_max | warp_shuffle_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 254.2 | 108.0% | 1 | Colab T4 |
 | row_reduce_mean | warp_shuffle_256t | 8192 × 4096 | 0.5 | 0.5 | 128.03 MiB | 254.1 | 107.9% | 1 | Colab T4 |
 | row_reduce_sum | two_pass_256t | 8192 × 4096 | 0.537 | 0.5 | 128.03 MiB | 250.2 | 106.3% | 1 | Colab T4 |
-| row_reduce_sum | warp_shuffle_256t | **64 × 524288** | 0.937 | 0.9 | 128.03 MiB | 143.2 | 60.8% | 1 | Colab T4 |
-| row_reduce_sum | two_pass_256t | **64 × 524288** | 0.538 | 0.5 | 128.03 MiB | 249.3 | 105.9% | 1 | Colab T4 |
+| row_reduce_sum | warp_shuffle_256t | 64 × 524288 | 0.937 | 0.9 | 128.03 MiB | 143.2 | 60.8% | 1 | Colab T4 |
+| row_reduce_sum | two_pass_256t | 64 × 524288 | 0.538 | 0.5 | 128.03 MiB | 249.3 | 105.9% | 1 | Colab T4 |
+
+<!-- END GENERATED id=s3b-reduce -->
 
 The barrier count is `1 + log2(blockDim)` = **9** at 256 threads, not 8 — the
 load-into-smem barrier before the tree starts is a real barrier. (Both this
@@ -577,10 +630,14 @@ directly. Algorithmic traffic differs — three-pass reads x three times
 (`4N·4` = 537 MB), online reads it twice (`3N·4` = 403 MB) — and goes in a
 footnote.
 
+<!-- BEGIN GENERATED id=s3c-softmax source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | max abs(Σrow − 1) | Machine |
 |---|---|---|---|---|---|---|---|---|---|
 | row_softmax | three_pass_256t | 8192 × 4096 | 2.053 | 2.051 | 256.0 MiB | 130.7 | 55.5% | 1.701e-07 | Colab T4 |
 | row_softmax | online_one_pass_256t | 8192 × 4096 | 1.767 | 1.8 | 256.0 MiB | 151.9 | 64.5% | 2.184e-07 | Colab T4 |
+
+<!-- END GENERATED id=s3c-softmax -->
 
 **Results vs. predictions (2026-08-29 Colab T4, `b01e48d`):**
 - **Speedup landed at 1.16×**, inside the predicted 1.0–1.25× band (2.053 vs
@@ -624,6 +681,8 @@ footnote.
 Shape **M=N=K=4096**, `alpha=1, beta=0`, row-major. Command:
 `./build/bin/mcke_gemm_bench 4096` (the bench echoes its own argv, per rule 2).
 
+<!-- BEGIN GENERATED id=s3d-gemm source=reports/colab-t4/2026-08-30_session5,PENDING (T4 slot pinned to the Session-5 dataset; V100 slot PENDING until stage 5h; tools/render_results.py -- edit the pin, not the table) -->
+
 | Variant | M=N=K | Tile (BM,BN,BK,TM,TN) | regs/thread | smem/block | spill B | occupancy (hand / API) | median ms | min ms | TFLOP/s | % of measured FMA peak | Machine |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | naive_uncoalesced | 4096 | — | 32 | 0 | 0 | 4 / 4 (100%) | 1143.68 | 1140.86 | 0.120 | 1.48% | Colab T4 |
@@ -644,6 +703,8 @@ Shape **M=N=K=4096**, `alpha=1, beta=0`, row-major. Command:
 | warptile_vec4 | 4096 | 128,128,8,8,8 | 128 | 16640 | 0 | 2 / 2 (25%) | 10.8 | 10.7 | 12.739 | 81.66% | Explorer V100 |
 | cuBLAS (first) | 4096 | — | — | — | — | — | 9.831 | 9.554 | 13.980 | 89.60% | Explorer V100 |
 | cuBLAS (drift recheck, last) | 4096 | — | — | — | — | — | 9.834 | 9.804 | 13.975 | 89.57% | Explorer V100 |
+
+<!-- END GENERATED id=s3d-gemm -->
 
 **The Explorer run is the clean baseline the Colab run couldn't be**: cuBLAS
 first-vs-last drift was **+0.03%** — clocks held throughout, no caveat needed on
@@ -757,6 +818,8 @@ compute-bound and the naive kernel simply fails to exploit that.
 **Predictions — recorded 2026-08-29, before the run, per rule 6.** The 2026-08-24
 originals are preserved in the third column; where they were revised, the reason
 is a design-review finding, not a measurement.
+
+<!-- AUTHORED: pre-registered predictions and verdicts (rule 6); only the Actual column is measured -->
 
 | Row | Predicted % of FMA peak | Actual | Verdict |
 |---|---|---|---|
@@ -914,6 +977,8 @@ hand calculation models sm_75's per-warp 256-register allocation granule and
 **Pre-registered ncu metric per transition** (rule 6 works better when the
 prediction is specific enough to be wrong):
 
+<!-- AUTHORED: pre-registered ncu predictions; nothing measured yet -->
+
 | Transition | Metric | Prediction |
 |---|---|---|
 | naive_uncoalesced → naive | `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio` | 32 → 4 |
@@ -926,6 +991,8 @@ prediction is specific enough to be wrong):
 **Modelled DRAM traffic** (a *model*, printed by the bench; the measurement is
 `dram__bytes_read.sum`). This is the reuse story `docs/PROFILING.md` calls the
 single most instructive number in the project:
+
+<!-- AUTHORED: a traffic MODEL printed by gemm_bench, with authored cells ('unknown -- measure') -->
 
 | Variant | Model read bytes | Amplification vs compulsory |
 |---|---|---|
@@ -990,23 +1057,27 @@ earlier version of itself sourced from a stale/cached notebook cell, which is
 why the numbers differ slightly (all well within run-to-run noise) from any
 previously-reported figures for the same five graphs.
 
+<!-- BEGIN GENERATED id=s4-graph source=PENDING (PENDING: the published values predate dataset capture, their raw output was not kept; tools/render_results.py -- edit the pin, not the table) -->
+
 | Graph | Policy | streams | median ms | min ms | speedup vs sequential | peak memory | naive memory | numerics gate |
 |---|---|---|---|---|---|---|---|---|
 | fanout4x4 | sequential | 1/1 | 4.222 | 4.205 | 1.00× | 184,557,568 B | 285,220,864 B (1.55×) | — |
 | fanout4x4 | level_parallel | 4/4 | 2.211 | 2.192 | 1.91× | 218,112,000 B | 285,220,864 B (1.31×) | — |
-| fanout4x4 | chain_greedy | 4/4 | 2.175 | 2.152 | 1.94× | 218,112,000 B | 285,220,864 B (1.31×) | **PASS** (9 configs × 20 repeats, 71,305,216 elements) |
+| fanout4x4 | chain_greedy | 4/4 | 2.175 | 2.152 | 1.94× | 218,112,000 B | 285,220,864 B (1.31×) | PASS (9 configs × 20 repeats, 71,305,216 elements) |
 | diamond_starved | sequential | 1/1 | 3.488 | 3.470 | 1.00× | 536,887,296 B | 536,887,296 B (1.00×) | — |
 | diamond_starved | level_parallel | 2/4 | 3.459 | 3.433 | 1.01× | 536,887,296 B | 536,887,296 B (1.00×) | — |
-| diamond_starved | chain_greedy | 2/4 | 3.453 | 3.433 | 1.01× | 536,887,296 B | 536,887,296 B (1.00×) | **PASS** (9 configs × 20 repeats, 134,221,824 elements) |
+| diamond_starved | chain_greedy | 2/4 | 3.453 | 3.433 | 1.01× | 536,887,296 B | 536,887,296 B (1.00×) | PASS (9 configs × 20 repeats, 134,221,824 elements) |
 | transformer_block | sequential | 1/1 | 21.802 | 20.930 | 1.00× | 201,342,976 B | 218,120,192 B (1.08×) | — |
 | transformer_block | level_parallel | 1/4 | 21.912 | 21.745 | 0.99× | 201,342,976 B | 218,120,192 B (1.08×) | — |
-| transformer_block | chain_greedy | 1/4 | 21.974 | 18.985 | 0.99× | 201,342,976 B | 218,120,192 B (1.08×) | **PASS** (9 configs × 20 repeats, 54,530,048 elements) |
+| transformer_block | chain_greedy | 1/4 | 21.974 | 18.985 | 0.99× | 201,342,976 B | 218,120,192 B (1.08×) | PASS (9 configs × 20 repeats, 54,530,048 elements) |
 | diamond_gemm_2048 | sequential | 1/1 | 14.477 | 13.933 | 1.00× | 83,886,080 B | 83,886,080 B (1.00×) | — |
 | diamond_gemm_2048 | level_parallel | 2/4 | 14.327 | 14.161 | 1.01× | 83,886,080 B | 83,886,080 B (1.00×) | — |
-| diamond_gemm_2048 | chain_greedy | 3/4 | 14.541 | 14.264 | 1.00× | 83,886,080 B | 83,886,080 B (1.00×) | **PASS** (9 configs × 20 repeats, 20,971,520 elements) |
+| diamond_gemm_2048 | chain_greedy | 3/4 | 14.541 | 14.264 | 1.00× | 83,886,080 B | 83,886,080 B (1.00×) | PASS (9 configs × 20 repeats, 20,971,520 elements) |
 | chain16 | sequential | 1/1 | 8.809 | 8.800 | 1.00× | 268,451,840 B | 1,140,867,072 B (4.25×) | — |
 | chain16 | level_parallel | 1/4 | 9.090 | 9.080 | 0.97× | 268,451,840 B | 1,140,867,072 B (4.25×) | — |
-| chain16 | chain_greedy | 1/4 | 9.080 | 9.068 | 0.97× | 268,451,840 B | 1,140,867,072 B (4.25×) | **PASS** (9 configs × 20 repeats, 285,216,768 elements) |
+| chain16 | chain_greedy | 1/4 | 9.080 | 9.068 | 0.97× | 268,451,840 B | 1,140,867,072 B (4.25×) | PASS (9 configs × 20 repeats, 285,216,768 elements) |
+
+<!-- END GENERATED id=s4-graph -->
 
 `chain16`'s `level_parallel`/`chain_greedy` land slightly *under* 1.0×
 (0.97×) despite genuine 4-way streaming (4.25× memory savings from liveness
@@ -1069,6 +1140,8 @@ copy-pasted Phase 3d number.
 **Per-node timing at N=1024** (`--gemm-n=1024 --profile --only=diamond_gemm_custom`,
 Colab T4, 2026-09-10):
 
+<!-- AUTHORED: from a one-off `--gemm-n=1024 --profile` run, not the default regeneration set -->
+
 | Policy | B_gemm min ms | C_gemm min ms | D_gemm min ms | graph median ms |
 |---|---|---|---|---|
 | sequential | 0.890 | 0.890 | 0.889 | 2.693 |
@@ -1096,6 +1169,8 @@ was itself the outlier, not a real property of the graph.
 
 **Reproducibility — four independent runs, two different Colab VM instances**
 (`--only=wave_sweep`, each 5 warmup + 20 timed iterations):
+
+<!-- AUTHORED: four separate runs across two VMs by design -- its subject is cross-run variance, which no single dataset holds -->
 
 | N | waves | run 1 | run 2 | run 3 | run 4 (fresh VM) |
 |---|---|---|---|---|---|
@@ -1214,6 +1289,8 @@ Phase-3d exit writeup (immediately below) works from what §3d's non-`ncu`
 methodology already established, and marks each remaining question as open
 rather than guessed at.
 
+<!-- AUTHORED: blocked on ncu permissions (ERR_NVGPUCTRPERM); empty until counters are available -->
+
 | Variant | sm__throughput % | dram__throughput % | occupancy (hand / API / ncu) | top stall reason | sectors/request | dram_bytes_read vs compulsory |
 |---|---|---|---|---|---|---|
 | naive_uncoalesced | | | | | | |
@@ -1309,6 +1386,8 @@ partially open.
 
 #### The headline: overlap paid off on exactly one of five graphs, and that is the result
 
+<!-- AUTHORED: a hand-derived summary of section 4, with an authored 'why' column -->
+
 | Graph | best speedup | why |
 |---|---|---|
 | `fanout4x4` | **1.94×** (chain_greedy) | four independent branches, each deliberately starved to 10 blocks — genuine idle SMs to interleave into |
@@ -1360,6 +1439,8 @@ The band {≈ceiling, ≈1.0×, <1.0×} was stated in advance and 1.01× is in i
 not defensible as stated, and the corrected version — asserted as exact integers
 by `tests/test_graph_host.cpp`, with no GPU — is:
 
+<!-- AUTHORED: exact integers asserted by tests/test_graph_host.cpp, not measured by a bench -->
+
 | Graph | width | sequential | level_parallel | chain_greedy |
 |---|---|---|---|---|
 | diamond | 2 | 0 / 0 | 2 rec / 2 wait | 2 / 2 |
@@ -1390,6 +1471,8 @@ graph is where chain-greedy's zero-event schedule would actually show up as
 wall-clock, and none of the five graphs is launch-bound.
 
 #### Memory: liveness reuse, and its direct tension with parallelism
+
+<!-- AUTHORED: hand-derived from section 4, plus a K=1 row section 4 does not contain -->
 
 | Graph | naive | reused | ratio |
 |---|---|---|---|
@@ -1577,6 +1660,8 @@ merely 4 streams *used* but 4 genuinely *resident at once*.
 
 One concrete window (all four are the same `bias_act` fused kernel — the
 graph's four independent branches):
+
+<!-- AUTHORED: one window hand-picked from the nsys trace; tools/nsys_overlap.py computes the headline numbers -->
 
 | Stream | Start (ns) | End (ns) | Duration (µs) |
 |---|---|---|---|
