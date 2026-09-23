@@ -1,10 +1,10 @@
-# reports/colab-t4/
+# reports/colab-t4/2026-08-30_session5/
 
 Raw artifacts from runs on **Google Colab, Tesla T4 (sm_75)**. One directory per
 machine so that a run on one machine can never overwrite another machine's
 evidence — the layout Phase 5 stage 5f's regeneration driver builds on.
 
-## `phase3_gemm.csv` + `phase3_gemm_stdout.log`
+## `phase3_gemm.csv` + `gemm_bench.stdout.log`
 
 The CSV and the complete stdout of **one** run of the Phase 3d GEMM ladder. These
 are the source of the nine **Colab T4** rows of `RESULTS.md` §3d — every value
@@ -35,3 +35,17 @@ so the pair reads as one run; contents are byte-identical to the originals
 
 The CSV uses `Profiler::write_csv`'s frozen 13-column schema, which is why this
 provenance lives in a README rather than as a header row in the file.
+
+## Moved into a per-run directory (2026-09-22, Phase 5 stage 5f)
+
+These files lived at `reports/colab-t4/` until stage 5f introduced one directory
+per run (`reports/<machine>/<run-id>/`, DECISIONS.md Q10), so that a dataset is a
+self-contained unit a RESULTS.md table can pin by path. Moved with `git mv`
+(history preserved) and verified byte-identical by sha256. The stdout log was
+renamed a second time, `phase3_gemm_stdout.log` → `gemm_bench.stdout.log`, to
+match the `<bench>.stdout.log` convention `scripts/regen_results.sh` uses.
+
+`manifest.json` here is **reconstructed by hand** (`"reconstructed": true`): this
+run predates the regeneration driver, so nothing was captured at run time.
+Fields that could not be recovered are `null`, not guessed; the git commit is
+marked **inferred**.

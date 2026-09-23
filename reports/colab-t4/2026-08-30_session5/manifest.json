@@ -1,0 +1,71 @@
+{
+  "schema": "mcke-dataset/1",
+  "status": "VALID",
+  "invalid_reasons": [],
+  "reconstructed": true,
+  "reconstruction_note": "Hand-written 2026-09-22 (Phase 5 stage 5f), NOT captured at run time. This run predates scripts/regen_results.sh. Every field below is taken from the run's own stdout log (gemm_bench.stdout.log) or from PROJECT_LOG.md Session 5; fields that could not be recovered are null rather than guessed.",
+  "machine_tag": "colab-t4",
+  "machine_tag_reason": "hand-named directory (predates scripts/machine_tag.sh's env-aware tags)",
+  "run_id": "2026-08-30_session5",
+  "started": "2026-08-30",
+  "finished": "2026-08-30",
+  "host": {
+    "hostname": null,
+    "uname": null
+  },
+  "gpu": {
+    "name": "Tesla T4",
+    "cc": "7.5",
+    "sm_count": 40,
+    "driver": "580.82.07 (per RESULTS.md section 0); the log's own 'versions' line reports the driver API as 13.0",
+    "clocks": "NOT LOCKED (no root on Colab), per the log",
+    "clocks_start": null,
+    "clocks_end": null
+  },
+  "toolchain": {
+    "cuda_runtime": "12.8",
+    "nvcc": "12.8.93 (per RESULTS.md section 0)",
+    "cmake": null,
+    "cxx": null
+  },
+  "git": {
+    "sha": "63702d2",
+    "sha_confidence": "INFERRED: last code commit (2026-08-30 10:39 -0700) before a407d5f (11:18 -0700) recorded these numbers. Not captured at run time.",
+    "dirty": null
+  },
+  "build": {
+    "dir": "build",
+    "cache": {
+      "MCKE_ENABLE_CUDA": "ON",
+      "CMAKE_BUILD_TYPE": null
+    }
+  },
+  "denominators": {
+    "peak_gb_s": 235.4,
+    "peak_tflops": 8.13,
+    "source": "bench_common.hpp T4 defaults, echoed by the log's environment block"
+  },
+  "runs": [
+    {
+      "bench": "gemm_bench",
+      "argv": [
+        "./build/bin/mcke_gemm_bench",
+        "4096"
+      ],
+      "exit_code": null,
+      "seconds": null,
+      "stdout": "gemm_bench.stdout.log",
+      "stderr": null,
+      "outputs": [
+        "phase3_gemm.csv"
+      ],
+      "invalid_reasons": []
+    }
+  ],
+  "notes": [
+    "15 validation lines in the log, 0 FAIL; cuBLAS spot-check 1024/1024 OK.",
+    "Drift check: cuBLAS 33.116 ms first vs 37.069 ms last = +11.9%, past the 3% threshold -- clocks moved during the run; treat as indicative (RESULTS.md section 3d).",
+    "Built from an OLDER gemm_bench: naive/naive_uncoalesced ran 20 timed iterations here; current source runs them at 2+5 (documented exception, gemm_bench.cpp:95-111).",
+    "Files renamed on commit, contents byte-identical: gemm_run.log -> gemm_bench.stdout.log; the CSV kept its original name."
+  ]
+}

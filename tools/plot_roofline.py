@@ -35,12 +35,11 @@
 #  two numbers) are the primary interface, and both are required together --
 #  mirroring `benchcfg::make_roofline`'s exact contract. `--preset=t4` /
 #  `--preset=v100` are named shortcuts for the two machines this project has
-#  already measured (RESULTS.md section 0), not a directory-name guess: this
-#  project's `reports/<tag>/` directories are named by hand (`colab-t4`,
-#  `explorer-v100`) rather than by scripts/machine_tag.sh's auto-generated slug
-#  (`t4`, `v100-sxm2-32gb`) -- see PROJECT_LOG.md Session 16's note on this
-#  mismatch, left for Phase 5 stage 5f to reconcile -- so inferring a preset
-#  from a path would be guessing on top of an already-inconsistent convention.
+#  already measured (RESULTS.md section 0), not a directory-name guess. A
+#  directory name records WHERE a run happened (scripts/machine_tag.sh's
+#  <env>-<gpu> tags, reconciled in stage 5f), and detection is deliberately
+#  best-effort; a denominator is a MEASUREMENT, and deriving one from a path
+#  would turn a harmless misnamed directory into a silently wrong roofline.
 #  Give none of the above and this script refuses to plot, loudly, the same
 #  way `benchcfg::make_roofline` aborts on a zero denominator.
 #
@@ -54,11 +53,11 @@
 #      memory_bound(ai)    = ai < ridge_point_ai
 #
 #  USAGE:
-#    python3 tools/plot_roofline.py --preset=t4 reports/colab-t4/*.csv \
-#        -o reports/colab-t4/roofline.svg
+#    python3 tools/plot_roofline.py --preset=t4 reports/colab-t4/<run-id>/*.csv \
+#        -o reports/colab-t4/<run-id>/roofline.svg
 #
 #    python3 tools/plot_roofline.py --peak-gb-s=636.3 --peak-tflops=15.601 \
-#        reports/explorer-v100/*.csv -o reports/explorer-v100/roofline.svg
+#        reports/explorer-v100/<run-id>/*.csv -o reports/explorer-v100/<run-id>/roofline.svg
 #
 #    python3 tools/plot_roofline.py --self-test    # no CSV, no matplotlib call
 # =============================================================================

@@ -1249,7 +1249,7 @@ required:**
   on both chips, but **not** the same ratio. *(Corrected 2026-09-22: this
   previously read "T4: 4.17× … V100: 4.17× — the SAME ratio, independently".
   The T4 figure is 40.39/10.36 = 3.90×, which is also what the Session-5 run's
-  own attribution line printed — `reports/colab-t4/phase3_gemm_stdout.log`:
+  own attribution line printed — `reports/colab-t4/2026-08-30_session5/gemm_bench.stdout.log`:
   "tiled_smem -> tiled_regblock 3.90x". Only the V100's 11.732/2.812 is 4.17×.
   "The same ratio, independently" was the striking part of the original
   sentence, and it was false; the claim that survives is the weaker, true one —
