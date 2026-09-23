@@ -187,7 +187,10 @@ gpu_snapshot() {   # $1 = output file
   fi
 }
 gpu_snapshot "$DS/.gpu_start.csv"
-{ command -v nvcc  >/dev/null 2>&1 && nvcc --version | tail -1; } > "$DS/.nvcc.txt"  || true
+# FULL text, not `tail -1`: the last line of `nvcc --version` is a build string
+# ("Build cuda_12.8.r12.8/compiler..."); the version RESULTS.md §0 quotes
+# ("nvcc 12.8.93") is on the "release ..., V12.8.93" line above it.
+{ command -v nvcc  >/dev/null 2>&1 && nvcc --version; } > "$DS/.nvcc.txt"  || true
 { command -v cmake >/dev/null 2>&1 && cmake --version | head -1; } > "$DS/.cmake.txt" || true
 
 : > "$DS/.runs.tsv"
