@@ -421,6 +421,16 @@ def _s4(d):
     return out
 
 
+# Multi-slot specs can be PREVIEWED one slot at a time: stage 5g has a T4
+# dataset but no V100 one (that is 5h), and §3d's T4 half is exactly the table
+# whose reproducibility most needs checking. (slot -> row renderer, and the
+# label that identifies that machine's rows in the published table.)
+PARTIAL = {
+    "s3d-gemm":    (s3d_rows, lambda ds: f"| {machine_label(ds)} |"),
+    "s0-hardware": (lambda ds: [s0_gpu_row(ds)], lambda ds: f"| {machine_label(ds, short=True)} |"),
+}
+
+
 # -----------------------------------------------------------------------------
 # Fences
 # -----------------------------------------------------------------------------
@@ -897,15 +907,29 @@ def main(argv: list[str]) -> int:
         if a.preview:
             fid, srcs = a.preview[0], a.preview[1:]
             if fid not in SPECS or len(srcs) != len(SPECS[fid].slots):
-                p.error(f"--preview {fid}: need {len(SPECS.get(fid, Spec('', [], None)).slots)} source(s)")
-            slots = {s: bo.Dataset.load(os.path.join(REPO, src)) for s, src in zip(SPECS[fid].slots, srcs)}
-            rendered = SPECS[fid].render(slots)
-            print("\n".join(rendered))
+                p.error(f"--preview {fid}: need {len(SPECS.get(fid, Spec('', [], None)).slots)} source(s), "
+                        f"one per slot {SPECS[fid].slots if fid in SPECS else ''} (PENDING allowed for "
+                        f"{sorted(PARTIAL)})")
             f = next((f for f in parse_fences(lines) if f.id == fid), None)
+            published = [ln.rstrip("\r\n") for ln in lines[f.begin + 1:f.end]] if f else []
+            if "PENDING" in srcs:
+                if fid not in PARTIAL:
+                    p.error(f"--preview {fid}: PENDING slots are only supported for {sorted(PARTIAL)}")
+                rows_fn, label_fn = PARTIAL[fid]
+                have = [bo.Dataset.load(os.path.join(REPO, s_)) for s_ in srcs if s_ != "PENDING"]
+                table_hdr = [ln for ln in published if ln.startswith("|")][:2]
+                rendered = table_hdr + [r for ds in have for r in rows_fn(ds)]
+                labels = [label_fn(ds) for ds in have]
+                # Compare against ONLY the provided machines' published rows.
+                published = table_hdr + [ln for ln in published[2:] if any(lb in ln for lb in labels)]
+            else:
+                slots = {s_: bo.Dataset.load(os.path.join(REPO, src)) for s_, src in zip(SPECS[fid].slots, srcs)}
+                rendered = SPECS[fid].render(slots)
+            print("\n".join(rendered))
             if f is None:
                 print(f"\n(no fence id={fid} in {a.file}; nothing to compare against)")
                 return 0
-            rep = compare_tables([ln.rstrip("\r\n") for ln in lines[f.begin + 1:f.end]], rendered)
+            rep = compare_tables(published, rendered)
             print(f"\n=== {fid}: fresh render vs published ({len(rep)} difference(s) beyond published precision) ===")
             for r in rep:
                 print("  " + r)
