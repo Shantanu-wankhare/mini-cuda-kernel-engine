@@ -30,6 +30,7 @@
 // =============================================================================
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 #include "mcke/core/device.hpp"
@@ -119,6 +120,17 @@ int main() {
 
   Roofline rl;
   rl.peak_gb_s = dev->peak_dram_gb_s();
+  // An explicitly INFINITE compute roof, not 0. With peak_tflops left at 0 (as
+  // it was until 2026-09-22) this program walked straight into the trap
+  // bench/bench_common.hpp exists to prevent: the summary row printed
+  // "%peak 0.0%" and "bound compute" for a kernel at AI ~0.17 -- two confidently
+  // wrong answers. This program measures the MEMORY roof; it has no measured
+  // compute peak to offer (that is fma_peak's job) and takes no argv to receive
+  // one, so any finite number here would be some other machine's. With an
+  // infinite compute roof every AI is memory-bound and %peak is exactly
+  // "% of spec-formula bandwidth" -- the same figure the `achieved` line below
+  // prints. Only the summary row changes; its GB/s and times never depended on it.
+  rl.peak_tflops = std::numeric_limits<double>::infinity();
   std::printf("\n%s\n", prof.summary_table(rl).c_str());
   std::printf(
       "achieved %.1f GB/s  (spec-formula peak %.1f GB/s -> %.1f%%)\n\n"

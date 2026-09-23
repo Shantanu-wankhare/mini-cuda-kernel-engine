@@ -2218,3 +2218,19 @@ table (the reproducibility result), runs the GB cross-check, fma_peak both ways,
 nsys + `nsys_overlap.py` against the committed trace, the nsys GPU-metrics trial,
 the ncu attempt, and the full roofline. **No promotion and no prose edits in the
 fork** — promotion is 5i, in the main chat.
+
+**Addendum (same day, owner's decision):** the "recorded, not fixed" `stream_triad`
+Roofline trap above is now **fixed** — and it was in *two* programs, not one:
+`tools/smoke_vector_add.cpp` (`mcke_smoke`, the source of §1's vector_add row)
+left `peak_tflops = 0` in exactly the same way. Both now set an explicitly
+**infinite** compute roof rather than a number: these are bandwidth probes with
+no argv and no measured compute peak of their own, so any finite value would be
+some other machine's. With an infinite compute roof every AI is memory-bound and
+`%peak` = % of spec bandwidth. Verified on the host against the real `Roofline`
+struct at the T4's own numbers: before, `0.0%` / `compute` (the trap,
+reproduced); after, **73.5%** / `memory` — exactly achieved ÷ spec, matching
+RESULTS.md §0. Only the stdout summary row changes; GB/s, times, and every table
+are unaffected. Fixing `smoke_vector_add.cpp` also exposed that
+`scripts/typecheck_cuda.sh` had **never type-checked `tools/*.cpp`**
+(`mcke_smoke`, `mcke_device_query`) on the CUDA path — the same class of silent
+exclusion as Phase 4's `src/graph/` gap. The glob now includes it; both clean.

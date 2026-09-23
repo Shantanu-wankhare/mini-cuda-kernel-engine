@@ -80,7 +80,11 @@ if [ ${#targets[@]} -eq 0 ]; then
   # so the MCKE_WITH_CUDA=1 path of every graph file would have reached Colab
   # completely unverified, which is the exact failure this script exists to
   # prevent. Same reasoning for tests/test_*.cpp.
-  targets=(src/*/*.cpp bench/*.cpp tests/test_*.cpp)
+  # tools/*.cpp joined 2026-09-22: mcke_smoke (tools/smoke_vector_add.cpp) and
+  # mcke_device_query had never been type-checked on the CUDA path -- found when
+  # a fix to smoke_vector_add.cpp produced no 'ok' line here. Same class of gap
+  # as the src/graph/ exclusion above.
+  targets=(src/*/*.cpp bench/*.cpp tools/*.cpp tests/test_*.cpp)
   while IFS= read -r f; do targets+=("$f"); done < <(find kernels bench tests tools -name '*.cu' | sort)
 fi
 
