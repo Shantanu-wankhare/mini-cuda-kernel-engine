@@ -642,6 +642,104 @@ def stale_prose(text: str, root: str = REPO) -> list[str]:
 
 
 # -----------------------------------------------------------------------------
+# Round-trip test for the specs that have no real dataset yet (0, 1, 3a, 3b,
+# 3c, 4): published table -> synthetic bench output written in each bench's
+# EXACT printf format (file:line cited) -> render -> compare with the published
+# table. It checks labels, ordering, derived columns and every stdout parser
+# BEFORE stage 5g, where a crash would cost a Colab session. It is not a
+# measurement test -- the numbers come from the published table by construction.
+# -----------------------------------------------------------------------------
+def _roundtrip(check) -> None:
+    lines = open(RESULTS, encoding="utf-8").read().splitlines()
+
+    def table(prefix):
+        i = next(i for i, l in enumerate(lines) if l.startswith(prefix))
+        j = i + 2
+        while j < len(lines) and lines[j].startswith("|"):
+            j += 1
+        return lines[i:j]
+
+    H = {"s1-elementwise": "| Kernel | Variant | n |", "s3a-bias-act": "| Kernel | Activation |",
+         "s3b-reduce": "| Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | __syncthreads",
+         "s3c-softmax": "| Kernel | Variant | rows × cols | median ms | min ms | Ideal bytes | GB/s | % measured BW | max abs",
+         "s4-graph": "| Graph | Policy | streams |"}
+    cells = {k: table_cells(table(v)) for k, v in H.items()}
+    tmp = tempfile.mkdtemp()
+    def W(name, text):
+        open(os.path.join(tmp, name), "w", encoding="utf-8").write(text)
+    import json
+    W("manifest.json", json.dumps({"status": "VALID", "machine_tag": "colab-t4",
+        "gpu": {"start": {"driver": "580.82.07"}},
+        "toolchain": {"nvcc": "Cuda compilation tools, release 12.8, V12.8.93\nBuild cuda_12.8.r12.8/compiler.0"}}))
+    HDR = ",".join(bo.PROFILER_COLUMNS) + "\n"
+    ENV = "device        %s (sm_%d%d), %d SMs, %d KiB smem/SM\n" % ("Tesla T4", 7, 5, 40, 64)   # bench_common.hpp:89
+    def summ(k, v, med, mn, gbs):                                                            # profiler.cpp summary_table
+        return f"{k:<22}{v:<30}{med:>10}{mn:>10}{gbs:>10}{'0.000':>10}{'0.17':>8}{'100.0':>9}%  memory\n"
+    W("device_query.stdout.log", "[device 0] Tesla T4  sm_75\n  SMs                     : 40\n"
+      "  shared mem / SM         : 64 KiB\n  roofline: peak_bw=%.1f GB/s (spec formula)\n" % 320.064)
+    s1 = cells["s1-elementwise"]
+    W("stream_triad.stdout.log", summ("stream_triad", "grid_stride_256t", s1[0][4], s1[0][5], s1[0][6])
+      + "achieved %s GB/s  (spec-formula peak 320.1 GB/s -> 73.5%%)\n" % s1[0][6])            # stream_triad.cu:124
+    W("smoke.stdout.log", summ("vector_add", "grid_stride_256t", s1[1][4], s1[1][5], s1[1][6])
+      + "achieved %s GB/s of 320.1 GB/s peak = 75.1%% of DRAM bandwidth\n" % s1[1][6])          # smoke_vector_add.cpp:108
+    W("fma_peak.stdout.log", "measured f32 FMA peak: %.3f TFLOP/s\n" % 8.130)
+    csv = HDR
+    for kernel, variant, occ, label, act, vw in S3A_ROWS:
+        src = next((c for c in cells["s3a-bias-act"] if c[0] == label.format(sm=40) and c[2] == vw),
+                   cells["s3a-bias-act"][2])       # the NEW repeat row has no published source
+        csv += (f"{kernel},{variant},{src[3]},{src[4]},20,1,{src[5].replace(',', '')},{src[6]},"
+                f"0.1,1,1,{src[7].rstrip('%')},memory\n")
+    W("phase3_bias_act.csv", csv)
+    W("bias_act_bench.stdout.log", ENV)
+    csv = HDR
+    for (kernel, variant, _), c in zip(S3B_ROWS, cells["s3b-reduce"]):
+        csv += f"{kernel},{variant},{c[3]},{c[4]},20,1,134250496,{c[6]},0.1,0.25,1,{c[7].rstrip('%')},memory\n"
+    W("phase3_reduce.csv", csv)
+    W("reduce_bench.stdout.log", ENV + "shapes        A = %d x %d (saturated, %.0f waves)   "
+      "B = %d x %d (starved, %.1f waves)\n" % (8192, 4096, 51, 64, 524288, 0.4))              # reduce_bench.cpp:138
+    csv = HDR
+    for c in cells["s3c-softmax"]:
+        csv += f"row_softmax,{c[1]},{c[3]},{c[4]},20,1,268435456,{c[6]},0.1,0.6,1,{c[7].rstrip('%')},memory\n"
+    W("phase3_softmax.csv", csv)
+    errs = {c[1]: c[8] for c in cells["s3c-softmax"]}
+    W("softmax_bench.stdout.log", ENV + "shape         %d x %d   compulsory bytes %d (%.1f MiB)\n"
+      % (8192, 4096, 268435456, 256.0) + "  max |sum(row) - 1|   three_pass %s   online %s   (ratio 1.28x)\n"
+      % (errs["three_pass_256t"], errs["online_one_pass_256t"]))                              # softmax_bench.cpp:248
+    csv, out = ",".join(GRAPH_COLUMNS) + "\n", ""
+    for g in S4_GRAPHS:
+        out += f"=== {g} ===============================================\n"                  # graph_bench.cpp:315
+        gate = ""
+        for c in [c for c in cells["s4-graph"] if c[0] == g]:
+            used, avail = c[2].split("/")
+            peak, naive = c[6].replace(",", "").split()[0], c[7].split(" B")[0].replace(",", "")
+            csv += f"{g},{c[1]},{used},0,0,0,{c[3]},{c[4]},{c[5].rstrip('×')},1.0,0,{peak},{naive}\n"
+            out += "  %-15s streams %d/%d  events %d rec + %d wait (+%d fork/join)\n" % (c[1], int(used), int(avail), 0, 0, 0)
+            if m := re.match(r"(PASS|FAIL) \((\d+) configs × (\d+) repeats, ([\d,]+) elements\)", c[8]):
+                gate = "  numerics gate  %s  (%d configs x %d repeats, %d elements)\n" % (
+                    "PASS" if m.group(1) == "PASS" else "*** FAIL ***", int(m.group(2)), int(m.group(3)),
+                    int(m.group(4).replace(",", "")))                                         # graph_bench.cpp:454
+        out += gate
+    W("phase4_graph.csv", csv)
+    W("graph_bench.stdout.log", out)
+
+    ds = bo.Dataset.load(tmp)
+    for fid in H:
+        try:
+            rep = compare_tables(table(H[fid]), SPECS[fid].render({"t4": ds}))
+        except Exception as e:  # noqa: BLE001
+            check(f"round-trip {fid}: renders", False, repr(e))
+            continue
+        if fid == "s3a-bias-act":   # the one designed difference: the width-sweep repeat row
+            check("round-trip s3a-bias-act: only the designed width-sweep row differs",
+                  len(rep) == 1 and rep[0].startswith("NEW row") and "width-sweep repeat" in rep[0], str(rep))
+        else:
+            check(f"round-trip {fid}: reproduces the published table", not rep, str(rep))
+    pub0 = next(l for l in lines if l.startswith("| Colab | Tesla T4"))
+    check("round-trip s0-hardware: T4 row reproduces the published row", s0_gpu_row(ds) == pub0,
+          f"{s0_gpu_row(ds)} vs {pub0}")
+
+
+# -----------------------------------------------------------------------------
 # Self-test
 # -----------------------------------------------------------------------------
 def self_test() -> int:
@@ -755,6 +853,8 @@ def self_test() -> int:
     rep = compare_tables(pub, new)
     check("compare: PASS -> FAIL is reported as a cell difference on its own row",
           len(rep) == 1 and rep[0].startswith("row 2 (g), col 3:"), str(rep))
+
+    _roundtrip(check)
 
     print("all self-tests PASSED" if not fails else f"*** {fails} self-test(s) FAILED ***")
     return 1 if fails else 0

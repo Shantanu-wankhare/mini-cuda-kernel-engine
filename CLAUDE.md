@@ -207,8 +207,15 @@ numbers on real GPU hardware. See `PROJECT_LOG.md` Sessions 7–10
 (2026-09-07 to 2026-09-11) and `docs/ROADMAP.md` for the phase plan. Next up
 is Phase 5 (Google Benchmark + profiling/telemetry).
 
-- Host-only build verified on macOS: 145,665 checks passing (`test_host_core`
-  58,856 + `test_graph_host` 86,809) combined.
+- Host-only build verified on macOS: 145,670 checks passing (`test_host_core`
+  58,861 + `test_graph_host` 86,809) combined.
+- **Phase 5 in progress (stages 5a–5f done, 2026-09-16 → 09-22).** RESULTS.md's
+  tables are now either fenced (`BEGIN/END GENERATED`, rendered by
+  `tools/render_results.py` from the dataset each fence pins) or marked
+  `AUTHORED`. Datasets live in `reports/<machine>/<run-id>/`, made by
+  `scripts/regen_results.sh`, which never edits RESULTS.md; promotion is a
+  reviewed step (`--stale-prose` first). Workflow: `docs/PROFILING.md` §7.
+  Most fences are PENDING until the 5g (Colab) / 5h (Explorer) runs.
 - CUDA path built and verified on three real GPUs: Colab Tesla T4 (sm_75),
   Northeastern Explorer Tesla V100-SXM2 (sm_70), plus the allocator race tests.
   RTX 5060 (sm_120) not yet touched.

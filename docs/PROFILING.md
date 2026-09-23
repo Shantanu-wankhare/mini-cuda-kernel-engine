@@ -166,3 +166,35 @@ as indicative only.
 - [ ] Stated denominator for any % of peak
 - [ ] Correctness verified in the same run (never report a time for an unverified
       kernel)
+
+## 7. Regenerating RESULTS.md (Phase 5 stage 5f)
+
+Two tools, deliberately separate steps (DECISIONS.md Q10):
+
+```bash
+# 1. Capture: run every bench this machine has built, into ONE new dataset dir.
+#    Never touches RESULTS.md.
+MCKE_MACHINE_TAG=colab-t4 scripts/regen_results.sh          # -> reports/colab-t4/<run-id>/
+scripts/regen_results.sh --dry-run                          # see the plan first
+# Off-T4 machines must state their own denominators (the benches otherwise fall
+# back to the T4's, silently):
+MCKE_PEAK_GB_S=636.3 MCKE_PEAK_TFLOPS=15.601 scripts/regen_results.sh --tag=explorer-v100
+
+# 2. Compare a fresh run against what is published -- the reproducibility check:
+python3 tools/render_results.py --preview s3a-bias-act reports/colab-t4/<run-id>
+
+# 3. Render every table from the dataset it is PINNED to (the exit criterion):
+python3 tools/render_results.py            # --check / --diff / --audit also available
+```
+
+Each generated table in RESULTS.md sits inside a
+`<!-- BEGIN GENERATED id=... source=<dataset>[,<dataset>] -->` fence; `PENDING`
+means no dataset yet, and a PENDING fence is never touched. **Promoting** a new
+run is a reviewed act, in this order: edit the fence's `source=`, run
+`python3 tools/render_results.py --stale-prose` to list prose that quotes numbers
+the new render would orphan, fix that prose, *then* render. A dataset whose
+`manifest.json` says `INVALID` (a bench failed, printed "no CUDA device", or a
+validation/numerics gate FAILed) is refused.
+
+Every other table carries `<!-- AUTHORED: <reason> -->`; `--audit` fails if any
+table is neither.

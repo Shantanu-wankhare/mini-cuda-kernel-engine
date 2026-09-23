@@ -1,0 +1,286 @@
+=== MCKE alloc_bench (Phase 2c) ==============================================
+build   MCKE_WITH_CUDA=0
+device  host-only build: raw_device_malloc == aligned_alloc(256, ...)
+clock   tick=41ns  paired_median=41ns  ==> floor=41ns  (percentiles at or below 82ns are instrument-limited, not physically meaningful)
+        std::mt19937_64, seed 0x9e3779b97f4a7c15, raw engine output only (NOT
+        <random> distributions -- see TraceGen's banner for why)
+--- trace: uniform_pow2 ---------------------------------------------------
+  sizes                13 classes, 256 B .. 1.00 MiB
+  ops                  199632 total (99816 allocs, 99816 frees)
+  max concurrent live  36028 handles (live table = 1.10 MiB)
+  oracle peak requested 29.80 MiB  <- a zero-fragmentation allocator's floor
+  phases               warmup[0] -> churn[10000] -> adversarial[90000] -> drain[170000]
+--- trace: dl_transformer ---------------------------------------------------
+  sizes                11 classes, 2.00 KiB .. 12.00 MiB
+  ops                  52020 total (26010 allocs, 26010 frees)
+  max concurrent live  14 handles (live table = 448 B)
+  oracle peak requested 45.04 MiB  <- a zero-fragmentation allocator's floor
+  phases               weights[0] -> layer_step[10] -> decode_step[20010] -> drain[52010]
+--- trace: dl_transformer_bypass ---------------------------------------------------
+  sizes                12 classes, 2.00 KiB .. 147.24 MiB
+  ops                  52022 total (26011 allocs, 26011 frees)
+  max concurrent live  15 handles (live table = 480 B)
+  oracle peak requested 192.27 MiB  <- a zero-fragmentation allocator's floor
+  phases               weights[0] -> layer_step[11] -> decode_step[20011] -> drain[52011]
+
+
+############### trace = uniform_pow2 ###############################################
+
+=== 2a. Latency  ->  RESULTS.md section 2a =================================
+allocator              op            median      p90      p99     p999       max  amortised  alloc_calls  raw_mallocs
+raw                    allocate        42*     84     666    1250    15041 ns     48.5ns        99816        99816
+raw                    deallocate      42*    208     375     625    12125 ns        -            -            -
+buddy/same_stream      allocate        42*     42*    250     292    11916 ns     34.2ns        99816            2
+buddy/same_stream      deallocate      41*     42*     42*     83    80709 ns        -            -            -
+buddy/coarse_poll      allocate        42*     42*    250     291     9375 ns     31.0ns        99816            2
+buddy/coarse_poll      deallocate      41*     42*     42*    125    12791 ns        -            -            -
+buddy/event            allocate        42*     83     250     292     8625 ns     34.7ns        99816            2
+buddy/event            deallocate      41*     42*     42*     84    48542 ns        -            -            -
+freelist/same_stream   allocate        42*     83     125     417   225542 ns     56.6ns        99816            5
+freelist/same_stream   deallocate      42*     84     125     291    37500 ns        -            -            -
+freelist/coarse_poll   allocate        42*     83      84     125   212834 ns     55.6ns        99816            5
+freelist/coarse_poll   deallocate      42*     83     125     291    14792 ns        -            -            -
+freelist/event         allocate        42*     83     125     167   336959 ns     59.8ns        99816            5
+freelist/event         deallocate      42*     84     125     209    38458 ns        -            -            -
+* at or below the 82 ns instrument floor -- see clock calibration above. Use the amortised column for the fast-path cost.
+
+*** On this host-only build, "raw" is aligned_alloc (~100-200 ns),
+*** NOT cudaMalloc (~10-100 us). The 100-1000x pool speedup is a GPU
+*** phenomenon and CANNOT be demonstrated on this machine. This
+*** section's headline speedup claim must come from a Colab/Explorer
+*** run of this same binary -- see docs/ROADMAP.md Phase 2.
+
+=== 2b. Fragmentation  ->  RESULTS.md section 2b =========================
+allocator               peak_reserv   peak_block     peak_req block_eff reserv_eff   utilisatn    int_waste   largest_free  OOM?
+raw                       29.80 MiB    29.80 MiB    29.80 MiB    100.0%    100.0%      100.0%          0 B            0 B    no
+buddy/same_stream         48.00 MiB    29.80 MiB    29.80 MiB    100.0%     62.1%       62.1%          0 B      32.00 MiB    no
+buddy/coarse_poll         48.00 MiB    29.80 MiB    29.80 MiB    100.0%     62.1%       62.1%          0 B      32.00 MiB    no
+buddy/event               48.00 MiB    29.80 MiB    29.80 MiB    100.0%     62.1%       62.1%          0 B      32.00 MiB    no
+freelist/same_stream      80.00 MiB    36.38 MiB    29.04 MiB     79.8%     45.5%       36.3%     7.34 MiB       8.00 MiB    no
+freelist/coarse_poll      80.00 MiB    36.38 MiB    29.04 MiB     79.8%     45.5%       36.3%     7.34 MiB       8.00 MiB    no
+freelist/event            80.00 MiB    36.38 MiB    29.04 MiB     79.8%     45.5%       36.3%     7.34 MiB       8.00 MiB    no
+
+  block_eff   = peak_requested / peak_blocks   -> INTERNAL fragmentation
+                only. This is the number the roadmap's "buddy 55-70%"
+                prediction meant.
+  reserv_eff  = peak_blocks / peak_reserved     -> slab sizing, a property
+                of the configured slab size, NOT of allocator design.
+  utilisation = peak_requested / peak_reserved  -> their product; the
+                header's AllocatorStats::utilisation(), at the peak moment.
+  buddy/same_stream      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/coarse_poll      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/event            largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/same_stream   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/coarse_poll   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/event         largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+
+=== raw_malloc_calls vs alloc_calls -- the headline claim =======================
+allocator              alloc_calls@warmup raw_mallocs@warmup alloc_calls@end raw_mallocs@end
+raw                              5083           5083          99816          99816
+buddy/same_stream                5083              2          99816              2
+buddy/coarse_poll                5083              2          99816              2
+buddy/event                      5083              2          99816              2
+freelist/same_stream             5083              3          99816              5
+freelist/coarse_poll             5083              3          99816              5
+freelist/event                   5083              3          99816              5
+
+  delta after warm-up:
+    raw                    94733 allocate calls -> 94733 additional driver allocations
+    buddy/same_stream      94733 allocate calls -> 0 additional driver allocations
+    buddy/coarse_poll      94733 allocate calls -> 0 additional driver allocations
+    buddy/event            94733 allocate calls -> 0 additional driver allocations
+    freelist/same_stream   94733 allocate calls -> 2 additional driver allocations
+    freelist/coarse_poll   94733 allocate calls -> 2 additional driver allocations
+    freelist/event         94733 allocate calls -> 2 additional driver allocations
+
+*** For "raw", that delta is FORCED to equal alloc_calls (one cudaMalloc
+*** per allocate, by construction). For buddy/freelist it should be at or
+*** near ZERO -- a driver allocation only when the pool must physically
+*** grow a slab (rare) or a request bypasses the pool entirely.
+wrote reports/alloc_latency_uniform_pow2.csv
+wrote reports/alloc_fragmentation_uniform_pow2.csv
+
+
+############### trace = dl_transformer ###############################################
+
+=== 2a. Latency  ->  RESULTS.md section 2a =================================
+allocator              op            median      p90      p99     p999       max  amortised  alloc_calls  raw_mallocs
+raw                    allocate        42*    125     209     250     2833 ns     53.4ns        26010        26010
+raw                    deallocate      42*    125     125     167    12708 ns        -            -            -
+buddy/same_stream      allocate        42*    458     500     583    39833 ns     68.6ns        26010            3
+buddy/same_stream      deallocate      41*     42*     42*     42*    4334 ns        -            -            -
+buddy/coarse_poll      allocate        42*    417     459     583    35625 ns     65.8ns        26010            3
+buddy/coarse_poll      deallocate      41*     42*     42*     42*    2958 ns        -            -            -
+buddy/event            allocate        42*    458     500     542    72792 ns     71.2ns        26010            3
+buddy/event            deallocate      41*     42*     42*     42*   10083 ns        -            -            -
+freelist/same_stream   allocate        42*     42*     84     167    12458 ns     30.2ns        26010            5
+freelist/same_stream   deallocate      42*     42*     42*    167      250 ns        -            -            -
+freelist/coarse_poll   allocate        42*     42*     42*     84    14583 ns     30.3ns        26010            5
+freelist/coarse_poll   deallocate      42*     42*     42*    125      333 ns        -            -            -
+freelist/event         allocate        42*     83      84      84     2333 ns     32.2ns        26010            5
+freelist/event         deallocate      42*     42*     42*     84      500 ns        -            -            -
+* at or below the 82 ns instrument floor -- see clock calibration above. Use the amortised column for the fast-path cost.
+
+*** On this host-only build, "raw" is aligned_alloc (~100-200 ns),
+*** NOT cudaMalloc (~10-100 us). The 100-1000x pool speedup is a GPU
+*** phenomenon and CANNOT be demonstrated on this machine. This
+*** section's headline speedup claim must come from a Colab/Explorer
+*** run of this same binary -- see docs/ROADMAP.md Phase 2.
+
+=== 2b. Fragmentation  ->  RESULTS.md section 2b =========================
+allocator               peak_reserv   peak_block     peak_req block_eff reserv_eff   utilisatn    int_waste   largest_free  OOM?
+raw                       45.04 MiB    45.04 MiB    45.04 MiB    100.0%    100.0%      100.0%          0 B            0 B    no
+buddy/same_stream         80.00 MiB    68.05 MiB    43.54 MiB     64.0%     85.1%       54.4%    24.51 MiB      32.00 MiB    no
+buddy/coarse_poll         80.00 MiB    68.05 MiB    43.54 MiB     64.0%     85.1%       54.4%    24.51 MiB      32.00 MiB    no
+buddy/event               80.00 MiB    68.05 MiB    43.54 MiB     64.0%     85.1%       54.4%    24.51 MiB      32.00 MiB    no
+freelist/same_stream      80.00 MiB    68.04 MiB    43.54 MiB     64.0%     85.0%       54.4%    24.50 MiB      16.00 MiB    no
+freelist/coarse_poll      80.00 MiB    68.04 MiB    43.54 MiB     64.0%     85.0%       54.4%    24.50 MiB      16.00 MiB    no
+freelist/event            80.00 MiB    68.04 MiB    43.54 MiB     64.0%     85.0%       54.4%    24.50 MiB      16.00 MiB    no
+
+  block_eff   = peak_requested / peak_blocks   -> INTERNAL fragmentation
+                only. This is the number the roadmap's "buddy 55-70%"
+                prediction meant.
+  reserv_eff  = peak_blocks / peak_reserved     -> slab sizing, a property
+                of the configured slab size, NOT of allocator design.
+  utilisation = peak_requested / peak_reserved  -> their product; the
+                header's AllocatorStats::utilisation(), at the peak moment.
+  buddy/same_stream      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/coarse_poll      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/event            largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/same_stream   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/coarse_poll   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/event         largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+
+=== raw_malloc_calls vs alloc_calls -- the headline claim =======================
+allocator              alloc_calls@warmup raw_mallocs@warmup alloc_calls@end raw_mallocs@end
+raw                                10             10          26010          26010
+buddy/same_stream                  10              2          26010              3
+buddy/coarse_poll                  10              2          26010              3
+buddy/event                        10              2          26010              3
+freelist/same_stream               10              3          26010              5
+freelist/coarse_poll               10              3          26010              5
+freelist/event                     10              3          26010              5
+
+  delta after warm-up:
+    raw                    26000 allocate calls -> 26000 additional driver allocations
+    buddy/same_stream      26000 allocate calls -> 1 additional driver allocations
+    buddy/coarse_poll      26000 allocate calls -> 1 additional driver allocations
+    buddy/event            26000 allocate calls -> 1 additional driver allocations
+    freelist/same_stream   26000 allocate calls -> 2 additional driver allocations
+    freelist/coarse_poll   26000 allocate calls -> 2 additional driver allocations
+    freelist/event         26000 allocate calls -> 2 additional driver allocations
+
+*** For "raw", that delta is FORCED to equal alloc_calls (one cudaMalloc
+*** per allocate, by construction). For buddy/freelist it should be at or
+*** near ZERO -- a driver allocation only when the pool must physically
+*** grow a slab (rare) or a request bypasses the pool entirely.
+wrote reports/alloc_latency_dl_transformer.csv
+wrote reports/alloc_fragmentation_dl_transformer.csv
+
+=== where each design wins  ->  RESULTS.md section 2 prose ===================
+[1] internal fragmentation (block_eff), trace=dl_transformer
+      buddy 64.0%   freelist 64.0%   -> FREELIST wins by 0.0 pts
+      predicted: buddy 55-70%, freelist 85-95% on DL shapes; roughly TIED
+      on multi-MiB tensors because small_large_split puts freelist into a
+      power-of-two ladder above 1 MiB -- see freelist_allocator.hpp banner.
+[2] largest contiguous free block after full drain
+      buddy 32.00 MiB   freelist 16.00 MiB   -> BUDDY wins (coalescing)
+[3] allocate p99
+      buddy 459 ns   freelist 42 ns   -> FREELIST
+      two competing costs, and which dominates depends on the trace:
+      freelist pays a hash-map insert (live_) on every allocate; buddy pays
+      a SPLIT CASCADE whenever a request needs a block far smaller than the
+      nearest free ancestor (e.g. a small tensor after a run of large ones).
+      On this DL trace's largest tensors (multi-MiB, close to the slab size)
+      the split cascade dominates and buddy's p99 is the worse one -- the
+      opposite of the uniform_pow2 trace, where blocks are smaller relative
+      to the slab and buddy's simpler bookkeeping wins. Neither allocator is
+      categorically faster; it is a function of block size vs. slab depth.
+[4] deallocate p99
+      buddy 42 ns   freelist 42 ns   -> FREELIST
+
+  *** [2] and [4] are the SAME mechanism (coalescing) showing up as a win
+  *** in one row and a cost in the other. If you remember one result from
+  *** Phase 2, remember this pair.
+
+
+############### trace = dl_transformer_bypass ###############################################
+
+=== 2a. Latency  ->  RESULTS.md section 2a =================================
+allocator              op            median      p90      p99     p999       max  amortised  alloc_calls  raw_mallocs
+raw                    allocate        42*    166     250     250      375 ns     58.3ns        26011        26011
+raw                    deallocate      42*    125     125     208     8625 ns        -            -            -
+buddy/same_stream      allocate        42*    458     500     542    31834 ns     69.0ns        26011            4
+buddy/same_stream      deallocate      41*     42*     42*     42*     208 ns        -            -            -
+buddy/coarse_poll      allocate        42*    417     500     542    35042 ns     66.9ns        26011            4
+buddy/coarse_poll      deallocate      41*     42*     42*     83      167 ns        -            -            -
+buddy/event            allocate        42*    458     500     542    35666 ns     69.6ns        26011            4
+buddy/event            deallocate      41*     42*     42*     83    13000 ns        -            -            -
+freelist/same_stream   allocate        42*     42*     84     125      792 ns     31.6ns        26011            6
+freelist/same_stream   deallocate      42*     42*     42*     84      292 ns        -            -            -
+freelist/coarse_poll   allocate        42*     42*     42*     84      458 ns     28.7ns        26011            6
+freelist/coarse_poll   deallocate      42*     42*     42*     84      250 ns        -            -            -
+freelist/event         allocate        42*     83      84     166     8500 ns     34.5ns        26011            6
+freelist/event         deallocate      42*     42*     42*     84      416 ns        -            -            -
+* at or below the 82 ns instrument floor -- see clock calibration above. Use the amortised column for the fast-path cost.
+
+*** On this host-only build, "raw" is aligned_alloc (~100-200 ns),
+*** NOT cudaMalloc (~10-100 us). The 100-1000x pool speedup is a GPU
+*** phenomenon and CANNOT be demonstrated on this machine. This
+*** section's headline speedup claim must come from a Colab/Explorer
+*** run of this same binary -- see docs/ROADMAP.md Phase 2.
+
+=== 2b. Fragmentation  ->  RESULTS.md section 2b =========================
+allocator               peak_reserv   peak_block     peak_req block_eff reserv_eff   utilisatn    int_waste   largest_free  OOM?
+raw                      192.27 MiB   192.27 MiB   192.27 MiB    100.0%    100.0%      100.0%          0 B            0 B    no
+buddy/same_stream        227.24 MiB   215.28 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.51 MiB      32.00 MiB    no
+buddy/coarse_poll        227.24 MiB   215.28 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.51 MiB      32.00 MiB    no
+buddy/event              227.24 MiB   215.28 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.51 MiB      32.00 MiB    no
+freelist/same_stream     227.24 MiB   215.27 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.50 MiB      16.00 MiB    no
+freelist/coarse_poll     227.24 MiB   215.27 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.50 MiB      16.00 MiB    no
+freelist/event           227.24 MiB   215.27 MiB   190.77 MiB     88.6%     94.7%       84.0%    24.50 MiB      16.00 MiB    no
+
+  block_eff   = peak_requested / peak_blocks   -> INTERNAL fragmentation
+                only. This is the number the roadmap's "buddy 55-70%"
+                prediction meant.
+  reserv_eff  = peak_blocks / peak_reserved     -> slab sizing, a property
+                of the configured slab size, NOT of allocator design.
+  utilisation = peak_requested / peak_reserved  -> their product; the
+                header's AllocatorStats::utilisation(), at the peak moment.
+  buddy/same_stream      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/coarse_poll      largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  buddy/event            largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/same_stream   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/coarse_poll   largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+  freelist/event         largest_free_block probe: tight-fit OK (no growth), over-fit OK (rejected/grew)
+
+=== raw_malloc_calls vs alloc_calls -- the headline claim =======================
+allocator              alloc_calls@warmup raw_mallocs@warmup alloc_calls@end raw_mallocs@end
+raw                                11             11          26011          26011
+buddy/same_stream                  11              3          26011              4
+buddy/coarse_poll                  11              3          26011              4
+buddy/event                        11              3          26011              4
+freelist/same_stream               11              4          26011              6
+freelist/coarse_poll               11              4          26011              6
+freelist/event                     11              4          26011              6
+
+  delta after warm-up:
+    raw                    26000 allocate calls -> 26000 additional driver allocations
+    buddy/same_stream      26000 allocate calls -> 1 additional driver allocations
+    buddy/coarse_poll      26000 allocate calls -> 1 additional driver allocations
+    buddy/event            26000 allocate calls -> 1 additional driver allocations
+    freelist/same_stream   26000 allocate calls -> 2 additional driver allocations
+    freelist/coarse_poll   26000 allocate calls -> 2 additional driver allocations
+    freelist/event         26000 allocate calls -> 2 additional driver allocations
+
+*** For "raw", that delta is FORCED to equal alloc_calls (one cudaMalloc
+*** per allocate, by construction). For buddy/freelist it should be at or
+*** near ZERO -- a driver allocation only when the pool must physically
+*** grow a slab (rare) or a request bypasses the pool entirely.
+wrote reports/alloc_latency_dl_transformer_bypass.csv
+wrote reports/alloc_fragmentation_dl_transformer_bypass.csv
+
+=== bypass path, isolated probe ===================================
+  bypass probe: 154389504 B (147 MiB) -> took the bypass path, pool untouched  [PASS]
+
+=== done. Copy the tables above into RESULTS.md section 2. ===

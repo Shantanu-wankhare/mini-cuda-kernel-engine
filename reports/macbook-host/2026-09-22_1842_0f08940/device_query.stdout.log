@@ -1,0 +1,8 @@
+MCKE device query — MCKE_WITH_CUDA=0, visible devices=0
+
+No CUDA device available.
+  - On macOS this is expected: this binary is the host-only build.
+    Host-side logic (allocator, shapes, graph topology) is still tested
+    by `ctest`. Kernels are simply not present in this build.
+  - On a GPU machine, this means the driver is missing or no GPU is
+    visible: check `nvidia-smi` and CUDA_VISIBLE_DEVICES.

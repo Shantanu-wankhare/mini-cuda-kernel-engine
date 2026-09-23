@@ -1,0 +1,15 @@
+trace,allocator,op,samples,median_ns,p90_ns,p99_ns,p999_ns,max_ns,amortised_ns,clock_floor_ns,instrument_limited,alloc_calls,raw_malloc_calls,with_cuda
+dl_transformer,raw,allocate,26000,42,125,209,250,2833,53.4242,41,1,26010,26010,0
+dl_transformer,raw,deallocate,26010,42,125,125,167,12708,53.4242,41,1,,,0
+dl_transformer,buddy/same_stream,allocate,26000,42,458,500,583,39833,68.5642,41,1,26010,3,0
+dl_transformer,buddy/same_stream,deallocate,26010,41,42,42,42,4334,68.5642,41,1,,,0
+dl_transformer,buddy/coarse_poll,allocate,26000,42,417,459,583,35625,65.8208,41,1,26010,3,0
+dl_transformer,buddy/coarse_poll,deallocate,26010,41,42,42,42,2958,65.8208,41,1,,,0
+dl_transformer,buddy/event,allocate,26000,42,458,500,542,72792,71.2394,41,1,26010,3,0
+dl_transformer,buddy/event,deallocate,26010,41,42,42,42,10083,71.2394,41,1,,,0
+dl_transformer,freelist/same_stream,allocate,26000,42,42,84,167,12458,30.1671,41,1,26010,5,0
+dl_transformer,freelist/same_stream,deallocate,26010,42,42,42,167,250,30.1671,41,1,,,0
+dl_transformer,freelist/coarse_poll,allocate,26000,42,42,42,84,14583,30.2776,41,1,26010,5,0
+dl_transformer,freelist/coarse_poll,deallocate,26010,42,42,42,125,333,30.2776,41,1,,,0
+dl_transformer,freelist/event,allocate,26000,42,83,84,84,2333,32.2264,41,1,26010,5,0
+dl_transformer,freelist/event,deallocate,26010,42,42,42,84,500,32.2264,41,1,,,0

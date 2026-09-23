@@ -270,16 +270,31 @@ outcome for numbers that are pure host bookkeeping with no GPU dependency.
 Policy does not affect fragmentation, so one row per allocator (all three
 policies produced identical figures).
 
+**Regenerated 2026-09-22, and reproduced a third time, byte-for-byte**
+(Phase 5 stage 5f). The three tables below are the first in this file that
+`tools/render_results.py` builds from a pinned dataset
+(`reports/macbook-host/2026-09-22_1842_0f08940`, produced by
+`scripts/regen_results.sh --only=device_query,alloc_bench` at commit
+`0f08940`) rather than by hand. Every number matched the 2026-08-26 figures,
+four weeks and many commits later. The only change the render made was
+dropping the bold that used to mark the notable cells: generated tables carry
+data only (DECISIONS.md Q13), so the emphasis now lives in the prose — buddy's
+**100.0%** block efficiency and **0 B** internal waste on `uniform_pow2`, and
+the **64.0%** and **32.00 MiB vs 16.00 MiB** largest-free split on
+`dl_transformer`. The renderer also *asserts* the one-row-per-allocator claim
+above rather than assuming it: if a policy ever produced different figures, the
+render would fail instead of silently hiding the difference.
+
 **Trace `uniform_pow2`** — the control. Every size is `2^k ≥ kMinBlockBytes`,
 so buddy's internal waste **must** be exactly zero; any other value is an
 allocator bug, not a result.
 
-<!-- BEGIN GENERATED id=s2b-frag-uniform source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
+<!-- BEGIN GENERATED id=s2b-frag-uniform source=reports/macbook-host/2026-09-22_1842_0f08940 (fresh MacBook run 2026-09-22 -- fragmentation is deterministic (fixed seed), so any machine reproduces it; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 29.80 MiB | 29.80 MiB | 29.80 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
-| buddy | 48.00 MiB | 29.80 MiB | 29.80 MiB | **100.0%** | 62.1% | 62.1% | **0 B** | 32.00 MiB | no |
+| buddy | 48.00 MiB | 29.80 MiB | 29.80 MiB | 100.0% | 62.1% | 62.1% | 0 B | 32.00 MiB | no |
 | freelist | 80.00 MiB | 36.38 MiB | 29.04 MiB | 79.8% | 45.5% | 36.3% | 7.34 MiB | 8.00 MiB | no |
 
 <!-- END GENERATED id=s2b-frag-uniform -->
@@ -292,13 +307,13 @@ one.
 
 **Trace `dl_transformer`** — GPT-2-small shapes, f32, batch 1 × seq 512.
 
-<!-- BEGIN GENERATED id=s2b-frag-dl source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
+<!-- BEGIN GENERATED id=s2b-frag-dl source=reports/macbook-host/2026-09-22_1842_0f08940 (fresh MacBook run 2026-09-22 -- fragmentation is deterministic (fixed seed), so any machine reproduces it; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|
 | raw | 45.04 MiB | 45.04 MiB | 45.04 MiB | 100.0% | 100.0% | 100.0% | 0 B | n/a | no |
-| buddy | 80.00 MiB | 68.05 MiB | 43.54 MiB | **64.0%** | 85.1% | 54.4% | 24.51 MiB | **32.00 MiB** | no |
-| freelist | 80.00 MiB | 68.04 MiB | 43.54 MiB | **64.0%** | 85.0% | 54.4% | 24.50 MiB | **16.00 MiB** | no |
+| buddy | 80.00 MiB | 68.05 MiB | 43.54 MiB | 64.0% | 85.1% | 54.4% | 24.51 MiB | 32.00 MiB | no |
+| freelist | 80.00 MiB | 68.04 MiB | 43.54 MiB | 64.0% | 85.0% | 54.4% | 24.50 MiB | 16.00 MiB | no |
 
 <!-- END GENERATED id=s2b-frag-dl -->
 
@@ -307,7 +322,7 @@ table (50257 × 768 × f32) folded in, so the bypass-to-driver path is exercised
 amid real churn. Kept as its own trace so its extra permanent driver allocation
 never muddies the clean traces' flatline.
 
-<!-- BEGIN GENERATED id=s2b-frag-bypass source=PENDING (pinned in the next step to a fresh MacBook run; tools/render_results.py -- edit the pin, not the table) -->
+<!-- BEGIN GENERATED id=s2b-frag-bypass source=reports/macbook-host/2026-09-22_1842_0f08940 (fresh MacBook run 2026-09-22 -- fragmentation is deterministic (fixed seed), so any machine reproduces it; tools/render_results.py -- edit the pin, not the table) -->
 
 | Allocator | peak_reserved | peak_blocks | peak_requested | block_eff | reserv_eff | utilisation | internal waste | largest_free @ end | OOM? |
 |---|---|---|---|---|---|---|---|---|---|

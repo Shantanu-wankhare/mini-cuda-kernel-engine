@@ -2105,3 +2105,116 @@ a script that rewrites `RESULTS.md`) is next, still Mac-doable. After that, the
 combined Colab session (5g) exercises everything genuinely untested from here:
 the GB adapter against a real GPU, the `nsys`/`ncu` shell-outs, and this
 plotter against a full multi-kernel CSV set instead of GEMM alone.
+
+## 2026-09-22 — Session 18: Phase 5 stage 5f — regenerating RESULTS.md from pinned datasets
+
+**Environment:** MacBook Air (Apple Silicon), host-only (AppleClang 21.0.0,
+CMake 4.4.3, bash 3.2 for the scripts). No GPU. One real benchmark dataset was
+captured on this machine (`reports/macbook-host/2026-09-22_1842_0f08940`).
+
+### Correction first (a loose end from Session 15)
+
+Session 15 recorded an "unresolved inconsistency": CLAUDE.md §8 said the ncu RC
+ticket is filed and open, RESULTS.md §5a said it "has not been filed yet". The
+owner confirmed it **is** filed and open (sent 2026-08-31, per PROJECT_LOG
+Session 4's "RC ticket filed" entry). RESULTS.md §5a was the stale one and is
+now fixed (commit `8aa6ea2`). That ticket is about GPU performance-counter
+permission only — it has nothing to do with Google Benchmark, which needs no
+ticket (no module exists; FetchContent through the `explorer` proxy works).
+
+### What was built (4 slices, commits `c373528`, `14b1325`, `c17b75f`, `0f08940`, + this one)
+
+- **`scripts/regen_results.sh`** — runs every bench this machine has built,
+  each with its CWD set to a new dataset dir `reports/<tag>/<run-id>/`; saves
+  stdout/stderr per bench; writes `manifest.json` (machine, GPU and clocks at
+  start/end, driver, full `nvcc --version`, git sha + dirty flag, CMake cache,
+  denominators, per-bench argv/exit/time). Marks the dataset **INVALID** if any
+  bench exits nonzero, prints "no CUDA device" (which exits 0), prints a FAILing
+  validation line, or a numerics-gate FAIL. **Never touches RESULTS.md.**
+- **`tools/bench_outputs.py`** — dataset loading and every parser (CSV + the
+  stdout-only columns), each citing the printf it reads and failing loudly on
+  anything it doesn't recognise.
+- **`tools/render_results.py`** — 13 table specs; the fence engine; `--check`,
+  `--diff`, `--audit`, `--preview`, `--stale-prose`, `--self-test`.
+- **RESULTS.md fenced:** 13 generated tables in `BEGIN/END GENERATED` fences
+  that name their dataset; 14 authored tables marked `AUTHORED: <reason>`.
+  27 tables total (planning had estimated ~28). `--audit` is clean.
+- `.gitignore` (`reports/*` + `!reports/*/` so datasets are committable), env-aware
+  machine tags (`colab-t4`, `explorer-v100`, `macbook-host`), the Session-5 T4
+  GEMM files moved into `reports/colab-t4/2026-08-30_session5/` with a
+  hand-reconstructed manifest (commit **inferred**, unrecoverable fields null).
+- `docs/PROFILING.md` §7 documents the workflow.
+
+### Pre-existing errors found and fixed (DECISIONS.md Q12)
+
+Building the renderer meant inventorying every published cell, which surfaced
+errors that predate Phase 5 — each fixed as a named correction, superseded text
+kept: §5b's "the SAME ratio, independently" (T4 is **3.90×**, not 4.17×); §3d's
+−0.10 pp (table says −0.14); §2a's star footnote (≤ 2×floor = 50 ns, not
+25 ns); "measured BW is typically 80–90% of spec" (measured: 73.5% and 70.9%);
+240.6 vs 240.5 GB/s; a dangling "§0 rule". Two code bugs: **`summary_table`'s
+sticky precision** (why many published ms cells have one decimal — e.g. an
+L2-control min of "0.0 ms"; proven by a new host test that fails on exactly
+row 2 with the bug reinstated) and **`graph_bench` exiting 0 on a failed
+numerics gate**. `fma_peak` gained `--warmup/--iters` with defaults unchanged
+(3+10, below rule 3) — its output is the denominator for every compute %peak, so
+it is measured both ways in 5g before anything changes.
+
+**Recorded, not fixed:** `stream_triad`'s local Roofline leaves `peak_tflops = 0`
+(the `bench_common.hpp` trap), so its stdout summary row prints `%peak 0.0%` /
+`compute`. Its headline `achieved … GB/s` line is correct and is the only line
+the renderer reads, so no table is affected. Left for the owner to decide.
+
+### Results — measured on this machine
+
+- **G1 (golden, real published data):** §3d's nine T4 rows render
+  **byte-identical** from the Session-5 dataset — first run.
+- **G2 (end-to-end):** a fresh `regen_results.sh` run reproduced all three §2b
+  fragmentation tables **byte-for-byte**, four weeks and many commits after
+  2026-08-26 — the third independent reproduction (MacBook 08-26, Colab 08-29,
+  MacBook 09-22). `--stale-prose` found 0 orphaned numbers; the render's entire
+  diff was 3 rows losing their bold. §2b is the first set of tables in RESULTS.md
+  built by the renderer.
+- **§2a star rule vs the code:** rendered from alloc's CSV and cross-checked
+  against the table alloc_bench prints itself in the same run — 42 rows, 0
+  mismatches, 85 starred cells agreeing.
+- **Round-trip for the six specs with no real data yet:** §0/§1/§3b/§3c/§4
+  exact, §3a's only difference the designed new row. Now a permanent self-test.
+
+### What was learned — mostly from tests that passed for the wrong reason
+
+- **My validity test first passed for the wrong reason.** The planted gate-FAIL
+  run exited 1 — because my scratch tag (`zz-scratch-t4b`) didn't match `*-t4`,
+  so the denominator guard fired before the gate was reached. Only checking *which
+  reason* each manifest recorded exposed it. Same shape as the warm-`_deps` and
+  `set -u` traps earlier in Phase 5: an exit code is not evidence of the reason.
+- **`nvcc --version | tail -1` is a build string**, not the version; found while
+  writing the parser that needed the version.
+- **Row alignment by all text cells buries status changes.** The first
+  `compare_tables` would have reported a gate flipping PASS→FAIL as "missing
+  row + new row" — hiding precisely the change 5g's reproducibility report must
+  show. Rows now pair by (first cell, occurrence); a self-test pins it.
+- **Deciding what may be generated is itself a design surface:** §3b's
+  `__syncthreads` counts look like data in stdout but are hard-coded literals —
+  "parsing" them would dress a constant up as a measurement, so they're spec
+  constants citing `kernels/reduce.cu`. §2b's "one row per allocator" is now
+  *asserted*, so a policy that ever changed fragmentation can't be hidden.
+- The one-decimal cells in §3a/§3b/§3c/§3d-V100 are the sticky-precision bug's
+  fingerprints. They can't be recovered — no raw data was kept — and are fixed
+  only when a run is promoted.
+
+### Verification
+
+Host suite 145,670 checks (58,861 + 86,809), 0 failures; `typecheck_cuda.sh` all
+clean; `shellcheck -x` clean on all four scripts; pyflakes clean; self-tests
+pass for `render_results.py` (G1, G3, G4, G6, G7, G9, comparison, round-trip),
+`nsys_overlap.py`, `plot_roofline.py`; `--audit` 0 unclassified; `--check` 0.
+
+### What's next
+
+**Stage 5g — the Colab T4 run, in a fork chat** (handoff prompt given in chat).
+The fork captures a dataset, commits it plus `--preview` output for every T4
+table (the reproducibility result), runs the GB cross-check, fma_peak both ways,
+nsys + `nsys_overlap.py` against the committed trace, the nsys GPU-metrics trial,
+the ncu attempt, and the full roofline. **No promotion and no prose edits in the
+fork** — promotion is 5i, in the main chat.

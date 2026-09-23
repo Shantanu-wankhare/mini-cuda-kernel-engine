@@ -1,0 +1,88 @@
+{
+  "schema": "mcke-dataset/1",
+  "status": "VALID",
+  "invalid_reasons": [],
+  "reconstructed": false,
+  "machine_tag": "macbook-host",
+  "machine_tag_reason": "auto: env='macbook' (uname/COLAB_*/SLURM_CLUSTER_NAME/hostname), gpu='' (nvidia-smi)",
+  "run_id": "2026-09-22_1842_0f08940",
+  "started": "2026-09-23T01:42:10Z",
+  "finished": "2026-09-23T01:42:11Z",
+  "host": {
+    "hostname": "Shantanus-MacBook-Air.local",
+    "uname": "Darwin Shantanus-MacBook-Air.local 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:20 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8142 arm64 arm"
+  },
+  "gpu": {
+    "start": null,
+    "end": null
+  },
+  "toolchain": {
+    "nvcc": null,
+    "cmake": "cmake version 4.4.3",
+    "cxx": "/usr/bin/c++"
+  },
+  "git": {
+    "sha": "0f08940",
+    "dirty": false
+  },
+  "build": {
+    "dir": "/Users/shantanuwankhare/Downloads/Projects/Mini CUDA Kernel Engine (GPU Compute Runtime)/build-host",
+    "cache": {
+      "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+      "CMAKE_CXX_COMPILER": "/usr/bin/c++",
+      "MCKE_CUDA_ARCH": "native",
+      "MCKE_ENABLE_CUDA": "OFF",
+      "MCKE_GOOGLE_BENCHMARK": "AUTO",
+      "MCKE_USE_NVTX": "OFF"
+    }
+  },
+  "denominators": {
+    "MCKE_PEAK_GB_S": null,
+    "MCKE_PEAK_TFLOPS": null,
+    "note": "null = unset: bench_common.hpp used its T4 defaults (235.4 / 8.130)"
+  },
+  "outputs": [
+    "reports/alloc_fragmentation_dl_transformer.csv",
+    "reports/alloc_fragmentation_dl_transformer_bypass.csv",
+    "reports/alloc_fragmentation_uniform_pow2.csv",
+    "reports/alloc_latency_dl_transformer.csv",
+    "reports/alloc_latency_dl_transformer_bypass.csv",
+    "reports/alloc_latency_uniform_pow2.csv"
+  ],
+  "runs": [
+    {
+      "bench": "device_query",
+      "argv": [
+        "/Users/shantanuwankhare/Downloads/Projects/Mini",
+        "CUDA",
+        "Kernel",
+        "Engine",
+        "(GPU",
+        "Compute",
+        "Runtime)/build-host/bin/mcke_device_query"
+      ],
+      "exit_code": 0,
+      "seconds": 0,
+      "stdout": "device_query.stdout.log",
+      "stderr": "device_query.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "alloc_bench",
+      "argv": [
+        "/Users/shantanuwankhare/Downloads/Projects/Mini",
+        "CUDA",
+        "Kernel",
+        "Engine",
+        "(GPU",
+        "Compute",
+        "Runtime)/build-host/bin/mcke_alloc_bench"
+      ],
+      "exit_code": 0,
+      "seconds": 0,
+      "stdout": "alloc_bench.stdout.log",
+      "stderr": "alloc_bench.stderr.log",
+      "invalid_reasons": []
+    }
+  ]
+}

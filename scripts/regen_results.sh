@@ -309,6 +309,9 @@ set -e
 echo
 echo "Nothing in RESULTS.md changed. To compare this run against a published table:"
 echo "  python3 tools/render_results.py --preview id=<table-id> source=${DS#"$REPO"/}"
-echo "To PROMOTE it, edit that table's source= pin in RESULTS.md, re-render, then run"
-echo "  python3 tools/render_results.py --stale-prose"
+# Order matters: --stale-prose compares the PUBLISHED table with the would-be
+# render, so it must run BEFORE rendering -- afterwards the old numbers are gone.
+echo "To PROMOTE it: edit that table's source= pin in RESULTS.md, then"
+echo "  python3 tools/render_results.py --stale-prose   # prose numbers it would orphan"
+echo "fix that prose, and only then render:  python3 tools/render_results.py"
 exit "$status"
