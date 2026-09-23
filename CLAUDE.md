@@ -83,15 +83,17 @@ MacBook accordingly: `cmake` + `ctest` work here now.
 The clang++ escape hatch below is kept for *minimal environments* (a fresh
 container, a login node with no CMake module), not because this machine lacks
 CMake. Re-verified 2026-09-16: still compiles warning-free and still passes.
-Note its one limitation — it builds **`test_host_core` only** (58,856 checks).
+Note its one limitation — it builds **`test_host_core` only** (58,861 checks).
 `test_graph_host` (86,809 checks) needs more sources and is not in this
 one-liner, so the fallback covers ~40% of the host suite, not all of it.
 
 ```bash
-# --- No CMake available? One-command host test (verified 2026-09-16):
+# --- No CMake available? One-command host test (verified 2026-09-22).
+# src/core/profiler.cpp joined the list 2026-09-22: test_host_core now covers
+# Profiler::summary_table (Phase 5 stage 5f), and without it this fails to link.
 clang++ -std=c++20 -Wall -Wextra -I include -I tests -DMCKE_WITH_CUDA=0 \
   tests/test_host_core.cpp src/core/device.cpp src/memory/allocator.cpp \
-  src/core/host_timer.cpp \
+  src/core/host_timer.cpp src/core/profiler.cpp \
   src/memory/buddy_allocator.cpp src/memory/freelist_allocator.cpp \
   -o /tmp/mcke_tests && /tmp/mcke_tests
 ```

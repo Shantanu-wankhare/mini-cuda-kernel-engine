@@ -42,7 +42,10 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 > runs this short, but treat this row as indicative rather than authoritative —
 > per `docs/ENVIRONMENTS.md`, Explorer is where the authoritative numbers come
 > from. "Measured BW" here is `stream_triad`'s figure, not `vector_add`'s
-> (240.6 GB/s) — see section 1 for why they differ and why that's expected.
+> (240.5 GB/s) — see section 1 for why they differ and why that's expected.
+> *(Corrected 2026-09-22: this note previously said 240.6 GB/s. §1's own table
+> gives 240.5 — 805,306,368 B / 3.348 ms — and 240.6 does not come from the
+> 2026-08-29 re-run either, which re-measured only `stream_triad`/`fma_peak`.)*
 
 > Note: "Peak BW (spec formula)" is `2 × memory_clock_khz × 1e3 × bus_bits/8`
 > (the leading ×2 accounts for `cudaDeviceProp::memoryClockRate` reporting one
@@ -51,7 +54,11 @@ Fill one row per machine, from `./build/bin/mcke_device_query`.
 > "Measured BW" comes from `bench/stream_triad` (Phase 1). Use the **measured**
 > figure as the denominator for bandwidth efficiency — it already accounts for
 > ECC overhead and real sustained clocks, and is typically 80-90% of the spec
-> number.
+> number. *(Corrected 2026-09-22: "typically 80-90%" is not what this project
+> measured — 235.4/320.1 = **73.5%** on the T4 and 636.3/898.0 = **70.9%** on
+> the V100, both below the claimed range. The general claim is left as written
+> above because it is the one this note was built on; the two measurements are
+> the data. See also `docs/PROFILING.md` §2, which repeats it.)*
 
 ---
 
@@ -184,7 +191,12 @@ embedding table taking the bypass path):
 | freelist/event | allocate | 94 | 138 | 164 | 304 | 72531 | 323.7 | 26011 | 6 |
 | freelist/event | deallocate | 546 | 626 | 652 | 5768 | 195660 | – | – | – |
 
-`*` = at or below the 25 ns instrument floor.
+`*` = at or below **2×** the 25 ns instrument floor, i.e. ≤ 50 ns — the test
+`ClockCalibration::is_below_floor` actually applies
+(`include/mcke/profiling/host_timer.hpp:134`, `ns <= 2 * floor_ns`). *(Corrected
+2026-09-22: this footnote previously read "at or below the 25 ns instrument
+floor", which does not match the code — the starred 42 and 36 ns cells are above
+25 ns, and are starred because they are within two clock ticks.)*
 
 *The `amortised` column is one timestamp bracket around the whole bare loop
 divided by op count — it recovers fast-path cost on a coarse clock, where the
@@ -641,8 +653,10 @@ chip: `peak_gb_s = 636.3` (`stream_triad`), `peak_tflops = 15.601` (`fma_peak`),
 ridge point **24.5 FLOP/byte** — a different roofline entirely from the T4's
 34.5, so these numbers are never mixed into a single "%peak" comparison with the
 T4 rows above; they sit in the same table only because the `Machine` column
-already exists to keep architectures distinguishable, per this file's own
-"don't mix V100 and A100 in one comparison" rule in §0.
+already exists to keep architectures distinguishable, per the project's
+"don't mix V100 and A100 in one comparison" rule — which lives in
+`docs/ENVIRONMENTS.md`'s Explorer notes, not in §0. *(Corrected 2026-09-22: this
+previously said the rule was "in §0", where it never appeared.)*
 
 **Same source code, same tile sizes (untuned for this chip), a different
 occupancy story on almost every row** — and the differences are all explained
@@ -672,8 +686,10 @@ by the architecture, not by anything wrong with the kernels:
 
 **`warptile_nodbuf`'s regression did not reproduce.** On the T4 it measured
 **−0.73 pp** relative to `tiled_regblock` (a contradiction of the +5–12%
-prediction, per §3d above). Here it is **−0.10 pp** — flat, indistinguishable
-from run-to-run noise at this iteration count. Registers, shared memory, tile,
+prediction, per §3d above). Here it is **−0.14 pp** — flat, indistinguishable
+from run-to-run noise at this iteration count. *(Corrected 2026-09-22: this
+previously said −0.10 pp; the table directly above gives 75.06% − 75.20% =
+−0.14 pp. The conclusion — flat, noise-level — is unchanged.)* Registers, shared memory, tile,
 and occupancy are all identical to `tiled_regblock` on both chips, and the
 verified bank-conflict cut (`test_gemm_bank_conflict_math`) is an
 architecture-independent integer property — so this is evidence *against* a bug
@@ -1229,8 +1245,15 @@ required:**
   transitions (coalescing → shared staging → register blocking → lane
   permutation → double buffer → vectorized loads → cuBLAS) hold on both the
   T4 and the V100, with register blocking the single largest jump on both
-  chips (T4: 4.17×/10.4%→40.4%; V100: 4.17×/18.0%→75.2% — the SAME ratio,
-  independently).
+  chips (T4: **3.90×**/10.4%→40.4%; V100: 4.17×/18.0%→75.2%) — the same *rank*
+  on both chips, but **not** the same ratio. *(Corrected 2026-09-22: this
+  previously read "T4: 4.17× … V100: 4.17× — the SAME ratio, independently".
+  The T4 figure is 40.39/10.36 = 3.90×, which is also what the Session-5 run's
+  own attribution line printed — `reports/colab-t4/phase3_gemm_stdout.log`:
+  "tiled_smem -> tiled_regblock 3.90x". Only the V100's 11.732/2.812 is 4.17×.
+  "The same ratio, independently" was the striking part of the original
+  sentence, and it was false; the claim that survives is the weaker, true one —
+  register blocking is the largest single rung on both architectures.)*
 - `warptile_nodbuf`'s regression is very likely **not a bug**: identical
   registers/smem/occupancy to `tiled_regblock` on both chips, a verified
   architecture-independent bank-conflict reduction

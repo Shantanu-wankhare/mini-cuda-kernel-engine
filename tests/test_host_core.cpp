@@ -42,6 +42,7 @@
 #include "mcke/memory/buddy_math.hpp"
 #include "mcke/memory/freelist_allocator.hpp"
 #include "mcke/profiling/host_timer.hpp"
+#include "mcke/profiling/profiler.hpp"
 #include "mcke/tensor/shape.hpp"
 
 // -----------------------------------------------------------------------------
@@ -2443,6 +2444,44 @@ void test_reference_vectors() {
   CHECK(exact_cases >= 10);
 }
 
+// ---------------------------------------------------------------------------
+// Profiler::summary_table precision (Phase 5 stage 5f, DECISIONS.md Q12).
+//
+// The regression: setprecision(3) was set ONCE before the row loop, and the
+// %peak column leaves the stream at precision 1, so every row after the first
+// printed med_ms/min_ms with ONE decimal. Those stdout tables were transcribed
+// into RESULTS.md, which is where "0.5" and an L2-control min of "0.0 ms" came
+// from. This pins the fix: two records, and the SECOND row must still carry 3
+// decimals. One record would not catch it -- the first row was always right.
+// ---------------------------------------------------------------------------
+void test_summary_table_precision() {
+  std::printf("test_summary_table_precision\n");
+  using namespace mcke;
+  Profiler prof;
+  KernelRecord a;
+  a.name = "k"; a.variant = "first";
+  a.median_ms = 1.23456; a.min_ms = 1.11111;
+  a.flops = 100; a.bytes = 400;
+  KernelRecord b = a;
+  b.variant = "second";
+  b.median_ms = 0.52349; b.min_ms = 0.51237;   // would print "0.5" / "0.5" before the fix
+  prof.add(a);
+  prof.add(b);
+
+  Roofline rl;
+  rl.peak_gb_s = 235.4;
+  rl.peak_tflops = 8.130;
+  const std::string t = prof.summary_table(rl);
+
+  CHECK(t.find("1.235") != std::string::npos);   // row 1 median, 3 dp
+  CHECK(t.find("1.111") != std::string::npos);   // row 1 min
+  CHECK(t.find("0.523") != std::string::npos);   // row 2 median -- the actual regression
+  CHECK(t.find("0.512") != std::string::npos);   // row 2 min
+  // Widths are frozen for Phase 5 (profiler.cpp's own comment): a data row is
+  // 22+30+10+10+10+10+8+10 = 110 chars before "  bound", and the separator 117.
+  CHECK(t.find(std::string(117, '-')) != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -2480,6 +2519,7 @@ int main() {
   test_gemm_bank_conflict_math();
   test_gemm_tolerances();
   test_reference_vectors();
+  test_summary_table_precision();
 #if !MCKE_WITH_CUDA
   // Stream-ordered reuse: needs fake stream handles, which are only safe to
   // fabricate when no driver will ever see them.

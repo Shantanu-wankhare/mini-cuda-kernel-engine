@@ -69,11 +69,19 @@ std::string Profiler::summary_table(const Roofline& rl) const {
      << std::setw(10) << "GB/s" << std::setw(10) << "TFLOP/s" << std::setw(8) << "AI"
      << std::setw(10) << "%peak" << "  bound\n";
   os << std::string(117, '-') << '\n';
-  os << std::fixed << std::setprecision(3);
+  os << std::fixed;
   for (const auto& r : records_) {
     const double ai = r.arithmetic_intensity();
+    // setprecision(3) HERE, per row -- not once before the loop. `setprecision`
+    // is sticky on the stream, and the %peak column below leaves it at 1, so
+    // with the call hoisted above the loop every row AFTER THE FIRST printed its
+    // med_ms/min_ms with one decimal. That is not cosmetic: those stdout tables
+    // were transcribed into RESULTS.md, which is why §3a/§3b/§3c/§3d-V100 carry
+    // cells like "0.5" and an L2-control min of "0.0" ms (found in Phase 5 stage
+    // 5f; DECISIONS.md Q12). The CSV was never affected -- write_csv uses its own
+    // stream at default precision -- so this only ever corrupted the human copy.
     os << std::left << std::setw(22) << r.name << std::setw(30) << r.variant
-       << std::right << std::setw(10) << r.median_ms
+       << std::right << std::setprecision(3) << std::setw(10) << r.median_ms
        << std::setw(10) << r.min_ms
        << std::setw(10) << std::setprecision(1) << r.gb_per_s()
        << std::setw(10) << std::setprecision(3) << r.tflops()

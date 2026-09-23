@@ -47,6 +47,8 @@
 // =============================================================================
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "mcke/core/device.hpp"
@@ -94,9 +96,44 @@ __global__ void fma_peak_kernel(const float* __restrict__ seed, float* __restric
   out[tid] = sum;   // the observable side effect that keeps the whole kernel alive
 }
 
+// -----------------------------------------------------------------------------
+// --warmup= / --iters=, added in Phase 5 stage 5f (DECISIONS.md Q12).
+//
+// The DEFAULTS STAY 3 + 10 -- below RESULTS.md rule 3's >= 5 warmup / >= 20
+// timed -- and that is deliberate, not an oversight left in place. This program
+// produces the DENOMINATOR for every compute-bound "% of peak" in the project
+// (8.130 TFLOP/s on the T4, 15.601 on the V100). Changing its iteration count
+// blind would silently move every one of those percentages at once. The flags
+// exist so stage 5g can measure BOTH ways on the same machine and record whether
+// the denominator actually moves before anything is changed. Unknown flags are
+// fatal, matching gemm_bench/graph_bench: a typo'd flag that silently falls back
+// to the defaults would make the A/B compare a run against itself.
+// -----------------------------------------------------------------------------
+struct Args { int warmup = 3; int iters = 10; };
+
+Args parse_args(int argc, char** argv) {
+  Args a;
+  for (int i = 1; i < argc; ++i) {
+    const char* s = argv[i];
+    if      (std::strncmp(s, "--warmup=", 9) == 0) a.warmup = std::atoi(s + 9);
+    else if (std::strncmp(s, "--iters=", 8) == 0)  a.iters  = std::atoi(s + 8);
+    else {
+      std::fprintf(stderr, "fma_peak: unknown argument '%s'\n"
+                           "usage: mcke_fma_peak [--warmup=N] [--iters=N]  (defaults 3, 10)\n", s);
+      std::exit(2);
+    }
+  }
+  if (a.warmup < 0 || a.iters <= 0) {
+    std::fprintf(stderr, "fma_peak: need --warmup >= 0 and --iters > 0\n");
+    std::exit(2);
+  }
+  return a;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const Args args = parse_args(argc, argv);
   if (device_count() == 0) {
     std::printf("no CUDA device; nothing to benchmark\n");
     return 0;
@@ -143,7 +180,7 @@ int main() {
 
   auto rec = prof.time_op(
       "fma_peak", "8acc_100000iter", *stream, ideal_flops, ideal_bytes,
-      /*warmup=*/3, /*iters=*/10,
+      args.warmup, args.iters,
       [&](const rt::Stream& s) {
         fma_peak_kernel<<<blocks, kThreads, 0, s.native()>>>(
             static_cast<const float*>(d_seed->ptr), static_cast<float*>(d_out->ptr));
@@ -154,6 +191,10 @@ int main() {
   stream->synchronize().throw_if_error();
 
   std::printf("\nblocks=%d threads/block=%d total_threads=%zu\n", blocks, kThreads, total_threads);
+  // Echoed so a log records which iteration config produced its number --
+  // without this line the 5g A/B's two logs would be indistinguishable.
+  std::printf("timing        %d warmup + %d timed iterations%s\n", args.warmup, args.iters,
+              (args.warmup < 5 || args.iters < 20) ? "  (below RESULTS.md rule 3 -- the historical default)" : "");
   std::printf(
       "\nmeasured f32 FMA peak: %.3f TFLOP/s\n\n"
       "*** Use this number as Roofline::peak_tflops for every compute-bound\n"

@@ -20,6 +20,10 @@ spec sheet:
 - **Measured bandwidth** — `bench/stream_triad`: `a[i] = b[i] + s*c[i]` over a
   working set ≫ L2. Typically 80-90% of the spec-formula number
   (`DeviceInfo::peak_dram_gb_s()`); the gap is ECC, refresh, and real clocks.
+  *(Corrected 2026-09-22: this project measured **73.5%** on the Colab T4 and
+  **70.9%** on the Explorer V100 — both below the "typical" range above, which
+  was stated before either machine was measured. Treat the range as folklore
+  and the measurements as the data; `RESULTS.md` §0.)*
 - **Measured f32 FMA peak** — `bench/fma_peak`: a long dependency-free chain of
   `fmaf` in registers, no memory traffic, enough independent chains to saturate
   the pipes. This already includes whatever clock the GPU sustains under load,

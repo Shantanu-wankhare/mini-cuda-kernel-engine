@@ -358,3 +358,117 @@ still open. Where should the ncu work actually run?
 explicitly and recorded rather than buried in driver output. Phase 5 does **not**
 open the RTX 5060 as a new environment; that stays available for Phase 6's arch
 A/B, where sm_120 is the point rather than a side effect.
+
+## 2026-09-22 — Phase 5 stage 5f planning: regenerating RESULTS.md (main chat)
+
+### Q10. How should a new benchmark run reach RESULTS.md?
+
+**Question:** RESULTS.md's prose quotes specific table numbers in well over 50
+places across §0–§5c, and only 1 of the 13 tables slated for generation has any
+raw data today (the T4 half of §3d). If the renderer simply rewrote tables with
+each new run's numbers, the surrounding prose would go silently stale. How
+should a new benchmark run reach RESULTS.md?
+
+**Options offered:**
+1. **Pinned datasets + explicit promotion (Recommended).** Each fence names the
+   exact dataset directory it renders from, visible in the file. A GPU run
+   creates a NEW dataset dir and changes nothing in RESULTS.md. Rendering from
+   pins is one deterministic command (the exit criterion). Promoting a run =
+   edit the pin and re-render; a `--stale-prose` report lists every nearby prose
+   number that no longer appears in the table. Side benefit: stage 5g's run
+   doubles as a reproducibility check against the published numbers before
+   anything is promoted.
+2. **Live overwrite.** regen_results.sh runs the benches and immediately
+   rewrites the fenced tables. Simplest, but every run silently desyncs the
+   prose — §3a already shows the failure (prose cites 242.8 GB/s for vw4, the
+   table shows 247.8, because the bench measures that config twice per run and
+   the two picked different measurements).
+3. **Separate generated file.** Generated tables go to their own file(s);
+   RESULTS.md links to them and stays fully hand-written. Zero risk to prose,
+   but revisits Q8 and reinterprets the exit criterion.
+
+**Picked:** Option 1.
+
+**Why recommended:** it is the only option under which "one command regenerates
+every table" and "the prose stays true" can both hold. Promotion becomes a
+deliberate, reviewable act instead of a side effect of running a benchmark.
+
+### Q11. Where should the renderer get columns that aren't in any CSV?
+
+**Question:** Many columns of the generated tables are printed to stdout only:
+GEMM regs/smem/spill/occupancy, softmax's max|Σrow−1|, the graph numerics-gate
+result, §0's hardware facts, the whole §2b fragmentation table. Where should the
+renderer get them?
+
+**Options offered:**
+1. **Parse captured stdout (Recommended).** regen_results.sh runs each bench with
+   CWD = the dataset dir and saves stdout next to its CSVs (which is also the
+   provenance record rule 2 asks for); the renderer parses the fixed printf
+   formats and fails loudly on any mismatch. Zero C++ changes; the GEMM parser is
+   testable today against the committed stdout log.
+2. **JSON sidecars from each bench.** Structured output from ~8 C++ programs.
+   More robust long-term, but none of it can run on the Mac, so it adds untested
+   code to exactly the 5g run meant to validate everything else.
+3. **CSV columns only.** Generated tables carry only CSV fields; the rest moves
+   to authored side tables. Simplest, but splits tables readers use together.
+
+**Picked:** Option 1 — **with a correction from the owner:** not every bench
+writes bare filenames to CWD. `alloc_bench.cpp` creates `reports/` and writes
+`reports/alloc_*.csv` (line 1040), so with CWD = dataset dir its CSVs land in
+`<dataset>/reports/`, and the loader must look there. (The option text had said
+"every bench already writes bare filenames to CWD"; that was imprecise.)
+
+**Why recommended:** zero untestable C++ in the data path, and the one real
+stdout fixture that exists (the Session-5 GEMM log) makes the hardest parser
+testable before any GPU is involved.
+
+### Q12. How should the pre-existing errors found during exploration be handled?
+
+**Question:** Exploration turned up pre-existing errors, all verified: §5b says
+register blocking gave "the SAME ratio" (4.17×) on both chips, but T4's is 3.90×;
+§3d prose says −0.10 pp where its table gives −0.14; the §2a star footnote says
+≤25 ns but the code stars ≤50 ns; §0 says measured BW is "typically 80–90% of
+spec" when this project measured 73.5% and 70.9%; a "§0 rule" reference is
+dangling; Profiler::summary_table has a sticky-precision bug (why many published
+ms cells have 1 decimal); graph_bench exits 0 when its numerics gate FAILS; and
+fma_peak runs 3 warmup + 10 timed, below rule 3, while producing the denominator
+for every compute %peak.
+
+**Options offered:**
+1. **Fix docs + 2 code bugs now; test fma_peak in 5g (Recommended).** Named
+   corrections in RESULTS.md, keeping superseded text; two small code fixes
+   (summary_table precision, graph_bench's exit code); fma_peak NOT changed
+   blind — 5g runs it at both 3+10 and 5+20 first.
+2. **Record all, fix in 5i.**
+3. **Fix everything now, fma_peak included** — changes the denominator of every
+   compute %peak, blind.
+
+**Picked:** Option 1. (Owner also noted that the sticky-precision bug shows in
+§3b too — `warp_shuffle_256t` median 0.523, min 0.5.)
+
+**Why recommended:** the doc errors are cheap and certain; the two code bugs are
+both silent-failure bugs of exactly the kind this project exists to catch;
+fma_peak is the one change whose consequences can't be seen until it is measured.
+
+### Q13. Should generated tables reproduce editorial emphasis?
+
+**Question:** Some published tables contain editorial marks — bold cells (§2b's
+100.0%/64.0%, §3b's 9 vs 1 barrier counts, §4's **PASS**) and an inline note
+("(this IS the baseline)"). Descriptive labels ("starved (40 blocks)",
+"cuBLAS (first)") would be generated either way.
+
+**Options offered:**
+1. **Data only in fences; emphasis in prose (Recommended).** A generator
+   shouldn't decide what's notable — after a new run the notable cell may change.
+   Bold dropped from generated regions; notes become a footnote just below the
+   fence.
+2. **Encode emphasis in each table's spec.** Tables look exactly as today, but
+   emphasis can go silently wrong after a promotion.
+
+**Picked:** Option 1 — **with an exception from the owner:** formatting that
+depends only on a cell's *own value* is fine to generate. Specifically, in §4's
+numerics-gate column, **FAIL must always render bold; PASS can be plain.**
+
+**Why the exception is right:** it is not editorial — it is a rule about a value,
+not a judgement about which cell matters, so it cannot go stale on promotion.
+And a FAIL is exactly the cell no reader should be able to miss.

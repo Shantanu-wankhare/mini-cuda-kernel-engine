@@ -306,6 +306,14 @@ int main(int argc, char** argv) {
 
   RawDeviceAllocator alloc;
   std::vector<Row> rows;
+  // Counted, and turned into the exit code at the bottom of main(). Before
+  // Phase 5 stage 5f this program returned 0 unconditionally -- a numerics-gate
+  // FAIL or a failed plan printed a line and was otherwise invisible to anything
+  // that checks exit codes (a batch script, CI, scripts/regen_results.sh). Every
+  // other bench already returns nonzero on a validation failure; this one was
+  // the exception, on the one check that guards a CORRECTNESS claim
+  // (DECISIONS.md Q12).
+  int correctness_failures = 0;
 
   // ---------------------------------------------------------------------------
   // One graph, all three policies.
@@ -335,7 +343,11 @@ int main(int argc, char** argv) {
 
       GraphExecutor ex(std::move(b.g), alloc, *dev, opts);
       const Status planned = ex.plan();
-      if (!planned.ok()) { std::printf("  plan FAILED: %s\n", planned.message().c_str()); return; }
+      if (!planned.ok()) {
+        std::printf("  plan FAILED: %s\n", planned.message().c_str());
+        ++correctness_failures;
+        return;
+      }
 
       // Deterministic host data for every input.
       for (TensorId t : inputs) {
@@ -454,7 +466,10 @@ int main(int argc, char** argv) {
       std::printf("  numerics gate  %s  (%d configs x %d repeats, %zu elements)\n",
                   res->passed ? "PASS" : "*** FAIL ***", res->configs_compared,
                   res->repeats, res->elements_compared);
-      if (!res->passed) std::printf("    %s\n", res->detail.c_str());
+      if (!res->passed) {
+        std::printf("    %s\n", res->detail.c_str());
+        ++correctness_failures;
+      }
     }
     std::printf("\n");
   };
@@ -566,6 +581,11 @@ int main(int argc, char** argv) {
                    r.enqueue_us, r.concurrency, r.peak, r.naive);
     std::fclose(f);
     std::printf("wrote phase4_graph.csv\n");
+  }
+  if (correctness_failures) {
+    std::printf("\n*** %d CORRECTNESS FAILURE(S) (numerics gate / plan) -- exiting 1 ***\n",
+                correctness_failures);
+    return 1;
   }
   return 0;
 }
