@@ -1991,3 +1991,117 @@ Stage 5e — `tools/plot_roofline.py`, reading the now-committed
 `reports/colab-t4/phase3_gemm.csv`. Then the combined Colab session (5g), which
 is where this stage's genuinely untested half — the real `nsys`/`ncu` shell-outs
 and the CSV column-name guess — gets its first real exercise.
+
+## 2026-09-22 — Session 17: Phase 5 stage 5e — the roofline plotter
+
+**Environment:** MacBook Air, host-only. matplotlib 3.11.0 / no numpy dependency.
+Rendered against the real committed `reports/colab-t4/phase3_gemm.csv` and a
+hand-derived (not committed) synthetic multi-kernel CSV for visual verification.
+Nothing in `RESULTS.md` changed.
+
+### What was built
+
+**`tools/plot_roofline.py`** (new) — Phase 5's second exit criterion ("a
+roofline plot with all kernels on it"). Reads one or more of `Profiler::write_csv`'s
+frozen 13-column CSVs, plots every row as one point on a log-log roofline: x =
+arithmetic intensity, y = achieved TFLOP/s, with the memory-bound diagonal and
+compute-bound ceiling drawn from explicitly-chosen denominators.
+
+### The one design decision worth restating: denominators are never inferred
+
+A CSV's own `attainable_tflops`/`bound` columns were computed against whatever
+machine produced that file. Trusting them here would silently draw "the
+roofline for whichever machine happened to make this CSV" — exactly the
+`bench_common.hpp` trap (`peak_tflops == 0` giving a confidently wrong `%peak`
+with no error) applied to a new context. So `--peak-gb-s=`/`--peak-tflops=`,
+`--preset=t4`/`--preset=v100` (RESULTS.md §0's own measured values, transcribed
+once with a citation), or `MCKE_PEAK_GB_S`/`MCKE_PEAK_TFLOPS` are the only ways
+in — give none, and the script refuses to plot, printing the same shape of
+message `benchcfg::make_roofline` prints when it aborts.
+
+Every plotted **point** still comes straight from the CSV — only the roofline
+**lines** and the memory/compute-bound marker shape are computed fresh from the
+chosen denominators, using the exact formulas in `profiler.hpp`'s `Roofline`
+struct, reproduced rather than reimplemented differently by accident.
+
+### What was learned — from actually looking at the rendered output, not just running the self-test
+
+The self-tests (`Roofline` formulas cross-checked against `RESULTS.md`'s own
+34.5 ridge point and the committed CSV's 8.13 TFLOP/s ceiling; a CSV-corruption
+guard) all passed on the first real render. **The render itself was not
+acceptable**, and would not have been caught without actually looking at the
+image:
+
+- **Labels for closely-spaced points overlapped into unreadable mush.** Four of
+  the nine GEMM variants (`tiled_regblock`, `warptile_nodbuf`, `warptile_dbuf`,
+  `warptile_vec4`) land within a few percent of each other in TFLOP/s once the
+  ladder nears cuBLAS — the well-known "diminishing returns near the ceiling"
+  finding already in `RESULTS.md` §3d, now visible as a real rendering problem.
+  A fixed `(5, 2)` text offset for every label put them on top of one another.
+- **The ridge-point annotation collided with the roofline legend box.** For a
+  GEMM-only plot, the ridge point (~34.5 FLOP/byte) happens to fall inside the
+  legend's horizontal span at the top-left.
+- **The marker-shape footnote collided with the kernel legend** (both wanted
+  the bottom-right corner).
+
+Fixed, in order: (1) `compute_label_offsets()` — a deterministic, log-space
+union-find clustering (no `adjustText`/`scipy` dependency) that stacks labels
+vertically within a cluster instead of overlapping them, unit-tested without
+matplotlib; (2) moved the ridge annotation to the bottom of the axes via a
+blended data/axes-fraction transform, which no legend ever occupies regardless
+of where the ridge point falls; (3) moved the marker-shape footnote to
+bottom-left, the one corner neither existing legend claims.
+
+**The stacking fix itself then created a second, subtler problem, also only
+visible by looking:** once labels for 4+ tightly-clustered points stack 11pt
+apart, the lower-ranked labels drift far enough from their actual marker
+(which may sit within a couple of *pixels* of its neighbours) to look
+unattached to any point at all. Fixed with a conditional leader line — added
+only for stacked members below the first, since the top of a cluster needs
+none. Zoomed into the rendered PNG to confirm the leader lines terminate at
+each point's own individual data coordinate rather than all converging on one
+marker; they do — the visual convergence is real and honest, because those
+five GEMM variants' achieved TFLOP/s genuinely are that close together.
+
+**A second real bug, caught the same way stage 5d's was — by a test that
+should have passed and didn't.** The `compute_label_offsets` self-test's first
+draft asserted the *first* point in input order would rank first (no leader
+line); it failed, because the test's own synthetic data had the second point
+at a *slightly higher* TFLOP/s value, so it legitimately ranked first by the
+function's own (correct) "highest point first" ordering. Fixed the test's
+assertions to match the data, not the other way around — the function was
+right; the test's assumption about its own fixture was wrong.
+
+**A real, if minor, bug from static analysis**, done as a matter of course
+after stage 5d's shellcheck precedent: `pyflakes` (freshly installed) flagged
+an unused `import io` left over from an earlier draft. Removed; both new
+Python tools now pyflakes-clean.
+
+### Verification
+
+- Self-test: **5/5 pass** — `Roofline` formulas against `RESULTS.md` §0/§3d's
+  own published numbers (34.5 ridge, 8.130 TFLOP/s ceiling), a memory-bound
+  worked example, the CSV-corruption guard, and `compute_label_offsets`'s
+  clustering/leader-line logic.
+- Real render against the committed `reports/colab-t4/phase3_gemm.csv`:
+  valid SVG (parsed with `xml.etree`), then re-rendered as PNG and **visually
+  inspected** at each iteration — this is what caught both rendering defects
+  the self-test structurally cannot, since neither is a numeric error.
+- A synthetic (uncommitted) multi-kernel CSV mixing `bias_relu` and
+  `row_reduce_sum` (memory-bound) alongside the real `gemm` CSV
+  (compute-bound) confirmed the tool's actual purpose — multiple kernels on
+  one roofline — with roofline-consistent synthetic values (each below its own
+  AI-derived ceiling) after a first attempt with hand-picked round numbers
+  correctly triggered the "achieved above attainable" warning path, exposing
+  that the synthetic data itself was inconsistent, not a bug in the check.
+- `pyflakes` clean on both `tools/plot_roofline.py` and `tools/nsys_overlap.py`.
+- Host suite unaffected (145,665 checks) — expected, checked anyway.
+
+### What's next
+
+Phase 5's Mac-side work (stages 5a–5e) is now complete. Stage 5f
+(`scripts/regen_results.sh` + `tools/render_results.py`, the riskiest stage —
+a script that rewrites `RESULTS.md`) is next, still Mac-doable. After that, the
+combined Colab session (5g) exercises everything genuinely untested from here:
+the GB adapter against a real GPU, the `nsys`/`ncu` shell-outs, and this
+plotter against a full multi-kernel CSV set instead of GEMM alone.
