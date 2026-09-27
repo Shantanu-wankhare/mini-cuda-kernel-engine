@@ -1,0 +1,11 @@
+
+kernel                variant                           med_ms    min_ms      GB/s   TFLOP/s      AI     %peak  bound
+---------------------------------------------------------------------------------------------------------------------
+stream_triad          grid_stride_256t                   1.268     1.246     635.2     0.106    0.17     70.7%  memory
+
+achieved 635.2 GB/s  (spec-formula peak 898.0 GB/s -> 70.7%)
+
+*** This achieved GB/s IS the "measured bandwidth" figure referenced
+*** throughout docs/PROFILING.md. Record it in RESULTS.md section 0 and
+*** use it -- not the spec-formula number -- as the denominator for every
+*** other kernel's bandwidth efficiency.

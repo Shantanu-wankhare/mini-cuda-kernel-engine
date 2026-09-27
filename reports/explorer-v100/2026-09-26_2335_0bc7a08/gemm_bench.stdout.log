@@ -1,0 +1,98 @@
+=== environment ============================================
+device        Tesla V100-SXM2-32GB (sm_70), 80 SMs, 96 KiB smem/SM
+denominators  peak_gb_s=634.2  peak_tflops=15.603  (MEASURED, not spec)
+ridge point   24.6 FLOP/byte -- below this a kernel is memory-bound
+              spec-formula bandwidth for reference: 898.0 GB/s
+build         MCKE_WITH_CUDA=1
+============================================================
+
+command       /home/wankhare.s/mcke/build/bin/mcke_gemm_bench 4096
+versions      driver 12.3  runtime 12.3   (cuBLAS in PEDANTIC math mode -- no TF32)
+clocks        NOT LOCKED (no root on Colab) -- see the drift check below
+shape         M=4096 N=4096 K=4096   alpha=1 beta=0 (timed)
+ideal         flops = 2*M*N*K = 1.374e+11   bytes = (MK+KN+MN)*4 = 2.013e+08
+              AI = 682.7 FLOP/byte vs ridge 24.6 -- COMPUTE-bound
+timing        5 warmup + 20 timed iterations, median and min
+              EXCEPTION: naive_uncoalesced and naive use 2+5 instead (see kNaiveWarmup
+              in bench/gemm_bench.cpp for why) -- a stated exception, not a rule-3 miss.
+note          the GB/s column below is MEANINGLESS for a compute-bound
+              kernel (compulsory bytes / time). Read TFLOP/s and %peak.
+vec4          K%4=0 N%4=0 -> warptile_vec4 uses 128-bit loads
+
+=== correctness: awkward shapes vs CPU reference ===========
+              (only FAILURES are printed above; silence is success)
+              tolerances are derived per-K: rel=4*sqrt(K)*eps, abs=k*eps*amax^2/2
+validation    naive_uncoalesced beta=2     OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    naive beta=2                 OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    tiled_smem beta=2            OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    tiled_regblock beta=2        OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    warptile_nodbuf beta=2       OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    warptile_dbuf beta=2         OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    warptile_vec4 beta=2         OK    (max_rel_err 0.00418 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+validation    cublas beta=2                OK    (max_rel_err 0.000715 vs tol 8e-06 -- alpha=0.5 beta=2, read-modify-write)
+
+=== correctness at the benchmark shape ====================
+spot-check    cublas   1024/1024 elements OK   max_abs 4.711e-05  max_rel 2.184e-04
+validation    naive_uncoalesced            OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    naive                        OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    tiled_smem                   OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    tiled_regblock               OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    warptile_nodbuf              OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    warptile_dbuf                OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+validation    warptile_vec4                OK    (max_rel_err 4.15 vs tol 3e-05 -- vs cuBLAS at the benchmark shape)
+
+=== occupancy: hand-computed vs CUDA occupancy API =========
+variant             regs   smem   spill     hand      api     occ%  binding limiter
+naive_uncoalesced     32      0       0        8        8   100.0%  threads/SM cap (tied)
+naive                 32      0       0        8        8   100.0%  threads/SM cap (tied)
+tiled_smem            42   8192       0        1        1    50.0%  registers
+tiled_regblock       120   8320       0        2        2    25.0%  registers
+warptile_nodbuf      121   8320       0        2        2    25.0%  registers
+warptile_dbuf        128  16640       0        2        2    25.0%  registers
+warptile_vec4        128  16640       0        2        2    25.0%  registers
+cublas              (no attributes: gemm_kernel_attrs: cuBLAS's kernels are not ours to introspect; the ceiling row has no regs/smem column)
+
+running       naive_uncoalesced  (SLOW: expect ~30-70s, ~7 launches at 2+5)
+running       naive              (SLOW: expect ~10-20s, ~7 launches at 2+5)
+
+kernel                variant                           med_ms    min_ms      GB/s   TFLOP/s      AI     %peak  bound
+---------------------------------------------------------------------------------------------------------------------
+gemm                  cublas                             9.848     9.477      20.4    13.956  682.67     89.4%  compute
+gemm                  naive_uncoalesced                303.232   303.057       0.7     0.453  682.67      2.9%  compute
+gemm                  naive                             78.909    78.854       2.6     1.742  682.67     11.2%  compute
+gemm                  tiled_smem                        48.870    48.845       4.1     2.812  682.67     18.0%  compute
+gemm                  tiled_regblock                    11.709    11.694      17.2    11.737  682.67     75.2%  compute
+gemm                  warptile_nodbuf                   11.764    11.736      17.1    11.683  682.67     74.9%  compute
+gemm                  warptile_dbuf                     10.841    10.775      18.6    12.678  682.67     81.3%  compute
+gemm                  warptile_vec4                     10.910    10.787      18.5    12.598  682.67     80.7%  compute
+gemm                  cublas_drift_recheck               9.846     9.801      20.4    13.959  682.67     89.5%  compute
+
+=== thermal drift check ====================================
+cublas first 9.848 ms, last 9.846 ms -> -0.0%  within 3%: clocks held, cross-row comparisons are sound
+
+=== modelled DRAM traffic (a MODEL, not a measurement) =====
+variant               model bytes     vs ideal   note
+naive_uncoalesced         5.5e+11      2730.7x
+naive                     5.5e+11      2730.7x
+tiled_smem               1.72e+10        85.3x
+tiled_regblock           4.29e+09        21.3x
+warptile_nodbuf          4.29e+09        21.3x
+warptile_dbuf            4.29e+09        21.3x
+warptile_vec4            4.29e+09        21.3x
+This is the reuse story docs/PROFILING.md calls the most instructive
+number in the project, and `ncu --metrics dram__bytes_read.sum` is what
+turns it from a model into a measurement. Predict in advance: the naive
+model implies 550 GB in ~79 ms = ~6967 GB/s, which is FOUR TIMES the
+T4's DRAM peak -- physically impossible, so L1/L2 must already be
+absorbing most of it. That impossibility is the prediction being tested.
+
+=== step-by-step attribution ==============================
+naive_uncoalesced  -> naive                3.84x     2.9% ->  11.2% of peak   [thread->output transpose (coalescing)]
+naive              -> tiled_smem           1.61x    11.2% ->  18.0% of peak   [shared-memory staging]
+tiled_smem         -> tiled_regblock       4.17x    18.0% ->  75.2% of peak   [register blocking]
+tiled_regblock     -> warptile_nodbuf      1.00x    75.2% ->  74.9% of peak   [lane->output permutation]
+warptile_nodbuf    -> warptile_dbuf        1.09x    74.9% ->  81.3% of peak   [double-buffered smem]
+warptile_dbuf      -> warptile_vec4        0.99x    81.3% ->  80.7% of peak   [float4 global->smem loads]
+warptile_vec4      -> cublas               1.11x    80.7% ->  89.4% of peak   [THE REMAINING GAP]
+
+wrote phase3_gemm.csv

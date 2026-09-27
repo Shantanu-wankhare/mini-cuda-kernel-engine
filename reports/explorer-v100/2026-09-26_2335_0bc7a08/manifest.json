@@ -1,0 +1,186 @@
+{
+  "schema": "mcke-dataset/1",
+  "status": "VALID",
+  "invalid_reasons": [],
+  "reconstructed": false,
+  "machine_tag": "explorer-v100",
+  "machine_tag_reason": "MCKE_MACHINE_TAG override",
+  "run_id": "2026-09-26_2335_0bc7a08",
+  "started": "2026-09-27T03:35:28Z",
+  "finished": "2026-09-27T03:40:42Z",
+  "host": {
+    "hostname": "d1027",
+    "uname": "Linux d1027 5.14.0-362.13.1.el9_3.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Dec 13 14:07:45 UTC 2023 x86_64 x86_64"
+  },
+  "gpu": {
+    "start": {
+      "name": "Tesla V100-SXM2-32GB",
+      "driver": "545.23.08",
+      "clocks_sm": "135 MHz",
+      "clocks_mem": "877 MHz",
+      "temperature": "36",
+      "power": "44.30 W"
+    },
+    "end": {
+      "name": "Tesla V100-SXM2-32GB",
+      "driver": "545.23.08",
+      "clocks_sm": "1530 MHz",
+      "clocks_mem": "877 MHz",
+      "temperature": "43",
+      "power": "70.95 W"
+    }
+  },
+  "toolchain": {
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2023 NVIDIA Corporation\nBuilt on Fri_Sep__8_19:17:24_PDT_2023\nCuda compilation tools, release 12.3, V12.3.52\nBuild cuda_12.3.r12.3/compiler.33281558_0",
+    "cmake": "cmake version 3.30.2",
+    "cxx": "/usr/bin/c++"
+  },
+  "git": {
+    "sha": "0bc7a08",
+    "dirty": false
+  },
+  "build": {
+    "dir": "/home/wankhare.s/mcke/build",
+    "cache": {
+      "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+      "CMAKE_CUDA_COMPILER": "/shared/EL9/explorer/cuda/12.3.0/bin/nvcc",
+      "CMAKE_CXX_COMPILER": "/usr/bin/c++",
+      "MCKE_CUDA_ARCH": "native",
+      "MCKE_ENABLE_CUDA": "ON",
+      "MCKE_GOOGLE_BENCHMARK": "AUTO",
+      "MCKE_USE_NVTX": "OFF"
+    }
+  },
+  "denominators": {
+    "MCKE_PEAK_GB_S": "634.2",
+    "MCKE_PEAK_TFLOPS": "15.603",
+    "note": "null = unset: bench_common.hpp used its T4 defaults (235.4 / 8.130)"
+  },
+  "outputs": [
+    "phase3_bias_act.csv",
+    "phase3_gemm.csv",
+    "phase3_reduce.csv",
+    "phase3_softmax.csv",
+    "phase4_graph.csv",
+    "reports/alloc_fragmentation_dl_transformer.csv",
+    "reports/alloc_fragmentation_dl_transformer_bypass.csv",
+    "reports/alloc_fragmentation_uniform_pow2.csv",
+    "reports/alloc_latency_dl_transformer.csv",
+    "reports/alloc_latency_dl_transformer_bypass.csv",
+    "reports/alloc_latency_uniform_pow2.csv"
+  ],
+  "runs": [
+    {
+      "bench": "device_query",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_device_query"
+      ],
+      "exit_code": 0,
+      "seconds": 0,
+      "stdout": "device_query.stdout.log",
+      "stderr": "device_query.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "stream_triad",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_stream_triad"
+      ],
+      "exit_code": 0,
+      "seconds": 0,
+      "stdout": "stream_triad.stdout.log",
+      "stderr": "stream_triad.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "fma_peak",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_fma_peak"
+      ],
+      "exit_code": 0,
+      "seconds": 1,
+      "stdout": "fma_peak.stdout.log",
+      "stderr": "fma_peak.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "smoke",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_smoke"
+      ],
+      "exit_code": 0,
+      "seconds": 1,
+      "stdout": "smoke.stdout.log",
+      "stderr": "smoke.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "alloc_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_alloc_bench"
+      ],
+      "exit_code": 0,
+      "seconds": 9,
+      "stdout": "alloc_bench.stdout.log",
+      "stderr": "alloc_bench.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "bias_act_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_bias_act_bench"
+      ],
+      "exit_code": 0,
+      "seconds": 5,
+      "stdout": "bias_act_bench.stdout.log",
+      "stderr": "bias_act_bench.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "reduce_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_reduce_bench"
+      ],
+      "exit_code": 0,
+      "seconds": 1,
+      "stdout": "reduce_bench.stdout.log",
+      "stderr": "reduce_bench.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "softmax_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_softmax_bench"
+      ],
+      "exit_code": 0,
+      "seconds": 2,
+      "stdout": "softmax_bench.stdout.log",
+      "stderr": "softmax_bench.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "gemm_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_gemm_bench",
+        "4096"
+      ],
+      "exit_code": 0,
+      "seconds": 8,
+      "stdout": "gemm_bench.stdout.log",
+      "stderr": "gemm_bench.stderr.log",
+      "invalid_reasons": []
+    },
+    {
+      "bench": "graph_bench",
+      "argv": [
+        "/home/wankhare.s/mcke/build/bin/mcke_graph_bench",
+        "--streams=4"
+      ],
+      "exit_code": 0,
+      "seconds": 287,
+      "stdout": "graph_bench.stdout.log",
+      "stderr": "graph_bench.stderr.log",
+      "invalid_reasons": []
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+verification: OK (0 mismatches of 67108864)
+
+kernel                variant                           med_ms    min_ms      GB/s   TFLOP/s      AI     %peak  bound
+---------------------------------------------------------------------------------------------------------------------
+vector_add            grid_stride_256t                   1.265     1.214     636.8     0.053    0.08     70.9%  memory
+
+achieved 636.8 GB/s of 898.0 GB/s peak = 70.9% of DRAM bandwidth
+
+allocator: raw(cudaMalloc)
+allocs=3 frees=0 raw_mallocs=3 raw_frees=0 oom=0 deferred=0 blocking_drains=0
+  reserved=768 MiB  in_use=768 MiB  requested=768 MiB  peak=768 MiB
+  internal_waste=0 MiB  utilisation=100%  largest_free_block=0 MiB

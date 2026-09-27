@@ -1,0 +1,108 @@
+=== environment ============================================
+device        Tesla V100-SXM2-32GB (sm_70), 80 SMs, 96 KiB smem/SM
+denominators  peak_gb_s=634.2  peak_tflops=15.603  (MEASURED, not spec)
+ridge point   24.6 FLOP/byte -- below this a kernel is memory-bound
+              spec-formula bandwidth for reference: 898.0 GB/s
+build         MCKE_WITH_CUDA=1
+============================================================
+
+command       /home/wankhare.s/mcke/build/bin/mcke_graph_bench --streams=4
+versions      driver 12.3  runtime 12.3
+clocks        NOT LOCKED unless stated -- see the drift check
+timing        5 warmup + 20 timed iterations, median and min
+
+NOTE: every scheduling INTEGER below (streams, events, waits, peak bytes)
+      is also asserted on the host by tests/test_graph_host.cpp. This run
+      contributes the TIMES.
+
+=== diamond_gemm_2048 ===============================================
+  sequential      streams 1/1  events 0 rec + 0 wait (+0 fork/join)
+                  median    5.288 ms  min    5.242 ms  speedup  1.00x  enqueue     6.4 us
+                  peak 83886080 B vs naive 83886080 B (1.00x)
+                  launch_bound_ratio 0.001 (enqueue/device; >1 = launch-bound)
+  level_parallel  streams 2/4  events 1 rec + 1 wait (+4 fork/join)
+                  median    5.183 ms  min    4.914 ms  speedup  1.02x  enqueue     8.3 us
+                  peak 83886080 B vs naive 83886080 B (1.00x)
+                  launch_bound_ratio 0.002 (enqueue/device; >1 = launch-bound)
+  chain_greedy    streams 3/4  events 2 rec + 2 wait (+7 fork/join)
+                  median    5.177 ms  min    4.918 ms  speedup  1.02x  enqueue     9.6 us
+                  peak 83886080 B vs naive 83886080 B (1.00x)
+                  launch_bound_ratio 0.002 (enqueue/device; >1 = launch-bound)
+  numerics gate  PASS  (9 configs x 20 repeats, 20971520 elements)
+
+=== chain16 ===============================================
+  sequential      streams 1/1  events 0 rec + 0 wait (+0 fork/join)
+                  median    2.674 ms  min    2.671 ms  speedup  1.00x  enqueue    31.8 us
+                  peak 268451840 B vs naive 1140867072 B (4.25x)
+                  launch_bound_ratio 0.012 (enqueue/device; >1 = launch-bound)
+  level_parallel  streams 1/4  events 0 rec + 0 wait (+0 fork/join)
+                  median    2.675 ms  min    2.672 ms  speedup  1.00x  enqueue    31.9 us
+                  peak 268451840 B vs naive 1140867072 B (4.25x)
+                  launch_bound_ratio 0.012 (enqueue/device; >1 = launch-bound)
+  chain_greedy    streams 1/4  events 0 rec + 0 wait (+0 fork/join)
+                  median    2.675 ms  min    2.672 ms  speedup  1.00x  enqueue    31.2 us
+                  peak 268451840 B vs naive 1140867072 B (4.25x)
+                  launch_bound_ratio 0.012 (enqueue/device; >1 = launch-bound)
+  numerics gate  PASS  (9 configs x 20 repeats, 285216768 elements)
+
+=== fanout4x4 ===============================================
+  sequential      streams 1/1  events 0 rec + 0 wait (+0 fork/join)
+                  median    3.326 ms  min    3.317 ms  speedup  1.00x  enqueue    31.4 us
+                  peak 184557568 B vs naive 285220864 B (1.55x)
+                  launch_bound_ratio 0.009 (enqueue/device; >1 = launch-bound)
+  level_parallel  streams 4/4  events 12 rec + 36 wait (+10 fork/join)
+                  median    1.041 ms  min    1.035 ms  speedup  3.19x  enqueue    50.4 us
+                  peak 218112000 B vs naive 285220864 B (1.31x)
+                  launch_bound_ratio 0.048 (enqueue/device; >1 = launch-bound)
+  chain_greedy    streams 4/4  events 0 rec + 0 wait (+10 fork/join)
+                  median    1.020 ms  min    0.980 ms  speedup  3.26x  enqueue    34.8 us
+                  peak 218112000 B vs naive 285220864 B (1.31x)
+                  launch_bound_ratio 0.034 (enqueue/device; >1 = launch-bound)
+  numerics gate  PASS  (9 configs x 20 repeats, 71305216 elements)
+
+=== diamond_starved ===============================================
+  sequential      streams 1/1  events 0 rec + 0 wait (+0 fork/join)
+                  median    1.079 ms  min    1.070 ms  speedup  1.00x  enqueue     6.4 us
+                  peak 536887296 B vs naive 536887296 B (1.00x)
+                  launch_bound_ratio 0.006 (enqueue/device; >1 = launch-bound)
+  level_parallel  streams 2/4  events 1 rec + 1 wait (+4 fork/join)
+                  median    0.913 ms  min    0.902 ms  speedup  1.18x  enqueue     8.3 us
+                  peak 536887296 B vs naive 536887296 B (1.00x)
+                  launch_bound_ratio 0.009 (enqueue/device; >1 = launch-bound)
+  chain_greedy    streams 2/4  events 0 rec + 0 wait (+4 fork/join)
+                  median    0.905 ms  min    0.893 ms  speedup  1.19x  enqueue     7.3 us
+                  peak 536887296 B vs naive 536887296 B (1.00x)
+                  launch_bound_ratio 0.008 (enqueue/device; >1 = launch-bound)
+  numerics gate  PASS  (9 configs x 20 repeats, 134221824 elements)
+
+=== transformer_block ===============================================
+  sequential      streams 1/1  events 0 rec + 0 wait (+0 fork/join)
+                  median    7.986 ms  min    7.295 ms  speedup  1.00x  enqueue     8.5 us
+                  peak 201342976 B vs naive 218120192 B (1.08x)
+                  launch_bound_ratio 0.001 (enqueue/device; >1 = launch-bound)
+  level_parallel  streams 1/4  events 0 rec + 0 wait (+0 fork/join)
+                  median    6.850 ms  min    6.798 ms  speedup  1.17x  enqueue     8.6 us
+                  peak 201342976 B vs naive 218120192 B (1.08x)
+                  launch_bound_ratio 0.001 (enqueue/device; >1 = launch-bound)
+  chain_greedy    streams 1/4  events 0 rec + 0 wait (+0 fork/join)
+                  median    6.805 ms  min    6.782 ms  speedup  1.17x  enqueue     8.4 us
+                  peak 201342976 B vs naive 218120192 B (1.08x)
+                  launch_bound_ratio 0.001 (enqueue/device; >1 = launch-bound)
+  numerics gate  PASS  (9 configs x 20 repeats, 54530048 elements)
+
+=== wave sweep (diamond of GEMMs, chain_greedy vs sequential) ===
+  occupancy: 2 blocks/SM (measured) x 80 SMs = 160 blocks/full wave
+       N     blocks    waves       seq ms    greedy ms  speedup
+     256          4     0.03        0.305        0.194     1.57x
+     512         16     0.10        0.502        0.344     1.46x
+     768         36     0.23        0.711        0.480     1.48x
+    1024         64     0.40        0.964        0.817     1.18x
+    1536        144     0.90        2.124        2.024     1.05x
+    2048        256     1.60        5.235        5.169     1.01x
+    4096       1024     6.40       35.230       33.550     1.05x
+  ^ waves = grid blocks / (measured blocks/SM x SM count) above.
+    See RESULTS.md sec 4 for the shape this curve actually takes and
+    which hypothesis explains it -- the prediction here was falsified,
+    do not assume monotonic falloff.
+
+wrote phase4_graph.csv

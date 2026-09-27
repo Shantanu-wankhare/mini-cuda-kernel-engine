@@ -1,0 +1,12 @@
+
+blocks=2560 threads/block=256 total_threads=655360
+timing        3 warmup + 10 timed iterations  (below RESULTS.md rule 3 -- the historical default)
+
+measured f32 FMA peak: 15.602 TFLOP/s
+
+*** Use this number as Roofline::peak_tflops for every compute-bound
+*** kernel benchmark from Phase 3 onward (docs/PROFILING.md sec 2).
+*** Do NOT substitute a spec-sheet FLOPS figure -- see the header comment
+*** in this file and theoretical_peak_f32_tflops() in src/core/profiler.cpp
+*** for why the spec number would misrepresent this specific chip's
+*** actual sustained clock.

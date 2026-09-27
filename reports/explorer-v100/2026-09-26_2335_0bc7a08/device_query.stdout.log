@@ -1,0 +1,27 @@
+MCKE device query — MCKE_WITH_CUDA=1, visible devices=1
+
+[device 0] Tesla V100-SXM2-32GB  sm_70
+  SMs                     : 80
+  max threads / SM        : 2048  (64 warps)
+  max blocks / SM         : 32
+  regs / SM               : 65536
+  shared mem / block      : 48 KiB  (opt-in max 96 KiB)
+  shared mem / SM         : 96 KiB
+  L2 cache                : 6144 KiB
+  global memory           : 31 GiB
+  memory bus              : 4096-bit @ 877 MHz
+  peak DRAM bandwidth     : 898.048 GB/s
+  copy engines            : 5
+  cooperative launch      : yes
+  stream-ordered mem pools: yes
+
+  roofline: peak_bw=898.0 GB/s (spec formula)
+            peak_compute=<measure with bench/fma_peak — do NOT
+            take it from a spec sheet; see docs/PROFILING.md>
+
+  Phase-3 planning aids:
+    threads in flight at 100% occupancy : 163840
+    smem budget per SM                  : 96 KiB
+    max f32 elements in smem per block  : 24576
+    regs per thread at 100% occupancy   : 32
+

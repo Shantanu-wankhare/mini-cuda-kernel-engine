@@ -1,0 +1,60 @@
+=== environment ============================================
+device        Tesla V100-SXM2-32GB (sm_70), 80 SMs, 96 KiB smem/SM
+denominators  peak_gb_s=634.2  peak_tflops=15.603  (MEASURED, not spec)
+ridge point   24.6 FLOP/byte -- below this a kernel is memory-bound
+              spec-formula bandwidth for reference: 898.0 GB/s
+build         MCKE_WITH_CUDA=1
+============================================================
+
+shape         8192 x 4096  (N = 33554432, 128.0 MiB per array)
+ideal bytes   fused 268451840   unfused 536887296   (ratio 2.000)
+
+=== correctness (at the benchmark shape, before timing) ====
+validation    fused/none/vw4               OK    (max_rel_err 0 vs tol 0e+00 -- single IEEE add: bit-exact)
+validation    fused/relu/vw4               OK    (max_rel_err 0 vs tol 0e+00 -- add + select: bit-exact)
+validation    fused/gelu_tanh/vw4          OK    (max_rel_err 0.000824 vs tol 1e-06 -- device tanhf vs host std::tanh, ~4 ulp through (1+tanh))
+validation    fused/gelu_erf/vw4           OK    (max_rel_err 0.000898 vs tol 1e-06 -- device erff vs host std::erf, ~4 ulp through (1+erf))
+validation    fused/gelu_tanh/vw1          OK    (max_rel_err 0.000824 vs tol 1e-06 -- width must not change the answer)
+validation    reject/misaligned_width      OK    (cols=4095 % 4 != 0 must be refused)
+validation    reject/in_place              OK    (x == y violates __restrict__)
+
+kernel                variant                           med_ms    min_ms      GB/s   TFLOP/s      AI     %peak  bound
+---------------------------------------------------------------------------------------------------------------------
+bias_relu             fused_vw4                          0.333     0.332     806.6     0.202    0.25    127.2%  memory
+bias_relu             unfused_pair_vw4                   0.674     0.672     796.8     0.100    0.12    125.6%  memory
+bias_gelu_tanh        fused_vw4                          0.333     0.332     806.6     1.008    1.25    127.2%  memory
+bias_gelu_tanh        unfused_pair_vw4                   0.677     0.674     793.2     0.496    0.62    125.1%  memory
+bias_gelu_erf         fused_vw4                          0.333     0.332     806.6     2.218    2.75    127.2%  memory
+bias_gelu_erf         unfused_pair_vw4                   0.676     0.673     794.4     1.092    1.37    125.3%  memory
+bias_gelu_tanh        fused_vw1                          0.350     0.349     766.5     0.958    1.25    120.9%  memory
+bias_gelu_tanh        fused_vw2                          0.341     0.339     787.3     0.984    1.25    124.1%  memory
+bias_gelu_tanh        fused_vw4                          0.333     0.332     806.6     1.008    1.25    127.2%  memory
+bias_gelu_tanh        fused_vw1_lowocc                   0.392     0.389     684.5     0.856    1.25    107.9%  memory
+bias_gelu_tanh        fused_vw2_lowocc                   0.347     0.344     773.3     0.967    1.25    121.9%  memory
+bias_gelu_tanh        fused_vw4_lowocc                   0.345     0.342     777.9     0.972    1.25    122.7%  memory
+bias_gelu_tanh_L2     fused_vw4_512x512                  0.006     0.006     341.7     0.427    1.25     53.9%  memory
+bias_gelu_tanh_L2     unfused_pair_vw4_512x512           0.009     0.008     455.3     0.284    0.62     71.8%  memory
+
+=== fusion speedup (RESULTS.md section 3a) ==================
+  relu         fused 0.333 ms   unfused 0.674 ms   speedup 2.02x  (predicted ~2.00x)
+  gelu_tanh    fused 0.333 ms   unfused 0.677 ms   speedup 2.03x  (predicted ~2.00x)
+  gelu_erf     fused 0.333 ms   unfused 0.676 ms   speedup 2.03x  (predicted ~2.00x)
+  512x512      fused 0.006 ms   unfused 0.009 ms   speedup 1.50x  (L2-resident CONTROL, predicted ~1.0-1.2x)
+
+=== vector width: full occupancy vs starved =================
+  vw=1   full-occupancy 0.350 ms (766.5 GB/s)   starved 0.392 ms (684.5 GB/s)
+  vw=2   full-occupancy 0.341 ms (787.3 GB/s)   starved 0.347 ms (773.3 GB/s)
+  vw=4   full-occupancy 0.333 ms (806.6 GB/s)   starved 0.345 ms (777.9 GB/s)
+  PREDICTION: full-occupancy row is flat across widths (issue is ~138x
+  from being the limiter); starved row shows a large win, because vector
+  width buys memory-level parallelism and MLP is only scarce when
+  occupancy is scarce. If BOTH are flat, the starvation was insufficient.
+
+=== GELU form: erf vs tanh =================================
+  erf 0.333 ms vs tanh 0.333 ms  -> +0.0%
+  PREDICTION: within ~2% (about 100 us of extra FP32-pipe work
+  hidden under a ~1140 us memory floor). If erf is 5-9% slower the
+  arithmetic is NO LONGER fully hidden -- check ncu's top warp-stall
+  reason for a shift from long_scoreboard to mio_throttle.
+
+wrote phase3_bias_act.csv

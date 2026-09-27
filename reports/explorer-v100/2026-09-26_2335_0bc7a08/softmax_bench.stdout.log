@@ -1,0 +1,46 @@
+=== environment ============================================
+device        Tesla V100-SXM2-32GB (sm_70), 80 SMs, 96 KiB smem/SM
+denominators  peak_gb_s=634.2  peak_tflops=15.603  (MEASURED, not spec)
+ridge point   24.6 FLOP/byte -- below this a kernel is memory-bound
+              spec-formula bandwidth for reference: 898.0 GB/s
+build         MCKE_WITH_CUDA=1
+============================================================
+
+shape         8192 x 4096   compulsory bytes 268435456 (256.0 MiB)
+algorithmic   three_pass 4N*4 = 512.0 MiB   online 3N*4 = 384.0 MiB
+L2 note       each row is 16 KiB; ~160 resident blocks give a ~2.5 MiB
+              working set, which FITS the T4's 4 MiB L2 -- so three_pass's
+              2nd and 3rd reads may never reach DRAM. If it beats its own
+              traffic model, that is the finding, not an error.
+
+=== correctness (at the benchmark shape, before timing) ====
+validation    three_pass_256t              OK    (max_rel_err 3.54e-07 vs tol 1e-05 -- expf ~2ulp + tree sum + divide)
+              max |sum(row) - 1| = 1.701e-07   (reference-free)
+validation    online_one_pass_256t         OK    (max_rel_err 4.03e-07 vs tol 1e-05 -- expf ~2ulp + tree sum + divide)
+              max |sum(row) - 1| = 2.184e-07   (reference-free)
+validation    overflow/three_pass_256t     OK    (logits 0..90; sum=1.000000, no max-subtraction would give NaN)
+validation    overflow/online_one_pass_256t OK    (logits 0..90; sum=1.000000, no max-subtraction would give NaN)
+validation    reject/in_place              OK    (x == y violates __restrict__)
+
+kernel                variant                           med_ms    min_ms      GB/s   TFLOP/s      AI     %peak  bound
+---------------------------------------------------------------------------------------------------------------------
+row_softmax           three_pass_256t                    0.820     0.814     327.3     0.205    0.62     51.6%  memory
+row_softmax           online_one_pass_256t               0.585     0.579     459.1     0.287    0.62     72.4%  memory
+
+=== three-pass vs online (RESULTS.md section 3c) ===========
+  three_pass 0.820 ms (327.3 GB/s)   online 0.585 ms (459.1 GB/s)   1.40x
+  PREDICTION 4/3 = 1.33x from traffic alone (3 reads -> 2), less any L2
+  reuse, so realistically 1.0-1.25x. NOT 3x -- "one pass" names the
+  statistics passes, not the memory passes.
+  Neither reaches 100% of 634.2 GB/s BY CONSTRUCTION: the denominator is
+  compulsory traffic (2N*4), and the extra passes are exactly the gap.
+
+=== numerics ==============================================
+  max |sum(row) - 1|   three_pass 1.701e-07   online 2.184e-07   (ratio 1.28x)
+  PREDICTION: online is 2-5x LESS accurate, and that is expected, not a
+  defect. Three-pass computes numerator and denominator from the identical
+  expression with the same m, so they are bit-consistent; online builds the
+  denominator through a chain of rescaled partials and then computes a fresh
+  numerator, so they agree only to within accumulated rounding.
+
+wrote phase3_softmax.csv

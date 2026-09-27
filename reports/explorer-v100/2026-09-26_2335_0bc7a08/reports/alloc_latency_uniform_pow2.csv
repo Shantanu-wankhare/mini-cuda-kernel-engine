@@ -1,0 +1,15 @@
+trace,allocator,op,samples,median_ns,p90_ns,p99_ns,p999_ns,max_ns,amortised_ns,clock_floor_ns,instrument_limited,alloc_calls,raw_malloc_calls,with_cuda
+uniform_pow2,raw,allocate,94733,2577,5131,6799,105130,190933,3695.31,19,0,99816,99816,1
+uniform_pow2,raw,deallocate,94899,3297,6120,7709,93514,641576,3695.31,19,0,,,1
+uniform_pow2,buddy/same_stream,allocate,94733,52,107,536,602,10397,53.3409,19,0,99816,2,1
+uniform_pow2,buddy/same_stream,deallocate,94899,36,59,113,315,58105,53.3409,19,1,,,1
+uniform_pow2,buddy/coarse_poll,allocate,94733,50,65,580,617,4163,301.241,19,0,99816,2,1
+uniform_pow2,buddy/coarse_poll,deallocate,94899,532,566,606,843,23473,301.241,19,0,,,1
+uniform_pow2,buddy/event,allocate,94733,52,116,589,656,22623,355.441,19,0,99816,2,1
+uniform_pow2,buddy/event,deallocate,94899,453,831,1150,1477,102518,355.441,19,0,,,1
+uniform_pow2,freelist/same_stream,allocate,94733,96,135,205,326,219651,86.1735,19,0,99816,5,1
+uniform_pow2,freelist/same_stream,deallocate,94899,87,171,257,453,321128,86.1735,19,0,,,1
+uniform_pow2,freelist/coarse_poll,allocate,94733,96,123,209,263,202115,342.742,19,0,99816,5,1
+uniform_pow2,freelist/coarse_poll,deallocate,94899,598,665,723,1014,440934,342.742,19,0,,,1
+uniform_pow2,freelist/event,allocate,94733,97,143,214,280,255548,383.962,19,0,99816,5,1
+uniform_pow2,freelist/event,deallocate,94899,509,910,1207,1577,356495,383.962,19,0,,,1
