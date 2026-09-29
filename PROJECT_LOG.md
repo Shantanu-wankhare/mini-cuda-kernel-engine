@@ -2234,3 +2234,152 @@ are unaffected. Fixing `smoke_vector_add.cpp` also exposed that
 `scripts/typecheck_cuda.sh` had **never type-checked `tools/*.cpp`**
 (`mcke_smoke`, `mcke_device_query`) on the CUDA path — the same class of silent
 exclusion as Phase 4's `src/graph/` gap. The glob now includes it; both clean.
+
+## 2026-09-27 to 2026-09-28 — Session 19: Phase 5 stage 5h — Explorer HPC, real V100 numbers (forked chat)
+
+**Hardware: Northeastern Explorer HPC, Tesla V100-SXM2-32GB (sm_70), driver
+545.23.08, CUDA 12.3 (`nvcc` 12.3.52), commit `0bc7a08`.** Run in a forked
+chat, not the main session; commands were never executed by the agent —
+every HPC command was handed to the owner as text and run by them over their
+own SSH session, per their explicit standing instruction not to risk their
+account being flagged as bot activity.
+
+### What was built
+
+- `reports/explorer-v100/2026-09-26_2335_0bc7a08/` — a full `VALID` dataset
+  from `scripts/regen_results.sh` on real V100 hardware (commit `8ee3218`):
+  10 bench outputs, manifest, CSVs, fresh-measured V100 denominators
+  (**634.2 GB/s / 15.603 TFLOP/s**, superseding the historical
+  636.3/15.601 pair — the guard correctly refused to run without both set
+  explicitly, since the machine tag is `explorer-v100`, not `-t4`).
+- `reports/explorer-v100/2026-09-26_2335_0bc7a08/gb_cross_check.md`
+  (commit `fd6a6c4`) — the Google Benchmark adapter (`bench/gb_adapter.hpp`)
+  cross-checked against `Profiler::time_op` on a **second** real architecture
+  (design/typecheck only covered T4 before this).
+- `tools/nsys_overlap.py`'s `_find_header_line()` (commit `63eb823`) — fixed
+  a real parsing bug the V100 nsys capture exposed (see below).
+- `RESULTS.md` §5c gained a "Second-GPU corroboration: Explorer Tesla
+  V100-SXM2" subsection (this commit) — the `fanout4x4` overlap mechanism
+  re-derived on V100 and compared numerically to the existing T4 write-up.
+
+### What was learned
+
+- **The lost V100 GEMM ladder was successfully reproduced.** All 9 GEMM
+  variants (naive → cuBLAS) matched the previously-recorded V100 numbers in
+  `RESULTS.md` §3d within ~1% noise, on a completely independent fresh
+  measurement. This was the primary reason HPC access was attempted at all,
+  and it worked.
+- **The `peak_tflops` fix (Session 18, commit `0bc7a08`) verified LIVE, not
+  just on the host.** `stream_triad.stdout.log` and `smoke.stdout.log` both
+  show the summary row reading **71.0% / memory**, not `0.0% / compute` —
+  turning that Mac-only arithmetic check into a real one, on real hardware,
+  per the exact ask a sibling fork had relayed.
+- **`ncu` is still blocked by `ERR_NVGPUCTRPERM`**, now confirmed on a
+  *second* node (`d1009`, vs. the original `d1007` from the 2026-08-31 RC
+  ticket) — solid evidence the block is account/cluster-wide, not
+  node-specific. The open RC ticket remains the right next step, not a
+  workaround.
+- **`kPerIter` shows no measurable per-iteration-sync overhead on V100**,
+  contrary to `profiler.hpp`'s own header comment predicting ~10 µs of
+  inflation for short kernels. Two of four configs were *faster* under
+  `kPerIter`, one flat, and the shortest kernel only +0.8%. Recorded
+  honestly as unresolved — a Colab T4 comparison point (stage 5g, not yet
+  run) is needed before drawing any conclusion, not explained away under
+  HPC time pressure.
+- **The V100 corroborates the T4 overlap mechanism, not just the overlap
+  fact** (full arithmetic in `RESULTS.md` §5c): the same fixed 40-block
+  `fanout4x4` shape leaves V100 at only ~79% of its own measured DRAM
+  ceiling (vs. T4's ~100%), and that gap shows up exactly where the model
+  predicts — a much smaller per-node slowdown (1.27× vs. 1.87×) and a
+  realized speedup (3.26×) close to the 4× ideal, instead of T4's 1.94×.
+
+### Bugs found (three real, one deferred as a non-fix)
+
+- **`tools/nsys_overlap.py`'s `parse_gpu_trace_csv` assumed the CSV header
+  was line 1 — fixed (commit `63eb823`).** `nsys stats --format csv` prints
+  its own informational preamble to stdout first (`NOTICE: Existing SQLite
+  export found...`, `Processing [...] with [...]...`), and
+  `scripts/profile_nsys.sh`'s plain `>` redirect captured all of it. The
+  column-name candidate lists themselves were **100% correct on the first
+  try** (`Start (ns)`, `Duration (ns)`, `Strm`, `Name` all confirmed present
+  verbatim in the real nsys 2024.7.1 header) — the bug was purely the
+  line-0 assumption. `_find_header_line()` now scans forward for the first
+  line that parses as CSV with a recognisable Start+Stream column, so it is
+  robust to any future preamble wording, not just this one. A self-test
+  reproducing the exact field failure was added. Confirmed after the fix:
+  **4,082 overlapping kernel pairs, max 4 concurrent streams, 3.95× local
+  concurrency factor** — the same structural result as T4's 4,404/4/3.46×.
+- **`scripts/profile_ncu.sh` greps stderr for `ERR_NVGPUCTRPERM`, but `ncu`
+  prints that diagnostic to stdout** — not yet fixed. Consequence: the
+  script ran all 7 GEMM variants instead of stopping after the first
+  permission failure, and (side effect) each sub-invocation of `gemm_bench`
+  wrote its own non-compliant `phase3_gemm.csv` into the repo root,
+  overwriting itself each time — cleaned up (`rm -f phase3_gemm.csv`), not
+  committed.
+- **`profile_nsys.sh`'s NVTX-presence heuristic false-negatives on
+  header-only NVTX v3** — `nm | grep nvtxRangePush` doesn't find the symbol
+  even when ranges work correctly, because NVTX v3 is resolved dynamically
+  at runtime, not statically linked. Confirmed a false alarm: the actual
+  `nsys stats --report nvtx_sum` output showed 16 real, correctly-named
+  ranges (`:b0n0`, `:b1n0`, etc., matching `executor.cpp`'s per-node
+  naming). Not yet fixed or removed.
+- **Deferred, not investigated:** every one of the 7 GEMM kernel variants in
+  the blocked `ncu` attempt reported the exact same `max_rel_err 8.714e-03`
+  spot-check — numerically implausible for independently different
+  implementations, likely because `--only=<variant>` means cuBLAS never ran
+  in-process to provide a live reference for that invocation. Flagged, not
+  investigated live — needs source-level follow-up with `gemm_bench.cpp`
+  open, not a guess under HPC time pressure.
+
+### Design decisions (and rejected alternatives)
+
+- **No `tmux`, by the owner's explicit choice** — accepted the consequence
+  (a closed laptop drops the SSH session and any pending/allocated SLURM
+  job) rather than introduce a persistence tool the owner didn't want.
+  Recovered twice by reconnecting and re-submitting `srun`.
+- **`--exclusive` tried, then dropped for a non-exclusive allocation** after
+  a very long `Priority`-reason queue wait with no allocation — the owner's
+  own call, accepting some GPU-sharing timing noise in exchange for
+  actually getting a session. All V100 numbers in this session (including
+  the `fanout4x4` corroboration) come from a **non-exclusive** allocation.
+- **`-xdev` mandated on every `find` from this session on**, after the
+  owner flagged that an earlier fork's unbounded `find ~` risked
+  traversing into a large shared filesystem mount under `$HOME`. All
+  subsequent searches were scoped to specific, known, bounded paths.
+- **GitHub push authentication**: HTTPS+password was rejected, and the
+  system's GUI askpass helper failed headless (`cannot open display`).
+  Resolved with a fine-grained, 7-day, repo-scoped Personal Access Token
+  embedded directly in the push URL — no credential helper configured on
+  shared infrastructure.
+
+### Verification
+
+`bench/gb_adapter.hpp`'s `kBurst` timing mode agreed with `Profiler::time_op`
+within 0.3–4.1% across 4 configs on V100 (full table in `gb_cross_check.md`).
+`tools/nsys_overlap.py --self-test` extended with the header-preamble
+regression case and passes (8/8 checks). All 9 GEMM variants reproduced
+within ~1% of the recorded V100 numbers. `git status` clean; all commits
+pushed to `origin/main`.
+
+### What's next
+
+**Stage 5g (Colab T4) remains unrun** — needed for the `kPerIter` overhead
+comparison point and as the first real exercise of `nsys_overlap.py`'s
+`extract_csv_via_nsys()` path (this session went CSV-first via
+`--csv`, never through a live `.nsys-rep`). The roofline plot
+(`tools/plot_roofline.py --preset=v100`) is the one fully-optional item that
+needs no further GPU time — can run from the Mac directly against the
+already-pushed V100 dataset, any time.
+
+**Owner's standing requirement, to be carried forward explicitly: once the
+full Phase 5 implementation is done, re-run all benchmarks/measurements for
+every phase using an EXCLUSIVE GPU allocation**, for authoritative,
+noise-free numbers — this session's V100 numbers (GEMM ladder, GB
+cross-check, `fanout4x4` overlap corroboration) were all captured on a
+**non-exclusive**, shared node, and should be treated as directionally
+solid but not the final authoritative record.
+
+Also carried forward, not yet acted on: fix `profile_ncu.sh`'s
+stdout-vs-stderr grep bug; fix or remove `profile_nsys.sh`'s NVTX
+false-negative heuristic; investigate the suspicious identical
+`max_rel_err` across all 7 ncu GEMM variants.

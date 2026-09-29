@@ -1758,3 +1758,70 @@ The timeline still resolves the open item cleanly: `fanout4x4`'s 1.94× is
 real, physical, multi-stream overlap, not an artifact of event bookkeeping or
 measurement noise. What was wrong was only the explanation of why it isn't
 the full 4×.
+
+#### Second-GPU corroboration: Explorer Tesla V100-SXM2, stage 5h
+
+Everything above was T4-only. Stage 5h (Northeastern Explorer, driver
+545.23.08, CUDA 12.3, commit `0bc7a08`, non-exclusive `gpu-interactive`
+allocation) re-ran the identical, unmodified capture command
+(`--only=fanout4x4 --iters=5 --warmup=2`, NVTX on) and queried it with the
+same `tools/nsys_overlap.py` (after fixing a header-detection bug the V100
+run exposed — see `PROJECT_LOG.md` Session 19): **4,082 overlapping kernel
+pairs, max concurrent streams 4** — the same structural result as T4, on a
+different architecture:
+
+```
+total kernels                 5684
+cross-stream overlapping pairs 4082
+max concurrent streams        4
+local concurrency factor      3.95x (best window, 4 kernels)
+```
+
+| Stream | Start (ns) | End (ns) | Duration (µs) |
+|---|---|---|---|
+| 18 | 608,706,493 | 608,969,979 | 263.5 |
+| 19 | 608,707,933 | 608,969,083 | 261.1 |
+| 20 | 608,705,213 | 608,968,763 | 263.6 |
+| 21 | 608,702,877 | 608,969,627 | 266.8 |
+
+The mechanism identified above for T4 — fixed low block-count (10
+blocks/branch, 40 total) starving DRAM, not SM occupancy, as the limiter —
+**predicts a milder effect on V100** for the same reason §3d already
+established: the V100 has 2× the SMs and a wider, faster HBM2 subsystem, so
+the same 40 blocks are proportionally further from saturating it. Recomputing
+the identical analysis this session's `graph_bench.stdout.log` makes possible
+(V100 dataset, `reports/explorer-v100/2026-09-26_2335_0bc7a08/`):
+
+```
+sequential per-node time   = 3.326 ms / 16 nodes             = 207.9 us
+contended per-node time    = mean(263.5, 261.1, 263.6, 266.8) = 263.7 us
+per-node slowdown under contention                             = 1.27x   (T4: 1.87x)
+
+ideal speedup from 4-way parallelism alone            = 4.00x
+speedup after the measured 1.27x per-node slowdown     = 4 / 1.27 = 3.15x
+measured speedup (chain_greedy)                        = 3.26x  (close; T4: 1.94x)
+
+achieved bandwidth in this window: 4 x 33,562,624 B = 134,250,496 B over the
+measured 267,102 ns wall span = 502.6 GB/s = 79.2% of this dataset's own
+measured V100 ceiling (634.2 GB/s).                        (T4: 235.9 GB/s, ~100.2% of 235.4 GB/s)
+```
+
+**The mechanism, not just the overlap fact, corroborates across
+architectures.** The V100's same fixed block count leaves it at ~79% of its
+own DRAM ceiling instead of T4's ~100% — measurably less saturated — and
+that gap shows up exactly where the model predicts it: a much smaller
+per-node slowdown (1.27× vs. 1.87×) and a realized `fanout4x4` speedup
+(3.26×) that sits close to the 4× ideal, instead of T4's 1.94×. This is the
+first time this project has confirmed the same overlap mechanism, with
+matching internal arithmetic, on two independent GPU architectures — not
+merely re-running the same benchmark twice.
+
+One honest loose end, recorded rather than smoothed over: the V100
+`fanout4x4` numbers above come from a **non-exclusive** `gpu-interactive`
+allocation (a shared node), unlike the T4 numbers, which were not gated on
+exclusivity either but were captured on Colab's dedicated-per-session GPU.
+Per the owner's standing instruction, every phase's benchmarks get re-run on
+an **exclusive** GPU allocation once the full Phase 5 implementation is
+done — this V100 corroboration should be treated as directionally solid
+(the cross-architecture story is large and consistent, not a noise-level
+effect) but re-measured for the authoritative record at that time.
