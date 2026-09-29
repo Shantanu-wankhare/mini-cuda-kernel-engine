@@ -155,6 +155,38 @@ def _find_column(fieldnames: Sequence[str], candidates: list[str], kind: str) ->
     return None
 
 
+def _find_header_line(lines: list[str]) -> int:
+    """Scan forward for the line that is actually the CSV header, rather than
+    assuming line 0 is it.
+
+    Found in the field (Explorer V100, 2026-09-29): `nsys stats` printed its
+    own informational preamble to stdout BEFORE the real CSV table --
+    "NOTICE: Existing SQLite export found... Consider using --force-export"
+    followed by a blank line and "Processing [...] with [...]..." -- and
+    `scripts/profile_nsys.sh`'s plain `>` redirect captured all of it, not
+    just the table. The column-name GUESSES were exactly right on the first
+    try (`Start (ns)`, `Duration (ns)`, `Strm`, `Name`, all literally present);
+    the bug was assuming line 0 is the header at all. This scan is robust to
+    ANY future preamble nsys chooses to print, not just this one wording --
+    it looks for the first line that, parsed as CSV, contains a recognisable
+    Start column AND a recognisable Stream column, and treats that as ground
+    truth for where the table begins.
+    """
+    for i, line in enumerate(lines):
+        cells = next(csv.reader([line]), [])
+        if (_find_column(cells, _START_CANDIDATES, "start") is not None
+                and _find_column(cells, _STREAM_CANDIDATES, "stream") is not None):
+            return i
+    preview = "\n".join(f"  {i}: {l!r}" for i, l in enumerate(lines[:15]))
+    raise ValueError(
+        "could not find a CSV header line (one containing both a recognisable "
+        "Start column and a recognisable Stream column) anywhere in the input.\n"
+        f"looked for start in:  {_START_CANDIDATES}\n"
+        f"looked for stream in: {_STREAM_CANDIDATES}\n"
+        f"first {min(15, len(lines))} line(s) of the input, for diagnosis:\n{preview}"
+    )
+
+
 def parse_gpu_trace_csv(text: str) -> list[KernelSpan]:
     """Parse `nsys stats --report cuda_gpu_trace --format csv` output.
 
@@ -162,7 +194,9 @@ def parse_gpu_trace_csv(text: str) -> list[KernelSpan]:
     column name matches -- see the honesty note at the top of this file for
     why that is the deliberate failure mode here, not a bug to silence.
     """
-    reader = csv.DictReader(io.StringIO(text))
+    lines = text.splitlines()
+    header_idx = _find_header_line(lines)
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
     if reader.fieldnames is None:
         raise ValueError("empty CSV: no header row found")
     fields = list(reader.fieldnames)
@@ -404,6 +438,35 @@ def run_self_test() -> None:
     assert wall == 569_046, f"wall span mismatch: {wall}"
     _assert_stats("results-md-5c-worked-example", stats, pairs=6, max_streams=4,
                  factor=1_969_885 / 569_046, tol=1e-3)
+
+    # 7. parse_gpu_trace_csv must skip past nsys's own informational preamble
+    #    to find the real header -- the exact bytes that broke on Explorer
+    #    V100 (2026-09-29): a leading blank line, then two NOTICE lines, then
+    #    a blank line, then a "Processing [...] with [...]..." line, THEN the
+    #    real header. Reproduced verbatim (shortened to 2 data rows) rather
+    #    than a made-up preamble, so this test would have caught the actual
+    #    bug instead of a hypothetical one.
+    preamble_csv = (
+        "\n"
+        "NOTICE: Existing SQLite export found: reports/x.sqlite\n"
+        "        It is assumed file was previously exported from: reports/x.nsys-rep\n"
+        "        Consider using --force-export=true if needed.\n"
+        "\n"
+        "Processing [reports/x.sqlite] with [cuda_gpu_trace.py]... \n"
+        "Start (ns),Duration (ns),CorrId,GrdX,GrdY,GrdZ,BlkX,BlkY,BlkZ,Reg/Trd,"
+        "StcSMem (MB),DymSMem (MB),Bytes (MB),Throughput (MB/s),SrcMemKd,DstMemKd,"
+        "Device,Ctx,GreenCtx,Strm,Name\n"
+        "100,50,1,,,,,,,,,,,,,,GPU0,1,,0,kernel_a\n"
+        "200,50,2,,,,,,,,,,,,,,GPU0,1,,1,kernel_b\n"
+    )
+    parsed = parse_gpu_trace_csv(preamble_csv)
+    ok = (len(parsed) == 2
+          and parsed[0] == KernelSpan(stream=0, start_ns=100, end_ns=150, name="kernel_a")
+          and parsed[1] == KernelSpan(stream=1, start_ns=200, end_ns=250, name="kernel_b"))
+    status = "PASS" if ok else "FAIL"
+    print(f"  {status}  nsys-preamble-header-skip: parsed={parsed}")
+    if not ok:
+        raise SystemExit(f"self-test FAILED: nsys-preamble-header-skip, got {parsed}")
 
     print("all self-tests PASSED")
 
