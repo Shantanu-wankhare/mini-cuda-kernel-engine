@@ -63,9 +63,26 @@
 //               residency differ from back-to-back execution;
 //             - launch pipelining is gone, so any launch-bound result --
 //               graph_bench's entire subject -- is destroyed.
-//           It is here ON PURPOSE: it is the instrument for the Phase 5
-//           cross-check that quantifies what that sync costs as a function of
-//           kernel duration. The delta is a deliverable, not an accident.
+//           It is here ON PURPOSE, as the instrument for the Phase 5
+//           cross-check of what that sync costs as a function of kernel
+//           duration.
+//
+//           *** CORRECTED 2026-09-28 -- read this before trusting kPerIter. ***
+//           This banner used to say kPerIter's reported Time "quantifies what
+//           that sync costs". It cannot, by construction: the loop records the
+//           stop event and ONLY THEN synchronizes, so the host round trip
+//           happens OUTSIDE the event bracket. The device-event Time can only
+//           show second-order effects -- launch latency leaking into the
+//           bracket (the start event is timestamped on an idle stream before
+//           the kernel arrives) and idle-state effects (clocks, L2). The first
+//           real run (Explorer V100, 2026-09-28) was read as "the round trip is
+//           much cheaper than ~10 us" because its kPerIter Time was within
+//           -3.2%..+0.8% of kBurst; that inference was the wrong mechanism --
+//           the measurement was blind to the round trip, not evidence it is
+//           cheap. The round trip is now measured DIRECTLY: each iteration is
+//           also bracketed with a host HostTimer, reported as the counters
+//           `host_us` (wall time per iteration, record -> sync returned) and
+//           `roundtrip_us` (host_us minus the device-event time).
 // =============================================================================
 #pragma once
 
@@ -77,6 +94,7 @@
 #include <vector>
 
 #include "mcke/core/status.hpp"
+#include "mcke/profiling/host_timer.hpp"
 #include "mcke/profiling/profiler.hpp"
 #include "mcke/runtime/stream.hpp"
 
@@ -230,7 +248,14 @@ void run_per_iteration(benchmark::State& state, const std::string& variant,
     return;
   }
 
+  // Host wall time per iteration, summed. The device events below CANNOT see
+  // the host round trip (it happens after the stop event is recorded -- see the
+  // corrected banner), so this is the only part of kPerIter that measures what
+  // the mode exists to measure.
+  double host_us_total = 0.0, device_us_total = 0.0;
+  HostTimer host;
   for (auto _ : state) {
+    host.start();                                            // first host action of the iteration
     if (const Status st = s->record(stream); !st.ok()) { state.SkipWithError(st.to_string()); return; }
     if (const Status st = fn(stream);        !st.ok()) { state.SkipWithError(st.to_string()); return; }
     if (const Status st = e->record(stream); !st.ok()) { state.SkipWithError(st.to_string()); return; }
@@ -238,11 +263,18 @@ void run_per_iteration(benchmark::State& state, const std::string& variant,
     // narrower barrier and does not wait on unrelated work queued behind us.
     // It is still a full host round-trip -- which IS the point of this mode.
     if (const Status st = e->synchronize(); !st.ok()) { state.SkipWithError(st.to_string()); return; }
+    host_us_total += static_cast<double>(host.stop_ns()) * 1e-3;   // ns -> us: returned from the sync
     auto ms = rt::Event::elapsed_ms(*s, *e);
     if (!ms.ok()) { state.SkipWithError(ms.status().to_string()); return; }
-    set_iteration_time_from_ms(state, static_cast<double>(*ms));
+    device_us_total += static_cast<double>(*ms) * 1e3;             // ms -> us, for the counters only
+    set_iteration_time_from_ms(state, static_cast<double>(*ms));   // Time column stays DEVICE time
   }
   set_roofline_counters(state, rl, flops, bytes);
+  // kAvgIterations: GB divides the accumulated totals by the iteration count,
+  // giving per-iteration means. Units are microseconds throughout.
+  using C = benchmark::Counter;
+  state.counters["host_us"]      = C(host_us_total, C::kAvgIterations);
+  state.counters["roundtrip_us"] = C(host_us_total - device_us_total, C::kAvgIterations);
   state.SetLabel(variant + " [kPerIter, HOST SYNC PER ITERATION -- "
                            "NOT comparable to RESULTS.md rows]");
 }

@@ -2383,3 +2383,100 @@ Also carried forward, not yet acted on: fix `profile_ncu.sh`'s
 stdout-vs-stderr grep bug; fix or remove `profile_nsys.sh`'s NVTX
 false-negative heuristic; investigate the suspicious identical
 `max_rel_err` across all 7 ncu GEMM variants.
+
+## 2026-09-28 — Session 20: verifying the 5h fork, and four corrections
+
+**Environment:** MacBook Air, host-only. No GPU work; this session verified
+the Explorer fork (Session 19, commits `8ee3218`…`91944a2`) against the repo
+rather than taking its handoff on trust, then fixed what it found.
+
+### What checked out, independently
+
+- **Dataset** `reports/explorer-v100/2026-09-26_2335_0bc7a08`: `VALID`, clean
+  tree at `0bc7a08`, explicit V100 denominators (the 5f guard worked).
+- **The V100 GEMM ladder reproduces:** `render_results.py --preview s3d-gemm
+  PENDING <dataset>` shows every timing within **≤1.1%** of the 2026-08-31
+  published rows (largest: `warptile_vec4`), and **every structural cell
+  identical** (tiles, regs, smem, spill, occupancy). The fork's "~1%" holds.
+- **GB `kBurst` vs `Profiler::time_op`:** +0.3% … +4.1%, as stated (4.1% is
+  across separate processes on a shared node; `kBurst` is the same code path).
+- **`nsys_overlap.py` fix** (scan forward for the CSV header; nsys prints a
+  preamble) is correct and tested against the verbatim failing bytes. It also
+  settles a 5d unknown: **the guessed column names were right**
+  (`Start (ns)`, `Duration (ns)`, `Strm`, `Name`).
+- Provenance detail the fork didn't state: the run used denominators
+  634.2 / 15.603 while its own `stream_triad` / `fma_peak` measured
+  635.2 / 15.602 — from an earlier probe run; ≤0.16% effect; the manifest
+  records what was used.
+
+### Corrections
+
+1. **RESULTS.md failed `--audit`.** The fork's new §5c V100 nsys-window table
+   had no `AUTHORED` marker — exactly the drift `--audit` exists to catch.
+   Marked; audit clean again.
+2. **`kPerIter`'s conclusion was the wrong mechanism — and so was my own 5b
+   design.** `run_per_iteration` records the stop event and *then*
+   synchronizes, so the host round trip is **outside** the device-event
+   bracket. The fork read "−3.2% … +0.8% vs `kBurst`" as "the round trip is much
+   cheaper than ~10 µs"; the measurement could not see the round trip at all.
+   What it does show: launch-latency leakage and idle-state effects are small
+   on V100 (≤3%, ~50 ns on the 6 µs kernel) — per-launch *event* timing is robust
+   to a per-iteration sync. My `gb_adapter.hpp` banner claimed the mode
+   "quantifies what that sync costs" — the same error, at design time.
+   **Fixed at the instrument:** `kPerIter` now also brackets each iteration
+   with `HostTimer` and reports `host_us` and `roundtrip_us` (host − device), so
+   5g's T4 run measures the round trip directly. Named corrections added to the
+   adapter banner and to the dataset's `gb_cross_check.md`; the Session 19
+   text is kept as written.
+3. **"Identical `max_rel_err` across all 7 ncu GEMM variants" is not a bug —
+   it's a result the fork misread.** Under `--only=<variant>` cuBLAS isn't
+   selected, so each variant falls to `spot_check_gemm` with a *fixed* seed —
+   the same 1024 elements every time. And the seven hand-written kernels
+   compute each output as one sequential FMA chain over *k* in increasing
+   order: tiling, register blocking, double buffering and `float4` loads move
+   *operands*, not *arithmetic*. Evidence already in the repo: on the T4 all
+   seven match cuBLAS with `max_rel_err 0` at 4096³ (bit-identical, Session 5
+   log); on the V100 all seven show the *same* `max_rel_err 4.15` vs cuBLAS,
+   whose summation order differs. Caveat: on V100 that is **consistent with**
+   bit-identity, not proof — the maximum is set by a near-zero element whose
+   relative error is insensitive to a few ulps. (Open item: a validation line
+   printing "`max_rel_err 4.15` … OK" is legitimate — it passes on the absolute
+   floor — but reads like a 415% failure; worth reporting `max_abs_err` too.)
+4. **The exclusivity caveat covers the published V100 rows too.** The
+   2026-08-31 V100 run (Session 6) used `srun` on `gpu-interactive` with no
+   `--exclusive` — the same kind of allocation. Its "authoritative" standing
+   rested on the +0.03% drift check, which measures clock stability, not the
+   absence of co-tenants. Added to RESULTS.md §5c. Two independent shared-node
+   runs a month apart agreeing within 1.1% is evidence contention was low both
+   times — not a substitute for the exclusive re-baseline.
+
+### Two script bugs from Session 19, fixed
+
+- **`profile_ncu.sh`** grepped stderr; ncu prints `ERR_NVGPUCTRPERM` on stdout.
+  Now captures both (`2>&1 | tee`) and checks the log **regardless of exit
+  code**. Tested against the worst case (block on stdout *and* exit 0): stops
+  after 1 variant, exits 1.
+- **`profile_nsys.sh`'s NVTX pre-check removed** — NVTX v3 resolves at runtime,
+  so `nm` can never find the symbol; it warned on a correct build. Replaced by
+  a post-profile check of `nsys stats --report nvtx_sum` (count rows after a
+  header naming `Range`). The `Range` column name is from memory, unverified
+  here; if wrong, the check prints the raw output loudly rather than passing.
+
+### Standing decision, carried forward (owner's, from the fork)
+
+Once Phase 5's implementation is done, **re-benchmark every phase on an
+exclusive GPU allocation** — potentially the whole project's measurements, for
+consistency. If exclusive time and/or the ncu permission stay blocked for a
+long time, **seriously consider pausing** rather than building on results that
+will need redoing. The regen/render machinery built in 5f is what makes that
+re-baseline cheap: the full V100 run was ~5 minutes of GPU time, one command.
+
+### What's next
+
+Stage **5g, Colab T4, in a fork** — still unrun and still needed: the T4
+dataset (the reproducibility preview for every T4 table), the `kPerIter`
+round-trip measurement (now actually measurable), fma_peak at 3+10 vs 5+20,
+and the first live exercise of `nsys_overlap.py`'s `extract_csv_via_nsys()`
+path. Then 5i (promotion + write-up, main chat) — where a new decision waits:
+promote the non-exclusive datasets now and re-promote after the exclusive
+re-baseline, or hold promotion until then.

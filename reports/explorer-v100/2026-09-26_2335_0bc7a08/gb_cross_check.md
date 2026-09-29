@@ -63,6 +63,23 @@ much cheaper than the general "~10 µs host round trip" the comment describes.
 this is the first real-GPU exercise of `kPerIter` anywhere in the project;
 5g hasn't run yet.
 
+> **Correction (2026-09-28, main chat) — Claim 2's inference is the wrong
+> mechanism; its data stands.** `kPerIter` records the stop event and *only
+> then* synchronizes (`bench/gb_adapter.hpp`), so the host round trip happens
+> **outside** the device-event bracket. Its reported Time cannot contain the
+> round trip at all. The −3.2%…+0.8% deltas above therefore say nothing about
+> how cheap the round trip is. They measure only the second-order effects that
+> *can* reach the bracket: launch latency leaking in, since the start event is
+> timestamped on an idle stream, and idle-state effects such as clocks and L2.
+> What they do show is still useful: those effects are small on V100, ≤3% and
+> about 50 ns on the 6 µs kernel, so per-launch **event** timing is robust to
+> a per-iteration sync. The original design had the same blind spot: the
+> adapter's own banner claimed this mode "quantifies what that sync costs". The
+> adapter now also reports `host_us` (wall time per iteration) and
+> `roundtrip_us` (host minus device), which measure the round trip directly.
+> Stage 5g's T4 run is the first to collect them. The text above is kept
+> as written.
+
 ## Raw output
 
 <details>

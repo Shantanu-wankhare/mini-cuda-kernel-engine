@@ -14,8 +14,9 @@
 #   1. Names the output by machine (scripts/machine_tag.sh) so a Colab run and
 #      an Explorer run never collide in reports/, matching the reports/<tag>/
 #      layout Phase 5 stage 5f builds on.
-#   2. Warns (does not block) if the target binary looks like it was NOT built
-#      with NVTX -- an unlabelled timeline is technically valid but useless,
+#   2. Warns (does not block) if the finished trace contains NO NVTX ranges
+#      -- checked in the trace itself, after profiling (see below for why not
+#      in the binary). An unlabelled timeline is technically valid but useless,
 #      per this file's own docs/PROFILING.md precedent ("without NVTX ranges
 #      you get anonymous kernel bars and cannot tell which graph node is
 #      which").
@@ -64,22 +65,14 @@ if ! command -v nsys >/dev/null 2>&1; then
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# NVTX heuristic check. `strings`/`nm` looking for the symbol NvtxRange's
-# constructor calls (nvtxRangePushA) is not authoritative -- a stripped binary
-# or a statically-inlined call could hide it -- but it is a cheap, honest
-# early warning rather than silence, and false positives (symbol present but
-# MCKE_USE_NVTX was actually off) are impossible since the symbol only exists
-# under that macro (profiler.hpp's #if MCKE_WITH_CUDA && defined(MCKE_USE_NVTX)).
-# ---------------------------------------------------------------------------
-if command -v nm >/dev/null 2>&1; then
-  if ! nm "$BIN" 2>/dev/null | grep -q nvtxRangePush; then
-    echo "WARNING: '$BIN' does not appear to reference nvtxRangePush*." >&2
-    echo "         Rebuild with -DMCKE_USE_NVTX=ON, or the nsys timeline will" >&2
-    echo "         be anonymous kernel bars with no graph-node labels" >&2
-    echo "         (docs/PROFILING.md section 3). Continuing anyway." >&2
-  fi
-fi
+# (The pre-profile `nm | grep nvtxRangePush` check that used to sit here was
+# REMOVED 2026-09-28. It could not work: NVTX v3 is header-only, and its entry
+# points resolve at RUNTIME through a function-pointer table the NVTX injection
+# library fills in -- there is no nvtxRangePushA symbol for `nm` to find. On
+# Explorer it warned "no NVTX" on a binary whose trace then held 16 correctly
+# named ranges (PROJECT_LOG Session 19). A warning that fires on correct builds
+# trains people to ignore it, which is worse than no warning. The check now runs
+# on the TRACE, after profiling -- the only place the answer is certain.)
 
 tag="$(mcke_machine_tag)"
 outdir="reports/${tag}"
@@ -112,6 +105,28 @@ echo "=== nsys stats --report cuda_gpu_trace -> ${rep_base}_gputrace.csv ==="
 # that stdout needs no unverified flag semantics.
 nsys stats --report cuda_gpu_trace --format csv "${rep_base}.nsys-rep" \
     > "${rep_base}_gputrace.csv"
+
+# ---------------------------------------------------------------------------
+# NVTX check, on the trace itself. `nvtx_sum` lists one row per named range; a
+# build without -DMCKE_USE_NVTX=ON produces none. We look for a CSV header row
+# naming a `Range` column and count the data rows after it -- tolerant of any
+# preamble nsys prints first (the same lesson tools/nsys_overlap.py learned on
+# Explorer). If nsys's wording ever differs, the fallback is loud, not silent:
+# the raw output is shown so a human can judge.
+# ---------------------------------------------------------------------------
+nvtx_out="$(nsys stats --report nvtx_sum --format csv "${rep_base}.nsys-rep" 2>&1 || true)"
+nvtx_rows="$(printf '%s\n' "$nvtx_out" | awk -F, '
+  !hdr && /(^|,)"?Range"?(,|$)/ { hdr = 1; next }
+  hdr && NF > 1 { n++ }
+  END { print n + 0 }')"
+if [ "$nvtx_rows" -gt 0 ]; then
+  echo "NVTX: ${nvtx_rows} named range(s) in the trace -- timeline is labelled."
+else
+  echo "WARNING: no NVTX ranges found in the trace. Rebuild with" >&2
+  echo "         -DMCKE_USE_NVTX=ON, or the timeline is anonymous kernel bars" >&2
+  echo "         (docs/PROFILING.md section 3). nsys nvtx_sum said:" >&2
+  printf '%s\n' "$nvtx_out" | head -8 | sed 's/^/           /' >&2
+fi
 
 echo
 echo "Next: python3 tools/nsys_overlap.py --csv ${rep_base}_gputrace.csv"

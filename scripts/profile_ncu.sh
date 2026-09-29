@@ -78,39 +78,50 @@ stamp="$(date +%Y%m%d_%H%M%S)"
 for v in "${VARIANTS[@]}"; do
   out="${outdir}/ncu_gemm_${v}_${stamp}"
   echo "=== ncu: ${v} -> ${out}.ncu-rep ==="
-  err_log="$(mktemp)"
+  log="$(mktemp)"
   # Build with line info (RelWithDebInfo default, see CLAUDE.md section 4) so
   # SASS maps back to source -- ncu needs no special flag for this, but the
   # binary does need -lineinfo, which is why this is stated rather than left
   # implicit: a build without it produces a report with no source correlation
   # and no error message telling you why.
-  if ncu --set full --kernel-name-base function --kernel-name regex:gemm \
-         --launch-skip 1 --launch-count 3 --export "$out" \
-         "$BIN" 1024 --only="$v" --skip-validation --warmup=1 --iters=3 \
-         2> "$err_log"; then
+  #
+  # stdout AND stderr, into one log (and still to the terminal via tee). Fixed
+  # 2026-09-28: this used to capture stderr only (`2> err_log`), but ncu prints
+  # ERR_NVGPUCTRPERM on STDOUT -- so on Explorer the grep below never matched,
+  # and the script ran all 7 variants into the same driver error instead of
+  # stopping after the first (PROJECT_LOG Session 19). The permission check
+  # also runs REGARDLESS of ncu's exit code: whether ncu exits nonzero on this
+  # error was never verified, and gating the check on it is how the first
+  # version could miss it twice over.
+  set +e
+  ncu --set full --kernel-name-base function --kernel-name regex:gemm \
+      --launch-skip 1 --launch-count 3 --export "$out" \
+      "$BIN" 1024 --only="$v" --skip-validation --warmup=1 --iters=3 \
+      2>&1 | tee "$log"
+  status=${PIPESTATUS[0]}
+  set -e
+  if grep -q ERR_NVGPUCTRPERM "$log"; then
+    echo
+    echo "*** BLOCKED: ERR_NVGPUCTRPERM ***"
+    echo "This account does not have GPU performance-counter access on this"
+    echo "machine (NVreg_RestrictProfilingToAdminUsers). This is a"
+    echo "DRIVER-LEVEL restriction, identical for every kernel and every"
+    echo "variant here -- so it will fail exactly the same way for the"
+    echo "remaining ${#VARIANTS[@]} variant(s), and there is no value in"
+    echo "repeating the same driver error. Status: RESULTS.md section 5a"
+    echo "(RC ticket filed 2026-08-31, rchelp@northeastern.edu -- see"
+    echo "PROJECT_LOG.md for the exact ticket text)."
+    rm -f "$log"
+    exit 1
+  fi
+  if [ "$status" -eq 0 ]; then
     echo "OK -> ${out}.ncu-rep"
   else
-    status=$?
-    if grep -q ERR_NVGPUCTRPERM "$err_log"; then
-      echo
-      echo "*** BLOCKED: ERR_NVGPUCTRPERM ***"
-      echo "This account does not have GPU performance-counter access on this"
-      echo "machine (NVreg_RestrictProfilingToAdminUsers). This is a"
-      echo "DRIVER-LEVEL restriction, identical for every kernel and every"
-      echo "variant here -- so it will fail exactly the same way for the"
-      echo "remaining ${#VARIANTS[@]} variant(s), and there is no value in"
-      echo "repeating the same driver error. Status: RESULTS.md section 5a"
-      echo "(RC ticket filed 2026-08-31, rchelp@northeastern.edu, still open"
-      echo "as of 2026-09-22 -- see PROJECT_LOG.md for the exact ticket text)."
-      rm -f "$err_log"
-      exit 1
-    fi
-    echo "FAILED (exit $status), NOT the known ERR_NVGPUCTRPERM block -- see:" >&2
-    cat "$err_log" >&2
+    echo "FAILED (exit $status), NOT the known ERR_NVGPUCTRPERM block (output above)." >&2
     echo "Continuing to the next variant (this failure is not known to be" >&2
-    echo "systemic, unlike ERR_NVGPUCTRPERM above)." >&2
+    echo "systemic, unlike ERR_NVGPUCTRPERM)." >&2
   fi
-  rm -f "$err_log"
+  rm -f "$log"
 done
 
 echo

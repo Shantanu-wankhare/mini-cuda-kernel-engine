@@ -1777,6 +1777,8 @@ max concurrent streams        4
 local concurrency factor      3.95x (best window, 4 kernels)
 ```
 
+<!-- AUTHORED: the best-concurrency window tools/nsys_overlap.py selected from the V100 nsys trace, transcribed from its output; the trace itself is not committed -->
+
 | Stream | Start (ns) | End (ns) | Duration (µs) |
 |---|---|---|---|
 | 18 | 608,706,493 | 608,969,979 | 263.5 |
@@ -1825,3 +1827,18 @@ an **exclusive** GPU allocation once the full Phase 5 implementation is
 done — this V100 corroboration should be treated as directionally solid
 (the cross-architecture story is large and consistent, not a noise-level
 effect) but re-measured for the authoritative record at that time.
+
+*(Added 2026-09-28, main chat, on verifying this subsection:)* the caveat
+above applies to **every** V100 number in this file, not only this
+subsection's. The V100 rows already published in §0 and §3d (2026-08-31,
+PROJECT_LOG Session 6) were captured the same way — `srun` on
+`gpu-interactive` with `--gres=gpu:v100-sxm2:1` and **no `--exclusive`** —
+so they were never exclusive either; their "authoritative" standing rested
+on the +0.03% cuBLAS drift check, which measures clock stability, not the
+absence of co-tenants. What the new dataset adds is evidence, not a cleaner
+source: two independent shared-node runs a month apart
+(`reports/explorer-v100/2026-09-26_2335_0bc7a08` vs the 2026-08-31 rows)
+agree within **1.1%** on every GEMM-ladder timing and exactly on every
+register/smem/occupancy cell (`render_results.py --preview s3d-gemm PENDING
+<dataset>`), which suggests contention was low both times — but is not a
+substitute for the exclusive re-baseline.
